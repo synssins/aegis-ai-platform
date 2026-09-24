@@ -39,6 +39,12 @@ gallery shows it, `comfyui/output/` is empty. Mark the checkpoint NSFW → a non
 VetoGuard policy pick a text-only classifier → every output is destroyed as unparseable (fail closed); pick a
 non-resident model → submissions refused with 503. Delete from the gallery → file, record and history gone.
 
+## Review policy — no self-sign-off
+Nothing is final on the strength of its author's own tests. Work built by Claude is adversarially reviewed by Gemini
+(`agy`, JSON print mode, `docs/tests/agy-review-*.md`) and must end a round with no findings; anything Gemini writes
+or proposes gets the same review from Claude before it ships. Findings become acceptance-suite assertions. Reports
+must say whether the current round is clean; unreviewed work is presented as unreviewed.
+
 ## Adversarial reviews
 `docs/tests/agy-vetoguard-review-*.md` record each round of external adversarial review of VetoGuard and what
 was fixed. Findings that were false positives are noted as such. New classes become suite assertions.
