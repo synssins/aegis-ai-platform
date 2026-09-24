@@ -33,7 +33,6 @@
         Strict-Transport-Security "max-age=31536000"
         X-Content-Type-Options "nosniff"
         -X-Frame-Options
-        Content-Security-Policy "frame-ancestors 'self'"
         Referrer-Policy "no-referrer"
         Permissions-Policy "camera=(), geolocation=(), microphone=(self)"
     }
@@ -91,6 +90,7 @@
 # Default handlers differ per site: the LAN address keeps Open WebUI at /; the public hostname serves the portal.
 (site) {
     import common
+    header Content-Security-Policy "frame-ancestors 'self'"
     handle {
         reverse_proxy openwebui:8080
     }

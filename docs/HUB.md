@@ -1,6 +1,6 @@
 # Aegis Hub — admin control centre
 
-`https://<LAN_IP>/hub` · user `admin`. **Own login, not basic-auth:** argon2id password hashes (64 MiB, t=3), mandatory TOTP (RFC 6238; secret Fernet-encrypted at rest with `HUB_SECRET_KEY`), HMAC-signed HttpOnly/Secure/SameSite=Strict session cookies (12 h), lockout (5 failures/user → 5 min; 20/IP → 15 min), every login/failure audited. No password is ever stored or printed anywhere: on first run (no administrator yet) `/hub` shows a **setup wizard** — choose the admin username, set a policy-checked password, enrol MFA — all in the browser. Recovery is console-only: `scripts/hub-reset-admin.sh` removes the administrator so the wizard runs again.
+`https://<LAN_IP>/hub` · user `admin`. **Own login, not basic-auth:** argon2id password hashes (64 MiB, t=3), mandatory TOTP (RFC 6238; secret Fernet-encrypted at rest with `HUB_SECRET_KEY`), HMAC-signed HttpOnly/Secure/SameSite=Strict session cookies (12 h), lockout (5 failures/user → 5 min; 20/IP → 15 min), every login/failure audited. No password is ever stored or printed anywhere: on first run (no administrator yet) `/hub` shows a **setup wizard** — choose the admin username, set a policy-checked password, enroll MFA — all in the browser. Recovery is console-only: `scripts/hub-reset-admin.sh` removes the administrator so the wizard runs again.
 Dark theme. Fixed left navigation with collapsible categories (the active one open), one level of sub-pages; the right pane scrolls independently. Every table paginates (10/25/50/100 per page, prev/next) via URL query parameters.
 
 | Category | Page | Can change | Notes |
@@ -15,7 +15,7 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 | | Pull | pull | via `modeld` — the only container with both internet and the model store. Apps never fetch their own |
 | | Exposed to apps | unexpose (hub-created only) | models from `config.yaml` are console-managed |
 | Access | API keys | mint / revoke | per-client, model-scoped, rate-limited; key shown once |
-| | Admin account | change password; re-enrol MFA | argon2id; policy ≥ 14 chars / 3 of 4 classes; changing the password signs out other sessions |
+| | Admin account | change password; re-enroll MFA | argon2id; policy ≥ 14 chars / 3 of 4 classes; changing the password signs out other sessions |
 | Gateway | Certificates | — | live TLS probe of every served host |
 | | Public hostname | hostname + Cloudflare token | writes exactly one templated site file; Let's Encrypt via DNS-01, no inbound ports |
 | | Isolation | — | **read-only** view of the Caddyfile and compose network wiring |
