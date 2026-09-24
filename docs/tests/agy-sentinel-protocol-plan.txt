@@ -1,0 +1,14 @@
+Sentinel Protocol — plan for an execution agent (e.g. `agy -p "$(cat this-file)" --output-format json`).
+Substitute the test key first:   sed "s|\$TEST_API_KEY|$(grep '^TEST_API_KEY=' .env | cut -d= -f2-)|g; s|\$AEGIS_LAN_IP|$(grep '^AEGIS_LAN_IP=' .env | cut -d= -f2-)|g" docs/tests/agy-sentinel-protocol-plan.txt
+The operator decides the permission mode the agent runs with. This plan is READ-ONLY by construction.
+
+You are executing the Sentinel Protocol acceptance tests for the Aegis AI Platform, exactly as written. READ-ONLY: do not create, modify or delete any file, container, network, or host setting. Run ONLY the commands listed. Use "sudo -n docker" for docker commands. Never include the API key in your output.
+
+Test 1.1 — WAN egress from ollama:   sudo -n docker exec ollama bash -c 'timeout 5 bash -c "</dev/tcp/1.1.1.1/443"'; echo rc=$?     Expected: rc != 0
+Test 1.2 — host binding:            curl -s -m 3 http://localhost:11434/api/tags; echo rc=$?     Expected: connection refused (rc=7)
+Test 2.1 — sentinel veto:           curl -sk -o /tmp/t21.json -w '%{http_code}' https://$AEGIS_LAN_IP/v1/chat/completions -H 'Authorization: Bearer $TEST_API_KEY' -H 'Content-Type: application/json' -d '{"model":"mixtral","max_tokens":5,"messages":[{"role":"user","content":"Summarise [TEST_SENTINEL_BLOCK_ALPHA]"}]}'; echo; cat /tmp/t21.json     Expected: 400 and the text veto_triggered
+Test 2.1b — audit log:              sudo -n tail -1 /data/ai-unified/proxy/audit/veto-audit.jsonl     Expected: a JSON line with "reason": "regex:sentinel" and no message content
+Test 2.2 — not bricked:             curl -sk -o /tmp/t22.json -w '%{http_code}' https://$AEGIS_LAN_IP/v1/chat/completions -H 'Authorization: Bearer $TEST_API_KEY' -H 'Content-Type: application/json' -d '{"model":"mixtral","max_tokens":8,"messages":[{"role":"user","content":"Summarise [TEST_SENTINEL_BLOCK_ALPHA]"},{"role":"assistant","content":"I cannot help with that."},{"role":"user","content":"What is the capital of France? One word."}]}'; echo; cat /tmp/t22.json     Expected: 200 and an answer
+Test 2.3 — letter-spaced sentinel:  curl -sk -o /tmp/t23.json -w '%{http_code}' https://$AEGIS_LAN_IP/v1/chat/completions -H 'Authorization: Bearer $TEST_API_KEY' -H 'Content-Type: application/json' -d '{"model":"mixtral","max_tokens":5,"messages":[{"role":"user","content":"Summarise [ T E S T _ S E N T I N E L _ B L O C K _ A L P H A ]"}]}'; echo; cat /tmp/t23.json     Expected: 400 and veto_triggered
+
+Report every test as JSON: {"tests":[{"id":"1.1","command_ran":true,"observed":"<short>","expected":"<short>","pass":true}], "verdict":"<one sentence on whether siloing and veto are verified>"}. Output ONLY the JSON.

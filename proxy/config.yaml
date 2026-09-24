@@ -1,0 +1,17 @@
+model_list:
+  - model_name: "mixtral"
+    litellm_params:
+      model: "ollama/mixtral"
+      api_base: "http://ollama:11434"
+  # Wildcard route removed (Gemini rev1). Add models explicitly. The guard model is NOT listed:
+  # clients may not address llama-guard directly; VetoGuard calls it over the backend network.
+
+litellm_settings:
+  callbacks: custom_logger.veto_filter.proxy_handler_instance
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  disable_spend_logs: true
+  # Virtual keys per client: scripts/mint-key.sh (console only; /key/* is 404 at the edge).

@@ -1,0 +1,16 @@
+# secrets / private
+.env
+.sanitize-patterns
+backup/
+docs/private/
+# runtime data — never tracked
+openwebui/
+caddy/data/
+caddy/config/
+caddy/sites-enabled/
+llm/
+comfyui/
+audio/
+proxy/db/
+proxy/audit/
+__pycache__/

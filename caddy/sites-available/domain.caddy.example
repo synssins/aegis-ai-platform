@@ -1,0 +1,10 @@
+# Template for a public hostname. The hub writes exactly this shape to
+# /etc/caddy/sites-enabled/domain.caddy — nothing else is templatable.
+#
+# HTTP-01 (default): the UDM must forward TCP 80 and 443 to this host (AEGIS_LAN_IP).
+# DNS-01: requires a Caddy build with your DNS provider module (caddy/Dockerfile.dns) and
+#         a provider token in .env; no inbound ports needed. Ask on the console.
+
+ai.example.com {
+    import site
+}

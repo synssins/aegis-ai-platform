@@ -1,0 +1,154 @@
+# Aegis AI Platform — hardened compose rev 2 (2026-09-24 overnight run)
+#
+# Topology: ONE bridge -> TWO.
+#   edge     : caddy(+hub) <-> openwebui, caddy <-> litellm         (egress allowed; only caddy publishes ports)
+#   backend  : litellm <-> ollama, litellm <-> litellm-db  (internal: true — no egress, unreachable from LAN)
+# openwebui cannot see ollama. Every inference request traverses litellm (VetoGuard + Llama Guard).
+#
+# Secrets: ./.env (0600). Model pulls: ./scripts/pull-model.sh. API keys: ./scripts/mint-key.sh.
+# Gateway config (caddy/Caddyfile) is console-only: root:root 0600, mounted read-only everywhere.
+
+services:
+  caddy:
+    image: caddy:2.11.4
+    container_name: caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - AEGIS_LAN_IP=${AEGIS_LAN_IP}
+      - ACME_EMAIL=${ACME_EMAIL}
+      - HUB_ADMIN_PASSWORD_HASH=${HUB_ADMIN_PASSWORD_HASH}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/sites-enabled:/etc/caddy/sites-enabled:ro
+      - ./caddy/data:/data
+      - ./caddy/config:/config
+    networks: [edge]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  hub:
+    # Operator hub. Shares caddy's network namespace so it — and only it — can reach the admin
+    # API on localhost:2019. Reachable from the LAN only via caddy at /hub (basic-auth at the edge).
+    # May write ONLY sites-enabled/domain.caddy from a fixed template. See caddy/hub/hub.py.
+    image: python:3.12-alpine
+    container_name: hub
+    command: ["python3", "-u", "/app/hub.py"]
+    environment:
+      - AEGIS_LAN_IP=${AEGIS_LAN_IP}
+    volumes:
+      - ./caddy/hub/hub.py:/app/hub.py:ro
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/sites-enabled:/etc/caddy/sites-enabled
+      - ./proxy/audit:/app/audit
+    network_mode: "service:caddy"
+    depends_on: [caddy]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:v0.11.4
+    container_name: openwebui
+    environment:
+      - OPENAI_API_BASE_URL=http://litellm:4000/v1
+      - OPENAI_API_KEY=${OPENWEBUI_UPSTREAM_KEY}      # LiteLLM virtual key (alias: openwebui), never the master
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
+      - WEBUI_URL=https://${AEGIS_LAN_IP}
+      - CORS_ALLOW_ORIGIN=https://${AEGIS_LAN_IP}
+      - ENABLE_SIGNUP=false
+      - DEFAULT_USER_ROLE=pending
+      - ENABLE_OLLAMA_API=false
+      - ENABLE_DIRECT_CONNECTIONS=false
+      - ENABLE_WEB_SEARCH=false
+      - ENABLE_PERSISTENT_CONFIG=false
+      - ENABLE_COMMUNITY_SHARING=false
+      - SCARF_NO_ANALYTICS=true
+      - DO_NOT_TRACK=true
+    volumes:
+      - ./openwebui:/app/backend/data
+    networks: [edge]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: litellm
+    command: --config /app/config/config.yaml --port 4000
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - DATABASE_URL=postgresql://litellm:${POSTGRES_PASSWORD}@litellm-db:5432/litellm
+      - STORE_MODEL_IN_DB=False
+      - DISABLE_ADMIN_UI=True
+      - LITELLM_LOG=INFO
+      - VETO_GUARD_ENABLED=1
+      - VETO_GUARD_URL=http://ollama:11434
+      - VETO_GUARD_MODEL=llama-guard3:1b
+      - VETO_GUARD_IGNORE_CATEGORIES=${VETO_GUARD_IGNORE_CATEGORIES:-}
+      - VETO_AUDIT_PATH=/app/audit/veto-audit.jsonl
+    volumes:
+      - ./proxy/config.yaml:/app/config/config.yaml:ro
+      - ./proxy/veto_filter.py:/app/custom_logger/veto_filter.py:ro
+      - ./proxy/audit:/app/audit
+    networks: [edge, backend]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      litellm-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  litellm-db:
+    image: postgres:16-alpine
+    container_name: litellm-db
+    environment:
+      - POSTGRES_USER=litellm
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=litellm
+    volumes:
+      - ./proxy/db:/var/lib/postgresql/data
+    networks: [backend]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, SETUID, SETGID, DAC_READ_SEARCH]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:0.34.3
+    container_name: ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_KEEP_ALIVE=24h              # keep mixtral + llama-guard resident; avoids reload latency on the guard
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./llm/gguf:/root/.ollama
+    networks: [backend]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+
+networks:
+  edge:
+    driver: bridge
+  backend:
+    driver: bridge
+    internal: true
