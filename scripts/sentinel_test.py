@@ -286,7 +286,7 @@ class Suite:
     def phase5(self):
         H = self.hub_login() or {}
         hub_ok = bool(H)
-        for pg in ([] if not hub_ok else ("overview/dashboard", "safety/policy", "safety/audit", "models/installed", "models/pull", "models/exposed", "access/keys", "access/account", "gateway/certs", "gateway/hostname", "gateway/isolation", "overview/services")):
+        for pg in ([] if not hub_ok else ("overview/dashboard", "safety/policy", "safety/audit", "models/installed", "models/pull", "models/exposed", "access/keys", "access/account", "gateway/certs", "gateway/hostname", "gateway/isolation", "overview/services", "overview/metrics")):
             st, _, b = http("GET", f"{self.base}/hub/{pg}", headers=H)
             self.rec(f"5.1-{pg.split('/')[1]}", "hub", f"hub page {pg} renders", "200 + <h1>", st, st == 200 and b"<h1>" in b)
         if hub_ok:
@@ -322,6 +322,13 @@ class Suite:
         self.rec("5.7", "network", "litellm cannot reach modeld", "fails", out[-40:], rc != 0)
         st, _, _ = http("GET", f"{self.base}/comfy")
         self.rec("5.8", "edge", "ComfyUI route hard-gated at edge", "503", st, st == 503)
+        st, _, b = http("GET", f"{self.base}/status")
+        self.rec("5.16", "edge", "public /status renders GPU/host load without login", "200 + GPU + CPU", st, st == 200 and b"utilisation" in b and b"CPU" in b)
+        self.rec("5.17", "edge", "public /status contains no keys/aliases/secrets", "no matches", "checked", st == 200 and not re.search(rb"sk-[A-Za-z0-9]{8,}|key_alias|password|secret", b, re.I))
+        st, _, b = http("GET", f"{self.base}/status/api")
+        try: j = json.loads(b); okj = "gpus" in j and "services" in j and "cpu" in j
+        except Exception: okj = False  # noqa: BLE001
+        self.rec("5.18", "edge", "/status/api returns structured metrics", "json with gpus/services/cpu", st, st == 200 and okj)
         rc, out = docker("inspect litellm --format '{{range .Mounts}}{{.Destination}}:{{.RW}} {{end}}'")
         self.rec("5.9", "hub", "litellm mounts policy read-only", "/app/policy:false", out, "/app/policy:false" in out)
         rc, out = docker("inspect hub --format '{{.HostConfig.NetworkMode}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}}'")

@@ -6,6 +6,7 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 | Category | Page | Can change | Notes |
 |---|---|---|---|
 | Overview | Dashboard | — | services by network, safety posture, VRAM residency, certificates, recent vetoes |
+| | Metrics | — | GPU utilisation/VRAM/temperature/power per card, CPU, memory, disk, resident models, service health — Prometheus, server-rendered sparklines (last hour), auto-refresh |
 | | Services | start / stop / restart (checked containers) | real container status from the host **watchdog**; caddy and hub can only be restarted; one request at a time; every watchdog response (log + errors) listed |
 | Safety | VetoGuard policy | **classifier model (the one place it is chosen — saving loads it and unloads other guards)**, blocked categories, tripwires, extra regexes, **retention & evidence** (immutable categories, days; evidence categories, days), diagnostics snippet toggle (default off) | **S4 is locked on**; classifier and fail-closed cannot be disabled; every save is audited + alerted |
 | | Audit log | **Clear log** (clearable entries only) | vetoes with immutable flag (🔒) and evidence-record marker; every admin action; sealed-evidence index (ids, times, categories, hashes — never content) |
@@ -18,6 +19,9 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 | Gateway | Certificates | — | live TLS probe of every served host |
 | | Public hostname | hostname + Cloudflare token | writes exactly one templated site file; Let's Encrypt via DNS-01, no inbound ports |
 | | Isolation | — | **read-only** view of the Caddyfile and compose network wiring |
+
+## Public status page
+`https://<LAN_IP>/status` (and `/status/api` as JSON) shows the same load/health view **without a login** — GPU/CPU/memory/disk load, models in memory, service up/down. It deliberately contains no accounts, keys, aliases or content; the acceptance suite asserts that. It is the first tile of the future portal.
 
 ## Privilege model
 - The hub's own login is the administrator boundary (see top). One admin identity by design until the identity layer lands (roadmap).

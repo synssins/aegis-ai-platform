@@ -45,6 +45,11 @@
         reverse_proxy localhost:9000
     }
 
+    # Public status page (GPU/CPU/memory load, resident models, service health — no sensitive data, no login).
+    handle /status* {
+        reverse_proxy localhost:9000
+    }
+
     # Monitoring — present when `--profile monitoring` is up (502 otherwise). Grafana has its own login.
     handle /grafana* {
         reverse_proxy grafana:3000

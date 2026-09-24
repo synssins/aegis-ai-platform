@@ -4,6 +4,10 @@ All significant changes to the platform are recorded here. Every entry must name
 
 ## 2026-09-24 (night) — 8B guard live with Gemma 3 27B
 
+- **Metrics in the hub + public status page:** Caddy joined the `monitoring` network so the hub reads Prometheus; new Overview → Metrics (GPU util/VRAM/temp/power per card with sparklines, CPU, memory, disk, resident models, services; refreshes every 15 s) and public `/status` + `/status/api` (no login; no accounts/keys/content — asserted by tests 5.16–5.18).
+- **Grafana "no data" fixed:** dashboard panels referenced datasource uid `prometheus` but provisioning left the uid auto-generated; uid pinned, verified with a panel query.
+- **Open WebUI default model:** `DEFAULT_MODELS=${OPENWEBUI_DEFAULT_MODEL}` (gemma3) — it was still preselecting mixtral.
+
 - **Disk:** root volume was 98 GB and hit 100% during a model pull (git and a pull failed); 18.6 GB of partial blobs and unused images reclaimed, then the LV grown online by 400 GB (492 GB now; 1 TB still free in the VG).
 - **VetoGuard 2.9 — retention + evidence** (operator requirement): audit entries carry `immutable` (S4 always; S3/S10/S11 and CSAM tripwires by default) and can only expire by time; hub **Clear log** keeps them. Evidence set (S4 + CSAM tripwires; S4 always) produces sealed records — full request/output, key, client IP/agent, model, categories with names, exact matched spans — Fernet-encrypted (`VETO_EVIDENCE_KEY`), hash-chained, metadata-only index, root-only, expiry sweeper; `scripts/evidence-export.sh` verifies the chain and exports for law enforcement. Unit-verified: capture set, encryption, index without content, client IP, spans, chain integrity.
 
