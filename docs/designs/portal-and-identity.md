@@ -47,6 +47,29 @@ Mirroring grants into an app's own settings is for UX only; enforcement happens 
 - ComfyUI stays 503 at the edge until the prompt gate, the image classifier and the gallery enforcement exist and
   pass the sentinel suite (roadmap #8).
 
+## NSFW model files in ComfyUI — per-file attributes, enforced on the workflow (design, 2026-09-24)
+A workflow is not NSFW; a **file** is. Every model reference in a ComfyUI workflow is a filename in a known
+folder (`CheckpointLoaderSimple.ckpt_name`, `LoraLoader.lora_name`, `VAELoader`, `UNETLoader`, `CLIPLoader`,
+`ControlNetLoader`, …), so the gate works on files:
+
+1. **Attribute registry (hub, root-only):** every file under `comfyui/` carries `nsfw: yes | no | unclassified`,
+   plus source, hash, licence. The browser sets it at download time from the registry's own flag (CivitAI `nsfw`,
+   HF `not-for-all-audiences`); files copied in by hand start **unclassified**. Admin edits it in Models →
+   Installed (audited). Unclassified = unavailable to everyone but admins until classified (fail closed).
+2. **Enforcement point = the portal proxy in front of ComfyUI's `POST /prompt`.** ComfyUI is reachable only
+   through it (`apps` network; `/comfy` is 503 at the edge until this exists). The proxy walks the submitted
+   workflow, collects **every string input that names a file in the store** (not just known node classes — so a
+   custom "load from path" node cannot slip one through), and refuses the whole prompt (400, audited, user +
+   files named) if any referenced file is NSFW/unclassified and the user lacks `images_nsfw`. Workflows that
+   reference only SFW files run for anyone with `images`.
+3. **Menus follow the grant (UX, not the control):** the proxy filters `/object_info` so a user without
+   `images_nsfw` never sees NSFW filenames in dropdowns.
+4. **Output gate is independent of the file attribute:** an SFW checkpoint can still produce NSFW output. Every
+   image passes the output classifier; illegal → destroyed + sealed metadata (as designed); NSFW for a user
+   without the grant → destroyed, audited, not evidence; NSFW for a granted user → gallery.
+5. **Prompt gate** (VetoGuard on positive/negative prompt text) runs before any of this, as for chat.
+6. Gallery items carry the files/attributes used, so admin review and the user's own purge see them.
+
 ## Model browser (Hub → Models → Browse)
 Agreed with Gemini after review:
 - **Guest-bound telemetry only.** VRAM budget from DCGM/Prometheus and Ollama inside the VM. The guest never
