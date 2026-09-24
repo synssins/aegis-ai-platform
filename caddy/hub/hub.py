@@ -66,6 +66,8 @@ VETO_AUDIT = os.path.join(AUDIT_DIR, "veto-audit.jsonl")
 SNIPPETS = os.path.join(AUDIT_DIR, "veto-snippets.jsonl")
 EVIDENCE_DIR = "/app/evidence"
 EVIDENCE_INDEX = os.path.join(EVIDENCE_DIR, "index.jsonl")
+HANDOFF_DIR = os.path.join(EVIDENCE_DIR, "handoff")
+EVIDENCE_KEY = os.environ.get("VETO_EVIDENCE_KEY", "")
 DEFAULT_RETENTION = {"immutable_categories": ["S4", "S3", "S10", "S11"], "immutable_tripwires": ["csam", "despaced"], "immutable_days": 730,
                      "evidence": {"enabled": True, "categories": ["S4"], "tripwires": ["csam", "despaced"], "days": 730}}
 OPS_REQ = "/app/ops/requests/request.json"
@@ -879,9 +881,9 @@ def p_audit():
     n_imm = sum(1 for e in allv if e.get("immutable")); n_clr = len(allv) - n_imm
     clear = f'<form method="post" action="/hub/api/audit/clear" class="inline">{csrf_field()}<input type="hidden" name="confirm" value="clear"><button class="danger">Clear log ({n_clr} clearable)</button></form> <span class="mut">{n_imm} immutable entries stay until {r.get("immutable_days")} days old ({esc(", ".join(r.get("immutable_categories", [])))} · tripwires {esc(", ".join(r.get("immutable_tripwires", [])))}).</span>'
     ev, ectl = paginate(evidence_index(), "ev", 10)
-    evrows = "".join(f'<tr><td><code>{esc(e.get("id"))}</code></td><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))} {esc(e.get("reason"))}</td><td>{esc(", ".join(e.get("categories") or []))}</td><td>{esc(e.get("key_alias"))}</td><td class="mut"><code>{esc(str(e.get("hash"))[:16])}…</code></td></tr>' for e in ev) or '<tr><td colspan="6" class="mut">no sealed records</td></tr>'
+    evrows = "".join(f'<tr><td><code>{esc(e.get("id"))}</code></td><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))} {esc(e.get("reason"))}</td><td>{esc(", ".join(e.get("categories") or []))}</td><td>{esc(e.get("key_alias"))}</td><td class="mut"><code>{esc(str(e.get("hash"))[:16])}…</code></td><td><form class="inline" method="post" action="/hub/api/evidence/handoff">{csrf_field()}<input type="hidden" name="id" value="{esc(e.get("id"))}"><button class="ghost">Export for handoff</button></form></td></tr>' for e in ev) or '<tr><td colspan="7" class="mut">no sealed records</td></tr>'
     hrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("actor"))}</td><td>{esc(e.get("event"))}</td><td>{esc(", ".join(f"{k}={v}" for k, v in e.items() if k not in ("ts", "event", "actor")))[:120]}</td></tr>' for e in hub) or '<tr><td colspan="4" class="mut">none</td></tr>'
-    evcard = f'<div class="card"><h2 style="margin-top:0">Sealed evidence records</h2><p class="mut">Captured for {esc(", ".join(r["evidence"].get("categories", [])))} and tripwires {esc(", ".join(r["evidence"].get("tripwires", [])))}: full request/output, timestamp, key, client IP, matched spans — encrypted at rest, hash-chained, never displayed here. Kept {r["evidence"].get("days")} days. Export for law enforcement is console-only: <code>scripts/evidence-export.sh &lt;id|all&gt; &lt;outdir&gt;</code> (verifies the chain).</p>{ectl}<table><tr><th>Record</th><th>Time</th><th>Trigger</th><th>Categories</th><th>Key</th><th>Hash</th></tr>{evrows}</table></div>'
+    evcard = f'<div class="card"><h2 style="margin-top:0">Sealed evidence records</h2><p class="mut">Captured for {esc(", ".join(r["evidence"].get("categories", [])))} and tripwires {esc(", ".join(r["evidence"].get("tripwires", [])))}: full request/output, timestamp, key, client IP, matched spans — encrypted at rest, hash-chained, never displayed here. Kept {r["evidence"].get("days")} days. Export for law enforcement is console-only: <code>scripts/evidence-export.sh &lt;id|all&gt; &lt;outdir&gt;</code> (verifies the chain).</p>{ectl}<table><tr><th>Record</th><th>Time</th><th>Trigger</th><th>Categories</th><th>Key</th><th>Hash</th><th></th></tr>{evrows}</table><p class="mut">"Export for handoff" re-encrypts one record with a fresh key: you download the file here and the key is shown once — send them to law enforcement by separate channels; they open it with <code>scripts/evidence-open.py</code>. Exports are audited and alerted.</p></div>'
     body = srows + f'<div class="card"><h2 style="margin-top:0">Vetoes</h2><div style="margin:0 0 8px">{clear}</div>{vctl}<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Category / detail</th><th>Model</th><th>Key</th><th></th></tr>{vrows}</table>{vctl}</div>' + evcard + f'<div class="card"><h2 style="margin-top:0">Admin actions</h2>{hctl}<table><tr><th>Time</th><th>Actor</th><th>Event</th><th>Fields</th></tr>{hrows}</table>{hctl}</div><p class="mut">Logs never contain message content. Files: proxy/audit/veto-audit.jsonl, proxy/audit/hub-audit.jsonl (root-only on the host).</p>'
     return page("safety", "audit", "Audit log", "Every veto (what tripped, who, when) and every administrative action.", body)
 
@@ -1042,6 +1044,41 @@ def act_policy(form):
         activate_guard(gm)
         return p_policy(f"Policy saved. Loading {gm} into memory now (other guard models are being unloaded); refresh in ~20 s to see it resident.")
     return p_policy("Policy saved. LiteLLM picks it up within seconds (no restart).")
+
+
+def act_evidence_handoff(form):
+    rid = form.get("id", "")
+    if not re.fullmatch(r"[0-9TZ]+-[0-9a-f]{8}", rid):
+        return p_audit()
+    src = os.path.join(EVIDENCE_DIR, rid + ".json.enc")
+    if not os.path.exists(src) or not EVIDENCE_KEY:
+        audit("evidence_handoff_failed", id=rid, reason="record missing or evidence key not configured")
+        return page("safety", "audit", "Audit log", "", '<div class="msg bad">Record not found, or the hub has no evidence key.</div>')
+    platform = Fernet(base64.urlsafe_b64encode(hashlib.sha256(EVIDENCE_KEY.encode()).digest()))
+    try:
+        rec = json.loads(platform.decrypt(open(src, "rb").read()))
+    except (InvalidToken, ValueError) as e:
+        audit("evidence_handoff_failed", id=rid, reason=f"decrypt: {type(e).__name__}")
+        return page("safety", "audit", "Audit log", "", '<div class="msg bad">Record could not be decrypted with the platform key.</div>')
+    body = {k: v for k, v in rec.items() if k not in ("prev_hash", "hash")}
+    verified = hashlib.sha256((rec["prev_hash"] + json.dumps(body, sort_keys=True, ensure_ascii=False)).encode()).hexdigest() == rec["hash"]
+    handoff_key = Fernet.generate_key().decode()                      # fresh key, shown once
+    bundle = {"format": "aegis-evidence-handoff-v1", "id": rid, "exported": now(), "exported_by": getattr(REQ, "user", "admin"),
+              "chain_hash": rec["hash"], "prev_hash": rec["prev_hash"], "chain_verified_at_export": verified,
+              "ciphertext": Fernet(handoff_key.encode()).encrypt(json.dumps(rec, sort_keys=True, ensure_ascii=False).encode()).decode(),
+              "open_with": "scripts/evidence-open.py <file> — the key was given to you separately"}
+    os.makedirs(HANDOFF_DIR, exist_ok=True)
+    out = os.path.join(HANDOFF_DIR, rid + ".aegis-evidence")
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(bundle, f, indent=1)
+    os.chmod(out, 0o600)
+    audit("evidence_exported_for_handoff", id=rid, chain_verified=verified)
+    body_html = f'''<div class="card"><h2 style="margin-top:0">Handoff bundle ready — record {esc(rid)}</h2>
+<p>Chain integrity at export: <b class="{"ok" if verified else "bad"}">{"verified" if verified else "FAILED — do not rely on this record"}</b></p>
+<p><a href="/hub/evidence/download/{esc(rid)}"><button>Download {esc(rid)}.aegis-evidence</button></a></p>
+<p><b>Decryption key — shown once. Send it to the recipient by a different channel than the file.</b></p><div class="key">{esc(handoff_key)}</div>
+<p class="mut">The recipient opens the bundle with <code>python3 evidence-open.py {esc(rid)}.aegis-evidence</code> (needs the <code>cryptography</code> package) and is prompted for the key. The export is recorded in the admin audit log.</p></div>'''
+    return page("safety", "audit", "Evidence handoff", "One record, one fresh key, two channels.", body_html)
 
 
 def act_clear_log(form):
@@ -1251,7 +1288,7 @@ def act_hostname(form):
     return p_hostname(f"Applied {host}. Caddy will obtain the certificate via DNS-01 within a minute or two. {m}" if ok else f"Failed and rolled back: {m}", ok)
 
 
-ACTIONS = {"/hub/api/ops": act_ops, "/hub/api/audit/clear": act_clear_log, "/hub/api/policy": act_policy, "/hub/api/alerts": act_alerts, "/hub/api/models/pull": act_pull,
+ACTIONS = {"/hub/api/ops": act_ops, "/hub/api/audit/clear": act_clear_log, "/hub/api/evidence/handoff": act_evidence_handoff, "/hub/api/policy": act_policy, "/hub/api/alerts": act_alerts, "/hub/api/models/pull": act_pull,
            "/hub/api/models/expose": act_expose, "/hub/api/models/unexpose": act_unexpose, "/hub/api/models/remove": act_remove,
            "/hub/api/models/unload": act_unload, "/hub/api/models/load": act_load, "/hub/api/models/setguard": act_setguard,
            "/hub/api/keys/mint": act_mint, "/hub/api/keys/revoke": act_revoke, "/hub/api/keys/update": act_keys_update, "/hub/api/hostname": act_hostname}
@@ -1340,6 +1377,15 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/hub/api/status":
             dom = current_domain(); cst, cts = container_status()
             return self._send(200, json.dumps({"containers": cst, "status_ts": cts, "lan": probe_cert(LAN_IP), "domain": dom, "public": probe_cert(LAN_IP, dom) if dom else None, "policy": policy()}, indent=1), "application/json")
+        if p.startswith("/hub/evidence/download/"):
+            rid = p.rsplit("/", 1)[-1]
+            f = os.path.join(HANDOFF_DIR, rid + ".aegis-evidence")
+            if not re.fullmatch(r"[0-9TZ]+-[0-9a-f]{8}", rid) or not os.path.exists(f):
+                return self._send(404, "not found", "text/plain")
+            audit("evidence_handoff_downloaded", id=rid)
+            data = open(f, "rb").read()
+            self.send_response(200); self.send_header("Content-Type", "application/octet-stream"); self.send_header("Content-Disposition", f'attachment; filename="{rid}.aegis-evidence"')
+            self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(data); return
         parts = p.split("/")
         if len(parts) == 4 and (parts[2], parts[3]) in PAGES:
             return self._send(200, PAGES[(parts[2], parts[3])]())

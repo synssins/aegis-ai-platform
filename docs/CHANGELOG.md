@@ -4,6 +4,9 @@ All significant changes to the platform are recorded here. Every entry must name
 
 ## 2026-09-24 (night) — 8B guard live with Gemma 3 27B
 
+- **Evidence handoff from the hub:** per-record re-encryption with a fresh key (file download + key shown once, separate channels), `scripts/evidence-open.py` for recipients (verifies chain hash), audited. Hub now holds `VETO_EVIDENCE_KEY` (admin plane, noted). Round-trip tested in throwaway containers; wrong key refused.
+- **Design for review:** `docs/designs/portal-and-identity.md` — portal shell, Authelia identity, hub as single source of truth with enforcement at LiteLLM/portal proxies, gallery with prompt-gate-first and destroy-never-store output gate (perceptual-hash evidence), model browser per the Gemini exchange (guest-bound telemetry, badges not scrubbing, mgmt-only egress, safetensors/GGUF + SHA-256, preview blackout, blue/red CivitAI key scope).
+
 - **Metrics in the hub + public status page:** Caddy joined the `monitoring` network so the hub reads Prometheus; new Overview → Metrics (GPU util/VRAM/temp/power per card with sparklines, CPU, memory, disk, resident models, services; refreshes every 15 s) and public `/status` + `/status/api` (no login; no accounts/keys/content — asserted by tests 5.16–5.18).
 - **Grafana "no data" fixed:** dashboard panels referenced datasource uid `prometheus` but provisioning left the uid auto-generated; uid pinned, verified with a panel query.
 - **Open WebUI default model:** `DEFAULT_MODELS=${OPENWEBUI_DEFAULT_MODEL}` (gemma3) — it was still preselecting mixtral.

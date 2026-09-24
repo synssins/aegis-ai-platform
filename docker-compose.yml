@@ -46,6 +46,7 @@ services:
       - AEGIS_LAN_IP=${AEGIS_LAN_IP}
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
       - HUB_SECRET_KEY=${HUB_SECRET_KEY}
+      - VETO_EVIDENCE_KEY=${VETO_EVIDENCE_KEY}      # evidence handoff export (re-encrypts one record with a fresh key)
       - GRAFANA_ENABLED=${GRAFANA_ENABLED:-0}
     volumes:
       - ./caddy/hub/hub.py:/app/hub.py:ro
