@@ -7,7 +7,7 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 |---|---|---|---|
 | Overview | Dashboard | — | services by network, safety posture, VRAM residency, certificates, recent vetoes |
 | | Services | — | health of every container; starting/stopping is console-only |
-| Safety | VetoGuard policy | guard model, blocked categories, tripwires, extra regexes | **S4 is locked on**; classifier and fail-closed cannot be disabled; every save is audited + alerted |
+| Safety | VetoGuard policy | guard model, blocked categories, tripwires, extra regexes, **diagnostics snippet toggle (default off)** | **S4 is locked on**; classifier and fail-closed cannot be disabled; every save is audited + alerted |
 | | Audit log | — | last 150 vetoes and 100 admin actions; never contains content |
 | | Alerts | webhook URL | Discord/Slack/generic JSON; "Send test" |
 | Models | Installed | expose / remove | expose = register in LiteLLM under a public name (through VetoGuard); guard models never exposable; resident/exposed models cannot be removed |

@@ -214,6 +214,7 @@ def policy() -> dict:
     p["categories"]["S4"]["block"] = True
     p.setdefault("guard", DEFAULT_POLICY["guard"].copy())
     p.setdefault("tripwires", {"enabled": True, "extra_patterns": []})
+    p.setdefault("audit", {"store_snippet": False})
     return p
 
 
@@ -433,6 +434,8 @@ def p_policy(msg="", ok=True):
 <div class="mut">Policy intent: illegal and protected-class content never passes; adult content may. Unchecking an "illegal" class is allowed but audited and alerted.</div></div>
 <div class="card"><h2 style="margin-top:0">Lexical tripwires</h2><label><input type="checkbox" name="tripwires" {"checked" if pol["tripwires"].get("enabled", True) else ""} style="width:auto"> Enabled (built-in lists for sentinel / CSAM terms / malware intent)</label>
 <label>Extra patterns — one Python regex per line, matched case-insensitively against normalised text</label><textarea name="extra">{esc(extra)}</textarea></div>
+<div class="card"><h2 style="margin-top:0">Diagnostics</h2><label><input type="checkbox" name="store_snippet" {"checked" if pol.get("audit", {}).get("store_snippet") else ""} style="width:auto"> Store a 160-character snippet of <b>flagged output</b> in <code>proxy/audit/veto-snippets.jsonl</code> (root-only)</label>
+<div class="mut">Off by default: logs never contain content. Turn on temporarily to diagnose false positives, then turn off. Never applies to S4 or CSAM-tripwire vetoes. Toggling is audited and alerted.</div></div>
 <p class="mut">Last change: {esc(pol.get("updated") or "never")} by {esc(pol.get("updated_by") or "—")}. Saving is logged and alerted.</p>
 <button type="submit">Save policy</button></form>"""
     return page("safety", "policy", "VetoGuard policy", "What the safety gate blocks. Administrator only; every change is audited.", body, msg, ok)
@@ -443,7 +446,12 @@ def p_audit():
     hub, hctl = paginate(tail_jsonl(HUB_AUDIT, 5000), "h")
     vrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))}</td><td>{esc(e.get("detail", ""))[:80]}</td><td>{esc(e.get("model"))}</td><td>{esc(e.get("key_alias"))}</td></tr>' for e in veto) or '<tr><td colspan="6" class="mut">none</td></tr>'
     hrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("event"))}</td><td>{esc(", ".join(f"{k}={v}" for k, v in e.items() if k not in ("ts", "event", "actor")))[:120]}</td></tr>' for e in hub) or '<tr><td colspan="3" class="mut">none</td></tr>'
-    body = f'<div class="card"><h2 style="margin-top:0">Vetoes</h2>{vctl}<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Detail</th><th>Model</th><th>Key</th></tr>{vrows}</table>{vctl}</div><div class="card"><h2 style="margin-top:0">Admin actions</h2>{hctl}<table><tr><th>Time</th><th>Event</th><th>Fields</th></tr>{hrows}</table>{hctl}</div><p class="mut">Logs never contain message content. Files: proxy/audit/veto-audit.jsonl, proxy/audit/hub-audit.jsonl (root-only on the host).</p>'
+    snips = tail_jsonl("/app/audit/veto-snippets.jsonl", 500)
+    srows = ""
+    if snips:
+        sp, sctl = paginate(snips, "n")
+        srows = '<div class="card"><h2 style="margin-top:0">Flagged-output snippets (diagnostics)</h2>' + sctl + '<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Key</th><th>Snippet</th></tr>' + "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))} {esc(e.get("detail", ""))}</td><td>{esc(e.get("key_alias"))}</td><td><code>{esc(e.get("snippet", ""))}</code></td></tr>' for e in sp) + '</table></div>'
+    body = srows + f'<div class="card"><h2 style="margin-top:0">Vetoes</h2>{vctl}<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Detail</th><th>Model</th><th>Key</th></tr>{vrows}</table>{vctl}</div><div class="card"><h2 style="margin-top:0">Admin actions</h2>{hctl}<table><tr><th>Time</th><th>Event</th><th>Fields</th></tr>{hrows}</table>{hctl}</div><p class="mut">Logs never contain message content. Files: proxy/audit/veto-audit.jsonl, proxy/audit/hub-audit.jsonl (root-only on the host).</p>'
     return page("safety", "audit", "Audit log", "Every veto and every administrative action.", body)
 
 
@@ -558,6 +566,10 @@ def act_policy(form):
             return p_policy(f"Invalid regex {pat!r}: {e}", False)
     pol["guard"]["model"] = gm
     pol["tripwires"] = {"enabled": "tripwires" in form, "extra_patterns": extra}
+    snip = "store_snippet" in form
+    if snip != bool(pol.get("audit", {}).get("store_snippet")):
+        audit("snippet_logging_" + ("enabled" if snip else "disabled"))
+    pol["audit"] = {"store_snippet": snip}
     pol["updated"], pol["updated_by"] = now(), "admin"
     save_json(POLICY_FILE, pol)
     changed = [f"{c}:{'block' if pol['categories'][c]['block'] else 'allow'}" for c in CATEGORIES if before[c] != pol["categories"][c]["block"]]

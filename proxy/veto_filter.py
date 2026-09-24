@@ -1,6 +1,22 @@
 """
-VetoGuard rev 2.5 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
+VetoGuard rev 2.7 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
 driven by an admin-editable policy file (hot-reloaded) that only the hub may write.
+
+rev 2.7 (Agy round 5, docs/tests/agy-vetoguard-review-r5-2026-09-24.md): oversized multipart leaves are
+never dropped; base64 fragments with stray non-printables are kept (cleaned) instead of discarded;
+system-role messages always reach the classifier chunks; prefill windows are classified as-is (no
+synthetic user turn); regex scans run on a dedicated bounded executor (saturation => refusal, never
+bypass); streamed chunk COUNT is capped as well as bytes; indented base64 continuation lines accepted.
+Optional admin diagnostics: policy "audit": {"store_snippet": true} stores <=160 chars of FLAGGED OUTPUT
+(never for S4 / CSAM-tripwire reasons) in VETO_SNIPPET_PATH — default off.
+
+rev 2.6 (Agy round 4, docs/tests/agy-vetoguard-review-r4-2026-09-24.md): the classifier's new segment
+starts at the last user turn WITH TEXT (an empty trailing user turn no longer hides an earlier payload)
+and includes tool-call arguments; the conversation window is always classified; streamed reasoning
+is joined before scanning; base64 detection ignores zero-width/format characters and accepts 2-line
+wraps; SchemaBudgetExceeded is handled (withhold) in the post-call paths; unknown multipart block
+types contribute all their string leaves; relative audit paths work. Round-4 finding 3 (hook argument
+order) is a false positive — verified against LiteLLM's CustomLogger source.
 
 rev 2.5 (Agy round 3, docs/tests/agy-vetoguard-review-r3-2026-09-24.md): hook signatures are the ones
 verified in LiteLLM's source (no argument-order guessing); top-level system + tool schemas reach the
@@ -41,6 +57,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import binascii
 import fcntl
 import copy
@@ -64,10 +81,14 @@ log = logging.getLogger("vetoguard")
 GUARD_URL = os.environ.get("VETO_GUARD_URL", "http://ollama:11434").rstrip("/")
 POLICY_PATH = os.environ.get("VETO_POLICY_PATH", "/app/policy/veto-policy.json")
 AUDIT_PATH = os.environ.get("VETO_AUDIT_PATH", "/app/audit/veto-audit.jsonl")
+SNIPPET_PATH = os.environ.get("VETO_SNIPPET_PATH", "/app/audit/veto-snippets.jsonl")
+SNIPPET_CHARS = 160
+NEVER_SNIPPET = ("S4", "csam", "despaced")
 AUDIT_ROTATE_BYTES = 50 * 1024 * 1024
 WITHHELD_MSG = "[Response withheld by policy: veto_triggered]"
 SCAN_BUDGET_S = 5.0
 MAX_OUTPUT_CHARS = 400_000
+MAX_OUTPUT_CHUNKS = 20_000
 POLICY_CHECK_INTERVAL_S = 2.0
 CONVERSATION_WINDOW = 8
 MAX_SCHEMA_NODES = 5000
@@ -86,6 +107,7 @@ DEFAULT_POLICY = {
               "chunk_chars": 6000, "chunk_overlap": 600, "max_chunks": 100, "timeout": 60, "concurrency": 2},
     "categories": {c: {"block": c in DEFAULT_BLOCK} for c in LLAMA_GUARD_CATEGORIES},
     "tripwires": {"enabled": True, "extra_patterns": []},
+    "audit": {"store_snippet": False},
 }
 
 
@@ -147,7 +169,7 @@ class Policy:
                 try:
                     with open(POLICY_PATH, encoding="utf-8") as f:
                         loaded = json.load(f)
-                    for k in ("guard", "tripwires"):
+                    for k in ("guard", "tripwires", "audit"):
                         if isinstance(loaded.get(k), dict):
                             data[k].update(loaded[k])
                     if isinstance(loaded.get("categories"), dict):
@@ -220,7 +242,7 @@ CONFUSABLES = str.maketrans({
     "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T", "Х": "X", "У": "Y",
     "І": "I", "Ј": "J", "Ѕ": "S", "Ԁ": "D", "Ԛ": "Q", "Ԝ": "W",
     # Greek lower/upper -> Latin
-    "α": "a", "β": "b", "ε": "e", "ι": "i", "κ": "k", "ν": "v", "ο": "o", "ρ": "p", "τ": "t", "υ": "u", "χ": "x", "γ": "y", "η": "n", "μ": "u",
+    "α": "a", "β": "b", "ε": "e", "ι": "i", "κ": "k", "ν": "v", "ο": "o", "ρ": "p", "τ": "t", "υ": "u", "χ": "x", "γ": "y", "η": "n", "μ": "m", "ω": "w", "σ": "o", "ς": "s", "з": "3", "ԁ": "d",
     "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X",
 })
 
@@ -233,11 +255,13 @@ def normalise(text: str) -> str:
     return WS_RE.sub(" ", text).lower()
 
 
-B64_BLOCK_RE = re.compile(r"(?:[A-Za-z0-9+/_-]{4,}={0,2}[ \t]*\r?\n){2,}[A-Za-z0-9+/_-]{4,}={0,2}")
+B64_BLOCK_RE = re.compile(r"(?:[ \t]*[A-Za-z0-9+/_-]{4,}={0,2}[ \t]*\r?\n){1,}[ \t]*[A-Za-z0-9+/_-]{4,}={0,2}")
+FORMAT_CHARS_RE = re.compile(r"[\u200b-\u200f\u2060-\u2064\ufeff\u00ad]")
 
 
 def _decoded_b64_fragments(text: str) -> list[str]:
     out = []
+    text = FORMAT_CHARS_RE.sub("", text)
     joined = " ".join(re.sub(r"\s+", "", m.group(0)) for m in B64_BLOCK_RE.finditer(text))
     for m in B64_RUN_RE.finditer(text + ("\n" + joined if joined else "")):
         s = m.group(0).rstrip("=").replace("-", "+").replace("_", "/")
@@ -246,8 +270,9 @@ def _decoded_b64_fragments(text: str) -> list[str]:
             dec = base64.b64decode(s, validate=True).decode("utf-8")
         except (binascii.Error, ValueError, UnicodeDecodeError):
             continue
-        if dec.strip() and all(ch.isprintable() or ch in "\n\t\r" for ch in dec):
-            out.append(dec)
+        clean = "".join(ch for ch in dec if ch.isprintable() or ch in "\n\t\r")
+        if clean.strip() and len(clean) >= 0.5 * len(dec):
+            out.append(clean)
     return out
 
 
@@ -290,12 +315,15 @@ def _content_to_text(content: Any) -> str:
             if isinstance(p, str):
                 parts.append(p)
             elif isinstance(p, dict):
+                known = False
                 for k in ("text", "input_text", "content", "refusal"):
                     v = p.get(k)
                     if isinstance(v, str):
-                        parts.append(v)
+                        parts.append(v); known = True
                     elif isinstance(v, list):
-                        parts.append(_content_to_text(v))
+                        parts.append(_content_to_text(v)); known = True
+                if not known and p.get("type") not in ("image_url", "input_image", "input_audio", "audio", "file"):
+                    parts.extend(_string_leaves(p, 0))
         return "\n".join(x for x in parts if x)
     if isinstance(content, dict):
         return "\n".join(_string_leaves(content, 0))
@@ -334,9 +362,20 @@ class RequestView:
                 if role == "tool":
                     t = "Tool result: " + t
                 self.turns.append({"role": "assistant" if role == "assistant" else "user", "content": t})
-        self.last_user = next((_content_to_text(m.get("content")) for m in reversed(msgs) if m.get("role") == "user"), "")
-        last_user_idx = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=0)
-        self.new_segment = [t for t in (_content_to_text(m.get("content")) for m in msgs[last_user_idx:]) if t]
+        self.last_user = next((_content_to_text(m.get("content")) for m in reversed(msgs) if m.get("role") == "user" and _content_to_text(m.get("content")).strip()), "")
+        last_user_idx = max((i for i, m in enumerate(msgs) if m.get("role") == "user" and _content_to_text(m.get("content")).strip()), default=0)
+        self.new_segment = []
+        for m in msgs[last_user_idx:]:
+            t = _content_to_text(m.get("content"))
+            if m.get("tool_calls"):
+                t = (t + "\n" + _tool_calls_text(m.get("tool_calls"))).strip()
+            if t:
+                self.new_segment.append(t)
+        for m in msgs:
+            if m.get("role") in ("system", "developer"):
+                sx = _content_to_text(m.get("content"))
+                if sx:
+                    self.new_segment.append(sx)
         if data.get("system"):
             sysx = _content_to_text(data.get("system"))
             texts.append(sysx); self.new_segment.append(sysx)
@@ -387,9 +426,14 @@ def tripwire_check(texts: list[str], lists: tuple[str, ...]) -> tuple[str, str] 
     return ("despaced", hit) if hit else None
 
 
+_SCAN_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="veto-scan")
+
+
 async def tripwires(texts: list[str], lists: tuple[str, ...]):
+    """Dedicated bounded pool: a ReDoS can stall at most 4 workers; queued scans then time out => refusal."""
+    loop = asyncio.get_running_loop()
     try:
-        return await asyncio.wait_for(asyncio.to_thread(tripwire_check, texts, lists), timeout=SCAN_BUDGET_S)
+        return await asyncio.wait_for(loop.run_in_executor(_SCAN_POOL, tripwire_check, texts, lists), timeout=SCAN_BUDGET_S)
     except asyncio.TimeoutError:
         return "timeout"
 
@@ -404,7 +448,7 @@ def _audit_writer() -> None:
     while True:
         rec = _AUDIT_Q.get()
         try:
-            os.makedirs(os.path.dirname(AUDIT_PATH), exist_ok=True)
+            os.makedirs(os.path.dirname(AUDIT_PATH) or ".", exist_ok=True)
             with open(AUDIT_PATH + ".lock", "a") as lk:
                 fcntl.flock(lk, fcntl.LOCK_EX)
                 try:
@@ -444,6 +488,24 @@ def audit(stage: str, reason: str, detail: str, data: dict, key_dict: Any) -> No
         _AUDIT_Q.put_nowait(rec)
     except queue.Full:
         log.error("audit queue full; event dropped from file (still in process log)")
+
+
+def snippet(stage: str, reason: str, detail: str, data: dict, key_dict: Any, text: str) -> None:
+    """Admin-enabled diagnostics for flagged OUTPUT only. Never for S4 / CSAM-tripwire reasons."""
+    if not POLICY.data.get("audit", {}).get("store_snippet"):
+        return
+    if any(x in detail for x in NEVER_SNIPPET) or any(x in reason for x in NEVER_SNIPPET):
+        return
+    rec = {"ts": datetime.now(timezone.utc).isoformat(), "stage": stage, "reason": reason, "detail": detail[:60],
+           "call_id": data.get("litellm_call_id"), "key_alias": _key_alias(key_dict), "snippet": text.strip()[:SNIPPET_CHARS]}
+    def _w():
+        try:
+            with open(SNIPPET_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+            os.chmod(SNIPPET_PATH, 0o600)
+        except OSError as e:
+            log.error("snippet write failed: %s", e)
+    threading.Thread(target=_w, daemon=True).start()
 
 
 def _refuse(status: int, code: str, message: str) -> None:
@@ -547,8 +609,8 @@ async def classify_request(view: RequestView) -> tuple[bool, list[str]]:
         _refuse(413, "prompt_too_long_for_guard", "Input exceeds the classifier budget.")
     calls = [[{"role": "user", "content": ch}] for ch in chunks if ch.strip()]
     w = _window(view.turns)
-    if w and w[-1]["role"] == "user" and len(w) > 1:
-        calls.append(w)                                   # multi-turn context classification
+    if len(w) > 1:
+        calls.append(w)                                   # multi-turn context classification (prefill evaluated as-is)
     return await _classify_many(calls)
 
 
@@ -637,19 +699,26 @@ class VetoGuard(CustomLogger):
             if hit == "timeout":
                 audit(stage, "regex_budget_exhausted", "", data, key); return ["REGEX_BUDGET"]
             if hit:
-                audit(stage, f"regex:{hit[0]}", hit[1], data, key); return [hit[0]]
+                audit(stage, f"regex:{hit[0]}", hit[1], data, key); snippet(stage, f"regex:{hit[0]}", hit[1], data, key, "\n".join(outputs)); return [hit[0]]
         try:
-            unsafe, cats = await classify_output(RequestView(data).last_user, outputs)
+            try:
+                last_user = RequestView(data).last_user
+            except SchemaBudgetExceeded:
+                last_user = ""
+            unsafe, cats = await classify_output(last_user, outputs)
         except GuardUnavailable as e:
             audit(stage, "guard_unavailable", _short_err(e), data, key); return ["GUARD_UNAVAILABLE"]
         if unsafe:
-            audit(stage, "classifier", ",".join(cats), data, key); return cats
+            audit(stage, "classifier", ",".join(cats), data, key); snippet(stage, "classifier", ",".join(cats), data, key, "\n".join(outputs)); return cats
         return None
 
     async def async_post_call_success_hook(self, data, user_api_key_dict, response):
         POLICY.reload()
         try:
             outputs = extract_outputs(response)
+        except SchemaBudgetExceeded as e:
+            audit("post_call", "schema_budget_exceeded", _short_err(e), data, user_api_key_dict)
+            _refuse(400, "veto_triggered", "Response structure too large to evaluate; withheld (fail-closed).")
         except Exception as e:  # noqa: BLE001 — fail closed
             audit("post_call", "extraction_failure", _short_err(e), data, user_api_key_dict)
             _refuse(500, "safety_processing_error", "Response could not be evaluated; withheld (fail-closed).")
@@ -693,21 +762,25 @@ class VetoGuard(CustomLogger):
             except Exception as e:  # noqa: BLE001 — fail closed
                 audit("post_call_stream", "extraction_failure", _short_err(e), request_data, user_api_key_dict)
                 withheld = ["EXTRACTION_FAILURE"]; break
-            if size > MAX_OUTPUT_CHARS:
-                audit("post_call_stream", "output_buffer_cap", str(size), request_data, user_api_key_dict)
+            if size > MAX_OUTPUT_CHARS or len(buffered) > MAX_OUTPUT_CHUNKS:
+                audit("post_call_stream", "output_buffer_cap", f"{size} chars / {len(buffered)} chunks", request_data, user_api_key_dict)
                 withheld = ["OUTPUT_TOO_LONG"]; break
         if not buffered:
             return
         if withheld is None:
             outputs = []
-            for slot in per_choice.values():
-                outputs.append("".join(slot["text"]))
-                outputs.extend(slot["reason"])
-                outputs.extend(f"{n} {_unescape_json_string(a)}" for n, a in slot["tools"].values())
-            if any(_g(c, "choices", None) for c in buffered) and not any(o and o.strip() for o in outputs):
+            try:
+                for slot in per_choice.values():
+                    outputs.append("".join(slot["text"]))
+                    outputs.append("".join(slot["reason"]))
+                    outputs.extend(f"{n} {_unescape_json_string(a)}" for n, a in slot["tools"].values())
+            except SchemaBudgetExceeded as e:
+                audit("post_call_stream", "schema_budget_exceeded", _short_err(e), request_data, user_api_key_dict)
+                outputs, withheld = [], ["SCHEMA_BUDGET"]
+            if withheld is None and any(_g(c, "choices", None) for c in buffered) and not any(o and o.strip() for o in outputs):
                 audit("post_call_stream", "no_scannable_output", "", request_data, user_api_key_dict)
                 withheld = ["NO_SCANNABLE_OUTPUT"]
-            else:
+            elif withheld is None:
                 withheld = await self._check_output("post_call_stream", request_data, user_api_key_dict, outputs)
         if withheld is None:
             for c in buffered:
