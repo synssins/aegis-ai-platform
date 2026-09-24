@@ -700,8 +700,12 @@ def p_exposed(msg="", ok=True):
 def p_keys(msg="", ok=True, newkey=None):
     st, j = litellm("GET", "/key/list?return_full_object=true&page=1&size=100")
     keys = [k for k in (j.get("keys", []) if isinstance(j, dict) else []) if k.get("key_alias")]; keys, kctl = paginate(keys, "k")
-    rows = "".join(f'<tr><td>{esc(k.get("key_alias"))}</td><td>{esc(", ".join(k.get("models") or []) or "all exposed")}</td><td>{esc(k.get("rpm_limit"))}/{esc(k.get("tpm_limit"))}</td><td class="mut">{esc((k.get("created_at") or "")[:19])}</td><td><form class="inline" method="post" action="/hub/api/keys/revoke">{csrf_field()}<input type="hidden" name="alias" value="{esc(k.get("key_alias"))}"><button class="danger">Revoke</button></form></td></tr>' for k in keys) or '<tr><td colspan="5" class="mut">none</td></tr>'
-    opts = "".join(f'<option value="{esc(p)}">{esc(p)}</option>' for p in (m.get("model_name") for m in exposed_models()))
+    pubs = [m.get("model_name") for m in exposed_models()]
+    def model_select(k):
+        cur = set(k.get("models") or [])
+        return "".join(f'<option value="{esc(p)}"{" selected" if p in cur else ""}>{esc(p)}</option>' for p in pubs)
+    rows = "".join(f'<tr><td>{esc(k.get("key_alias"))}</td><td><form class="inline" method="post" action="/hub/api/keys/update">{csrf_field()}<input type="hidden" name="alias" value="{esc(k.get("key_alias"))}"><select name="models" multiple size="2" style="width:170px">{model_select(k)}</select> <button class="ghost">Update models</button></form><div class="mut">{esc(", ".join(k.get("models") or []) or "all exposed")}</div></td><td>{esc(k.get("rpm_limit"))}/{esc(k.get("tpm_limit"))}</td><td class="mut">{esc((k.get("created_at") or "")[:19])}</td><td><form class="inline" method="post" action="/hub/api/keys/revoke">{csrf_field()}<input type="hidden" name="alias" value="{esc(k.get("key_alias"))}"><button class="danger">Revoke</button></form></td></tr>' for k in keys) or '<tr><td colspan="5" class="mut">none</td></tr>'
+    opts = "".join(f'<option value="{esc(p)}">{esc(p)}</option>' for p in pubs)
     banner = f'<div class="card"><b>New key — shown once, store it now:</b><br><span class="key">{esc(newkey)}</span></div>' if newkey else ""
     body = f"""{banner}<div class="card">{kctl}<table><tr><th>Alias</th><th>Models</th><th>rpm/tpm</th><th>Created</th><th></th></tr>{rows}</table></div>
 <form method="post" action="/hub/api/keys/mint">{csrf_field()}<div class="card"><h2 style="margin-top:0">Mint a key</h2><div class="row"><div><label>Alias (client name)</label><input name="alias" required pattern="[a-z0-9][a-z0-9._-]+" placeholder="home-assistant"></div><div><label>Models</label><select name="models" multiple size="3">{opts}</select></div><div><label>rpm</label><input name="rpm" type="number" value="60" min="1" style="width:100px"></div><div><label>tpm</label><input name="tpm" type="number" value="200000" min="1000" style="width:130px"></div><button>Mint</button></div></div></form>"""
@@ -860,6 +864,17 @@ def act_mint(form):
     return p_keys(f"Key minted for {alias}." if ok else f"LiteLLM refused ({st}): {str(j)[:200]}", bool(ok), newkey=j.get("key") if ok else None)
 
 
+def act_keys_update(form):
+    alias = form.get("alias", ""); models = [m for m in form.getlist("models") if ALIAS_RE.match(m)]
+    st, j = litellm("GET", "/key/list?return_full_object=true&page=1&size=100")
+    tok = next((k.get("token") for k in (j.get("keys", []) if isinstance(j, dict) else []) if k.get("key_alias") == alias), None)
+    if not tok:
+        return p_keys("Key not found.", False)
+    st, j = litellm("POST", "/key/update", {"key": tok, "models": models}); ok = st == 200
+    audit("key_models_updated" if ok else "key_update_failed", alias=alias, models=",".join(models) or "all", status=st)
+    return p_keys(f"Updated models for {alias}: {', '.join(models) or 'all exposed'}." if ok else f"LiteLLM refused ({st}).", ok)
+
+
 def act_revoke(form):
     alias = form.get("alias", "")
     st, j = litellm("POST", "/key/delete", {"key_aliases": [alias]}); ok = st == 200
@@ -941,7 +956,7 @@ def act_hostname(form):
 ACTIONS = {"/hub/api/ops": act_ops, "/hub/api/policy": act_policy, "/hub/api/alerts": act_alerts, "/hub/api/models/pull": act_pull,
            "/hub/api/models/expose": act_expose, "/hub/api/models/unexpose": act_unexpose, "/hub/api/models/remove": act_remove,
            "/hub/api/models/unload": act_unload, "/hub/api/models/load": act_load,
-           "/hub/api/keys/mint": act_mint, "/hub/api/keys/revoke": act_revoke, "/hub/api/hostname": act_hostname}
+           "/hub/api/keys/mint": act_mint, "/hub/api/keys/revoke": act_revoke, "/hub/api/keys/update": act_keys_update, "/hub/api/hostname": act_hostname}
 PAGES = {("overview", "dashboard"): p_dashboard, ("overview", "services"): p_services, ("safety", "policy"): p_policy,
          ("safety", "audit"): p_audit, ("safety", "alerts"): p_alerts, ("models", "installed"): p_installed,
          ("models", "pull"): p_pull, ("models", "exposed"): p_exposed, ("access", "keys"): p_keys, ("access", "account"): p_account,
@@ -1123,9 +1138,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, "not found", "text/plain")
         try:
             self._send(200, fn(form))
+        except (BrokenPipeError, ConnectionResetError):
+            return  # client navigated away mid-action; the action itself completed and was audited
         except Exception as e:  # noqa: BLE001
             audit("hub_error", path=p, error=str(e)[:200])
-            self._send(500, p_dashboard(f"Action failed: {e}", False))
+            try:
+                self._send(500, p_dashboard(f"Action failed: {e}", False))
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
 
 if __name__ == "__main__":
