@@ -31,7 +31,8 @@ gate) + `gemma3:27b` (image classifier), both fully on GPU thanks to an 8k conte
 **Arc #1 = image generation** (`comfyui-intel`); **Arc #2 = the `intel` pool for chat/coding** (`ollama-intel` sees
 only that card; gemma3:27b is served from it under the public name `gemma3`). Chat models are exposed **on a pool**
 (Models → Installed → Expose → pool). A model larger than one card can only spread inside its pool, so today the
-chat pool is one 24 GB card; giving it both Arcs means taking Arc #1 back from images (scheduler design, phase 2). Fit badges in the browser judge **each card separately** (image/video models need
+chat pool is one 24 GB card; giving it both Arcs means taking Arc #1 back from images (scheduler design, phase 2). Measured on Arc #2: `gemma3:27b` ≈ 8 tok/s, `qwen3-coder:30b` (MoE, 3B active) ≈ 37 tok/s with 385 tok/s prompt
+processing — prefer MoE models on the Vulkan backend. Load/Unload on Models → Installed are pool-aware. Fit badges in the browser judge **each card separately** (image/video models need
 one card; language models may spread over a pool) — "fits now on B60", "fits on T4 after unload", "spread across
 intel pool (2×24 GB)". Intel cards are invisible to DCGM, so they are declared in `AEGIS_INTEL_GPUS` (compose) and
 their free memory is approximate.

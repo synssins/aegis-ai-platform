@@ -1150,7 +1150,7 @@ def p_installed(msg="", ok=True):
         exp = exposed.get(n) or exposed.get(n.replace(":latest", ""))
         act = (f'<span class="tag ok">active classifier</span>' if n == policy()["guard"]["model"] else
                 f'<form class="inline" method="post" action="/hub/api/models/setguard">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Set as classifier</button></form>') if m["is_guard"] else (f'<span class="tag ok">exposed as {esc(exp)}</span>' if exp else f'<form class="inline" method="post" action="/hub/api/models/expose">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input name="public" placeholder="public name" style="width:150px" value="{esc(n.split(":")[0].split("/")[-1])}"> {pool_sel}<button class="ghost">Expose</button></form>')
-        ld = "" if m["is_guard"] else (f'<form class="inline" method="post" action="/hub/api/models/unload">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Unload</button></form>' if m["loaded"] else f'<form class="inline" method="post" action="/hub/api/models/load">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Load</button></form>')
+        ld = "" if m["is_guard"] else (f'<form class="inline" method="post" action="/hub/api/models/unload">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Unload</button></form>' if m["loaded"] else f'<form class="inline" method="post" action="/hub/api/models/load">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}">{("<select name=pool>" + "".join(f"<option value={k}{' selected' if k == pool_for_model(n) else ''}>{k}</option>" for k in POOLS) + "</select> ") if len(POOLS) > 1 else ""}<button class="ghost">Load</button></form>')
         rm = "" if exp or m["loaded"] or n == policy()["guard"]["model"] else f'<form class="inline" method="post" action="/hub/api/models/remove">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input type="hidden" name="confirm" value="{esc(n)}"><button class="danger">Remove</button></form>'
         rows += f'<tr><td>{esc(n)} {cap_icons(m.get("caps", []))}</td><td>{size:.1f} GiB</td><td>{"<span class=ok>resident</span>" if m["loaded"] else "<span class=mut>on disk</span>"}</td><td>{act}</td><td>{ld} {rm}</td></tr>'
     body = f'<div class="card">{mctl}<table><tr><th>Model</th><th>Size</th><th>State</th><th>Exposure</th><th></th></tr>{rows or "<tr><td colspan=5 class=mut>none</td></tr>"}</table></div><p class="mut">"Expose" registers the model in LiteLLM under a public name (through VetoGuard); models that advertise <b>tools</b> are registered on the native chat API so assistants such as Home Assistant get real tool calls — a model without <b>tools</b> can only answer in text. Guard models are never exposable; the active classifier is chosen in Safety → VetoGuard policy (or "Set as classifier" here — same action) and is loaded/unloaded by that choice, not by hand. Unload before removing.</p>'
@@ -1859,17 +1859,37 @@ def act_setguard(form):
 def act_unload(form):
     m = form.get("model", "")
     if not MODEL_RE.match(m): return p_installed("Invalid model name.", False)
-    st, j = http("POST", OLLAMA + "/api/generate", {"model": m, "keep_alive": 0}, timeout=120); ok = st == 200
+    ok = False; st = 0; j = ""
+    for pool, url in POOLS.items():                          # drop it from every pool it is resident on
+        st2, ps = http("GET", url + "/api/ps", timeout=5)
+        if any(x.get("name") == m for x in (ps.get("models", []) if isinstance(ps, dict) else [])):
+            st, j = http("POST", url + "/api/generate", {"model": m, "keep_alive": 0}, timeout=120); ok = ok or st == 200
     audit("model_unloaded" if ok else "model_unload_failed", model=m, status=st)
     return p_installed(f"Unloaded {m}." if ok else f"Ollama refused ({st}): {str(j)[:160]}", ok)
+
+
+def pool_for_model(m: str) -> str:
+    """Where a model belongs: the pool its public name is served from; guard/vision classifiers → the safety pool;
+    otherwise the chat pool (intel when present)."""
+    for x in exposed_models():
+        lm = (x.get("litellm_params") or {}).get("model", "")
+        if lm.split("/", 1)[-1].removesuffix(":latest") == m.removesuffix(":latest"):
+            base = (x.get("litellm_params") or {}).get("api_base", "")
+            for k, v in POOLS.items():
+                if v == base:
+                    return k
+    if is_guard_name(m) or m == policy()["images"].get("classifier_model"):
+        return next((k for k, v in POOLS.items() if v == GUARD_OLLAMA), "nvidia")
+    return "intel" if "intel" in POOLS else "nvidia"
 
 
 def act_load(form):
     m = form.get("model", "")
     if not MODEL_RE.match(m): return p_installed("Invalid model name.", False)
-    st, j = http("POST", OLLAMA + "/api/generate", {"model": m, "keep_alive": "24h"}, timeout=600); ok = st == 200
-    audit("model_loaded" if ok else "model_load_failed", model=m, status=st)
-    return p_installed(f"Loaded {m}." if ok else f"Ollama refused ({st}): {str(j)[:160]}", ok)
+    pool = form.get("pool") if form.get("pool") in POOLS else pool_for_model(m)
+    st, j = http("POST", POOLS[pool] + "/api/generate", {"model": m, "keep_alive": "24h"}, timeout=600); ok = st == 200
+    audit("model_loaded" if ok else "model_load_failed", model=m, pool=pool, status=st)
+    return p_installed(f"Loaded {m} on the {pool} pool." if ok else f"Ollama ({pool}) refused ({st}): {str(j)[:160]}", ok)
 
 
 def act_remove(form):
