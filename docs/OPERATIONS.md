@@ -55,6 +55,7 @@ See `docs/INSTALL.md` → Upgrading. Every image is pinned; read the changelog b
 ## Recovery
 - Lost hub password/authenticator: `scripts/hub-reset-admin.sh` removes the accounts; the first-run wizard
   reappears at `/hub`.
+- Device certificate lost while "require a device certificate for administrators" is on: `scripts/hub-device-recovery.sh` lifts the requirement (audited); sign in, issue a new certificate, revoke the lost one, re-enable.
 - Hub unreachable: `docker compose restart caddy hub` on the console.
 - Watchdog stuck: `sudo systemctl restart aegis-watchdog`; a stale `ops/requests/request.json` can be moved to `ops/archive/`.
 
