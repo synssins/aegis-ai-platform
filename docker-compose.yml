@@ -45,9 +45,10 @@ services:
     command: ["python3", "-u", "/app/hub.py"]
     environment:
       - AEGIS_LAN_IP=${AEGIS_LAN_IP}
-      - GUARD_OLLAMA=http://ollama-intel:11434         # where the hub loads/checks the safety classifier
+      - GUARD_OLLAMA=http://ollama:11434               # where the hub loads/checks the safety classifier (T4 pool)
+      - AEGIS_POOLS=nvidia=http://ollama:11434,intel=http://ollama-intel:11434   # GPU pools: nvidia = safety (text guard + image classifier), intel = chat/coding
       - COMFY_URL=http://comfyui-intel:8188            # the ComfyUI instance behind the gate (comfyui:8188 for the NVIDIA one)
-      - AEGIS_INTEL_GPUS=Arc Pro B60:24576,Arc Pro B60:24576   # Intel cards are invisible to DCGM; declared for fit badges/status
+      - AEGIS_INTEL_GPUS=Arc Pro B60:24576:images,Arc Pro B60:24576:intel   # Intel cards are invisible to DCGM; declared with their role (images = ComfyUI, intel = Ollama pool)
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
       - HUB_SECRET_KEY=${HUB_SECRET_KEY}
       - VETO_EVIDENCE_KEY=${VETO_EVIDENCE_KEY}      # evidence handoff export (re-encrypts one record with a fresh key)
@@ -118,7 +119,7 @@ services:
       - STORE_MODEL_IN_DB=True                      # models exposed from the hub persist in the DB
       - DISABLE_ADMIN_UI=True
       - LITELLM_LOG=INFO
-      - VETO_GUARD_URL=http://ollama-intel:11434        # classifier pool (Intel Arc); fail-closed if unreachable
+      - VETO_GUARD_URL=http://ollama:11434              # classifier pool = the T4s (dedicated to safety); fail-closed if unreachable
       - VETO_POLICY_PATH=/app/policy/veto-policy.json
       - VETO_AUDIT_PATH=/app/audit/veto-audit.jsonl
       - VETO_EVIDENCE_DIR=/app/evidence
@@ -159,6 +160,9 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0:11434
       - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_CONTEXT_LENGTH=8192                    # safety pool: classifier contexts only (chat lives on the intel pool)
+      - OLLAMA_FLASH_ATTENTION=1
+      - OLLAMA_KV_CACHE_TYPE=q8_0                     # halves KV memory so guard 8B + gemma3:27b (vision classifier) fit two T4s
     # GPUs via CDI (nvidia-ctk cdi generate -> /etc/cdi/nvidia.yaml): device nodes are injected into the
     # container spec directly, so a host `systemctl daemon-reload` no longer strips them (NVML Unknown Error).
     devices:
@@ -169,8 +173,8 @@ services:
 
   # ---------------------------------------------------------------- monitoring (profile) ----
   ollama-intel:
-    # GPU pool "intel": the two Arc Pro B60 on Ollama's Vulkan backend (stock image, no fork). Holds the safety
-    # classifier by policy so the NVIDIA pool keeps its memory for the chat model and image generation.
+    # GPU pool "intel": Arc Pro B60 #2 on Ollama's Vulkan backend (stock image, no fork) — chat/coding models.
+    # Arc #1 belongs to ComfyUI (comfyui-intel); the T4 pool (ollama) is dedicated to the safety classifiers.
     # Pass ONLY the Intel render/card nodes and the Intel Vulkan ICD: the whole /dev/dri (virtio display) hangs
     # discovery in a VM. Map nodes with: for r in /sys/class/drm/renderD*; do echo $(basename $r) $(basename $(readlink -f $r/device)); done
     <<: *hardened
@@ -183,9 +187,7 @@ services:
       - VK_DRIVER_FILES=/usr/share/vulkan/icd.d/intel_icd.json
       - OLLAMA_CONTEXT_LENGTH=8192
     devices:
-      - /dev/dri/renderD129
-      - /dev/dri/renderD131
-      - /dev/dri/card0
+      - /dev/dri/renderD131                           # Arc #2 only (0000:04:00.0); Arc #1 = renderD129 is ComfyUI's
       - /dev/dri/card3
     group_add: ["991", "44"]                          # render, video (host gids)
     volumes:

@@ -90,9 +90,9 @@ CADDY_ADMIN = "http://127.0.0.1:2019"
 LITELLM = "http://litellm:4000"
 OLLAMA = "http://ollama:11434"                                   # NVIDIA pool: chat models
 GUARD_OLLAMA = os.environ.get("GUARD_OLLAMA", OLLAMA).rstrip("/")  # classifier pool (Intel Arc when present)
-POOLS = {"nvidia": OLLAMA, "intel": GUARD_OLLAMA} if GUARD_OLLAMA != OLLAMA else {"nvidia": OLLAMA}
-# Intel cards are not visible to DCGM; they are declared once here (name:MiB, comma-separated) until a runtime reports them.
-INTEL_GPUS = [(x.rsplit(":", 1)[0].strip(), int(x.rsplit(":", 1)[1])) for x in os.environ.get("AEGIS_INTEL_GPUS", "").split(",") if ":" in x]
+POOLS = {k.strip(): v.strip().rstrip("/") for k, v in (x.split("=", 1) for x in os.environ.get("AEGIS_POOLS", "").split(",") if "=" in x)} or ({"nvidia": OLLAMA, "intel": GUARD_OLLAMA} if GUARD_OLLAMA != OLLAMA else {"nvidia": OLLAMA})
+# Intel cards are not visible to DCGM; declared once here as name:MiB[:role] (role: images = ComfyUI's card, intel = Ollama pool card).
+INTEL_GPUS = [((f.split(":")[0].strip(), int(f.split(":")[1]), (f.split(":")[2].strip() if f.count(":") >= 2 else "intel"))) for f in os.environ.get("AEGIS_INTEL_GPUS", "").split(",") if f.count(":") >= 1]
 COMFY = os.environ.get("COMFY_URL", "http://comfyui-intel:8188")          # the ComfyUI instance behind the gate
 MODELD = "http://modeld:11434"
 PROM = "http://prometheus:9090"
@@ -1488,11 +1488,18 @@ def gpu_cards() -> list[dict]:
             cards.append({"pool": "nvidia", "name": g.get("name", f"GPU {i}"), "mem_total": total, "mem_free": g.get("mem_free") or 0})
     except Exception:  # noqa: BLE001
         pass
-    if INTEL_GPUS and "intel" in POOLS:
-        st, ps = http("GET", POOLS["intel"] + "/api/ps", timeout=5)
-        used = sum(m.get("size_vram", 0) for m in (ps.get("models", []) if isinstance(ps, dict) else [])) / 2**20
-        for name, mib in INTEL_GPUS:
-            cards.append({"pool": "intel", "name": name, "mem_total": mib, "mem_free": max(0, mib - used / max(1, len(INTEL_GPUS)))})
+    if INTEL_GPUS:
+        used_llm, free_img = 0.0, None
+        if "intel" in POOLS:
+            st, ps = http("GET", POOLS["intel"] + "/api/ps", timeout=5)
+            used_llm = sum(m.get("size_vram", 0) for m in (ps.get("models", []) if isinstance(ps, dict) else [])) / 2**20
+        st, ss = http("GET", COMFY + "/system_stats", timeout=5)
+        if isinstance(ss, dict) and ss.get("devices"):
+            free_img = (ss["devices"][0].get("vram_free") or 0) / 2**20
+        n_llm = max(1, sum(1 for _, _, r in INTEL_GPUS if r == "intel"))
+        for name, mib, role in INTEL_GPUS:
+            free = (free_img if free_img is not None else mib) if role == "images" else max(0, mib - used_llm / n_llm)
+            cards.append({"pool": "images" if role == "images" else "intel", "name": name, "mem_total": mib, "mem_free": free})
     return cards
 
 

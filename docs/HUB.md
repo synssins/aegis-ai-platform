@@ -26,10 +26,12 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 `https://<LAN_IP>/status` (and `/status/api` as JSON) shows the same load/health view **without a login** — GPU/CPU/memory/disk load, models in memory, service up/down. It deliberately contains no accounts, keys, aliases or content; the acceptance suite asserts that. It is the first tile of the future portal.
 
 ## GPU pools and fit badges
-Two pools: `nvidia` (2× T4 15 GB) and `intel` (2× Arc Pro B60 24 GB). Chat models are exposed **on a pool** (Models
-→ Installed → Expose → pool); Ollama spreads a model over every card of its pool when it does not fit one (gemma3:27b
-already spans both T4s; a ~40 GB Q4 model would span both B60s). The classifier lives on the Intel pool by policy;
-image generation takes one Arc. Fit badges in the browser judge **each card separately** (image/video models need
+Layout (operator decision 2026-09-24): **the T4s are dedicated to safety** — `nvidia` pool = `llama-guard3:8b` (text
+gate) + `gemma3:27b` (image classifier), both fully on GPU thanks to an 8k context and q8 KV cache on that pool;
+**Arc #1 = image generation** (`comfyui-intel`); **Arc #2 = the `intel` pool for chat/coding** (`ollama-intel` sees
+only that card; gemma3:27b is served from it under the public name `gemma3`). Chat models are exposed **on a pool**
+(Models → Installed → Expose → pool). A model larger than one card can only spread inside its pool, so today the
+chat pool is one 24 GB card; giving it both Arcs means taking Arc #1 back from images (scheduler design, phase 2). Fit badges in the browser judge **each card separately** (image/video models need
 one card; language models may spread over a pool) — "fits now on B60", "fits on T4 after unload", "spread across
 intel pool (2×24 GB)". Intel cards are invisible to DCGM, so they are declared in `AEGIS_INTEL_GPUS` (compose) and
 their free memory is approximate.
