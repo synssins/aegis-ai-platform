@@ -1,0 +1,201 @@
+{
+ "title": "Aegis \u2014 GPU & Host",
+ "uid": "aegis-gpu-host",
+ "schemaVersion": 39,
+ "timezone": "browser",
+ "refresh": "15s",
+ "panels": [
+  {
+   "id": 1,
+   "type": "timeseries",
+   "title": "GPU utilisation",
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent"
+    }
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list"
+    }
+   },
+   "targets": [
+    {
+     "expr": "DCGM_FI_DEV_GPU_UTIL",
+     "legendFormat": "{{gpu}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "id": 2,
+   "type": "timeseries",
+   "title": "GPU memory used",
+   "gridPos": {
+    "x": 12,
+    "y": 0,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "decmbytes"
+    }
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list"
+    }
+   },
+   "targets": [
+    {
+     "expr": "DCGM_FI_DEV_FB_USED",
+     "legendFormat": "{{gpu}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "id": 3,
+   "type": "timeseries",
+   "title": "GPU temperature",
+   "gridPos": {
+    "x": 0,
+    "y": 8,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "celsius"
+    }
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list"
+    }
+   },
+   "targets": [
+    {
+     "expr": "DCGM_FI_DEV_GPU_TEMP",
+     "legendFormat": "{{gpu}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "id": 4,
+   "type": "timeseries",
+   "title": "GPU power",
+   "gridPos": {
+    "x": 12,
+    "y": 8,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "watt"
+    }
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list"
+    }
+   },
+   "targets": [
+    {
+     "expr": "DCGM_FI_DEV_POWER_USAGE",
+     "legendFormat": "{{gpu}}",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "id": 5,
+   "type": "timeseries",
+   "title": "Host CPU busy",
+   "gridPos": {
+    "x": 0,
+    "y": 16,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percent"
+    }
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list"
+    }
+   },
+   "targets": [
+    {
+     "expr": "100 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[2m])) * 100",
+     "legendFormat": "cpu",
+     "refId": "A"
+    }
+   ]
+  },
+  {
+   "id": 6,
+   "type": "timeseries",
+   "title": "Host memory used",
+   "gridPos": {
+    "x": 12,
+    "y": 16,
+    "w": 12,
+    "h": 8
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prometheus"
+   },
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes"
+    }
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list"
+    }
+   },
+   "targets": [
+    {
+     "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes",
+     "legendFormat": "mem",
+     "refId": "A"
+    }
+   ]
+  }
+ ]
+}

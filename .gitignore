@@ -14,3 +14,6 @@ audio/
 proxy/db/
 proxy/audit/
 __pycache__/
+monitoring/data/
+caddy/hub/state/
+proxy/policy/

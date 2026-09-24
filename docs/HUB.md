@@ -1,0 +1,52 @@
+# Aegis Hub — admin control centre
+
+`https://<LAN_IP>/hub` · user `admin` · password: `HUB_ADMIN_PASSWORD` in `.env` (basic-auth enforced by Caddy).
+Dark theme, left navigation: five categories, one level of sub-pages.
+
+| Category | Page | Can change | Notes |
+|---|---|---|---|
+| Overview | Dashboard | — | services by network, safety posture, VRAM residency, certificates, recent vetoes |
+| | Services | — | health of every container; starting/stopping is console-only |
+| Safety | VetoGuard policy | guard model, blocked categories, tripwires, extra regexes | **S4 is locked on**; classifier and fail-closed cannot be disabled; every save is audited + alerted |
+| | Audit log | — | last 150 vetoes and 100 admin actions; never contains content |
+| | Alerts | webhook URL | Discord/Slack/generic JSON; "Send test" |
+| Models | Installed | expose / remove | expose = register in LiteLLM under a public name (through VetoGuard); guard models never exposable; resident/exposed models cannot be removed |
+| | Pull | pull | via `modeld` — the only container with both internet and the model store. Apps never fetch their own |
+| | Exposed to apps | unexpose (hub-created only) | models from `config.yaml` are console-managed |
+| Access | API keys | mint / revoke | per-client, model-scoped, rate-limited; key shown once |
+| Gateway | Certificates | — | live TLS probe of every served host |
+| | Public hostname | hostname + Cloudflare token | writes exactly one templated site file; Let's Encrypt via DNS-01, no inbound ports |
+| | Isolation | — | **read-only** view of the Caddyfile and compose network wiring |
+
+## Privilege model
+- Caddy basic-auth is the administrator boundary. There is one admin identity by design.
+- The hub shares Caddy's network namespace: it can reach the Caddy admin API, LiteLLM (with the master
+  key), Ollama (read + delete) and `modeld` (pulls). No other container can reach any of those admin surfaces.
+- The hub's filesystem is read-only except: `proxy/policy/` (policy JSON), `caddy/sites-enabled/`
+  (hostname site file), `caddy/hub/state/` (webhook, hostname), `proxy/audit/` (append-only logs).
+- The isolation layer — `caddy/Caddyfile`, `docker-compose.yml`, networks, mounts, capabilities — is
+  mounted read-only into the hub and is **console-only** to change.
+- Every POST requires a CSRF token bound to the hub process; every state change writes to
+  `proxy/audit/hub-audit.jsonl` and, if configured, the alert webhook.
+
+## Policy semantics (Safety → VetoGuard policy)
+Llama Guard 3 categories, grouped:
+- **locked:** S4 child sexual exploitation — always blocked, no UI to change it.
+- **illegal (blocked by default):** S1 violent crimes, S2 non-violent crimes, S3 sex-related crimes, S9 indiscriminate weapons.
+- **protected (blocked by default):** S10 hate / protected classes, S11 suicide & self-harm.
+- **adult/legal (allowed by default):** S5, S6, S7, S8, S12 sexual content (adult), S13, S14.
+
+The lexical tripwire (sentinel, CSAM terms, malware intent, plus admin-added regexes) runs before
+the classifier. The classifier runs on input and on output (streaming is buffered and released only
+after classification). If the guard model is unreachable the request is refused — this is not configurable.
+
+## Guard model choice (measured 2026-09-24 on 2× Tesla T4, Mixtral 8x7B resident)
+| Guard | Placement | 6000-char classification | Mixtral gen | Notes |
+|---|---|---|---|---|
+| llama-guard3:1b | mostly CPU (0.1 GiB VRAM) | **0.12 s** warm | 12.5 tok/s | current setting |
+| llama-guard3:8b | GPU | 0.07 s warm | 8.6 tok/s | **evicts Mixtral** — 10 s + 26 s reload per request; unusable on this VRAM |
+| llama-guard3:8b | CPU only | 14–21 s | 12.5 tok/s | unusable latency |
+
+8B is the better classifier (Meta reports the 1B distillation loses recall on paraphrased and
+multilingual content). It becomes viable when either the main model is ≤ ~20 GB or the guard moves
+to the Intel Arc cards. Both are one setting away in this page once the hardware allows.

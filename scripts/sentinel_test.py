@@ -227,8 +227,35 @@ class Suite:
         rc, out = docker("network inspect ai-unified_backend --format '{{.Internal}}'")
         self.rec("4.5", "hygiene", "backend network is internal", "true", out, out.strip() == "true")
 
+
+    # ---------------- Phase 5: admin plane, model pipeline, apps framework ----------------
+    def phase5(self):
+        pw = self.env.get("HUB_ADMIN_PASSWORD"); tok = base64.b64encode(f"admin:{pw}".encode()).decode() if pw else ""
+        H = {"Authorization": f"Basic {tok}"}
+        for pg in ("overview/dashboard", "safety/policy", "safety/audit", "models/installed", "models/pull", "models/exposed", "access/keys", "gateway/certs", "gateway/hostname", "gateway/isolation"):
+            st, _, b = http("GET", f"{self.base}/hub/{pg}", headers=H)
+            self.rec(f"5.1-{pg.split('/')[1]}", "hub", f"hub page {pg} renders", "200 + <h1>", st, st == 200 and b"<h1>" in b)
+        st, _, b = http("POST", f"{self.base}/hub/api/policy", b"csrf=bogus&guard_model=x", {**H, "Content-Type": "application/x-www-form-urlencoded"})
+        self.rec("5.2", "hub", "hub POST without valid CSRF token is refused", "403", st, st == 403)
+        rc, out = sh(f"sudo -n python3 -c \"import json;d=json.load(open('{ROOT}/proxy/policy/veto-policy.json'));print(d['categories']['S4']['block'])\"")
+        self.rec("5.3", "hub", "policy file has S4 blocked", "True", out, out.strip() == "True")
+        rc, out = sh(f"sudo -n stat -c '%U %a' {ROOT}/proxy/policy {ROOT}/proxy/policy/veto-policy.json")
+        self.rec("5.4", "hub", "policy dir/file root-only", "root 700 / root 600", out, "root 700" in out and "root 600" in out)
+        rc, out = docker("exec openwebui curl -s -m 4 -o /dev/null -w '%{http_code}' http://modeld:11434/api/version", timeout=15)
+        self.rec("5.5", "network", "openwebui cannot reach modeld (mgmt isolated)", "000", out, out.strip() in ("000", "") or rc != 0)
+        rc, out = docker("exec modeld bash -c 'getent hosts ollama.com >/dev/null && echo egress'", timeout=15)
+        self.rec("5.6", "network", "modeld HAS egress (pull path)", "egress", out, "egress" in out)
+        rc, out = docker("exec litellm python3 -c \"import urllib.request;print(urllib.request.urlopen('http://modeld:11434/api/version',timeout=3).status)\"", timeout=15)
+        self.rec("5.7", "network", "litellm cannot reach modeld", "fails", out[-40:], rc != 0)
+        st, _, _ = http("GET", f"{self.base}/comfy")
+        self.rec("5.8", "edge", "ComfyUI route hard-gated at edge", "503", st, st == 503)
+        rc, out = docker("inspect litellm --format '{{range .Mounts}}{{.Destination}}:{{.RW}} {{end}}'")
+        self.rec("5.9", "hub", "litellm mounts policy read-only", "/app/policy:false", out, "/app/policy:false" in out)
+        rc, out = docker("inspect hub --format '{{.HostConfig.NetworkMode}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}}'")
+        self.rec("5.10", "hub", "hub shares caddy netns, read-only fs, cap_drop ALL", "container:… true [ALL]", out, out.startswith("container:") and "true" in out and "ALL" in out)
+
     def run(self):
-        for ph in (self.phase1, self.phase2, self.phase3, self.phase4):
+        for ph in (self.phase1, self.phase2, self.phase3, self.phase4, self.phase5):
             try: ph()
             except Exception as e:  # noqa: BLE001
                 self.rec(ph.__name__, "harness", "phase crashed", "no exception", repr(e), False)

@@ -14,7 +14,10 @@ Every step is independently revertible; data directories are never touched.
 8. Mint OpenWebUI's key: `scripts/mint-key.sh mint openwebui mixtral 120 400000` → put it in `.env` as `OPENWEBUI_UPSTREAM_KEY` → `docker compose up -d openwebui`.
 9. Mint a test key: `scripts/mint-key.sh mint sentinel-tests mixtral 60 100000` → `.env` `TEST_API_KEY`.
 10. `scripts/sentinel_test.py --label post-migration` — must be all-pass. Report lands in `docs/tests/`.
-11. Log the change in `docs/CHANGELOG.md` (key aliases only, never keys); commit.
+11. Build the gateway image once: `docker build -t aegis/caddy:2.11.4-cloudflare caddy/build`.
+12. Seed the policy: the hub writes `proxy/policy/veto-policy.json` on first start (defaults: S1–S4, S9–S11 blocked). `sudo chmod 700 proxy/policy caddy/hub/state`.
+13. Optional profiles: `docker compose --profile monitoring up -d` (set `GRAFANA_ADMIN_PASSWORD`, `GRAFANA_ENABLED=1`); `--profile apps` only after GPU assignment.
+14. Log the change in `docs/CHANGELOG.md` (key aliases only, never keys); commit.
 
 Rollback: `docker compose down && cp -a backup/<date>/* . && docker compose up -d`.
 

@@ -4,57 +4,63 @@ Aegis is a self-hosted LLM inference platform designed on one assumption: **the 
 can fail silently for months**, so the platform must be defensible on its own.
 
 ```
-LAN ──► :80/:443 ──► caddy ──┬── /            ──► openwebui ─┐
-                    (edge)   ├── /v1/{chat/completions,        │  virtual key
-                             │      completions,embeddings,    ▼
-                             │      models}   ──► litellm ──► VetoGuard ──► ollama (backend, internal)
-                             ├── /hub ──► hub (shares caddy netns; basic-auth)        ▲
-                             └── /grafana ──► grafana (optional)                       │
-                                                                         llama-guard3 ─┘ (classifier)
+LAN ──► :80/:443 ──► caddy ──┬── /              ──► openwebui ──────────────┐
+                             ├── /v1/{chat/completions,completions,          │ virtual key
+                             │       embeddings,models} ──► litellm ──► VetoGuard ──► ollama
+                             ├── /hub     ──► hub (admin plane, shares caddy netns)   ▲   (backend, internal)
+                             ├── /grafana ──► grafana (profile: monitoring)           │
+                             ├── /tts     ──► fish-speech (profile: apps)     llama-guard3 (classifier)
+                             └── /comfy   ──► 503 HARD GATE until safety gate exists
+hub ──► modeld (mgmt, egress) ── pulls into the shared model store ──► ollama sees new models
 ```
 
 ## Networks
 | Network | `internal` | Members | Purpose |
 |---|---|---|---|
-| `edge` | no | caddy (+hub), openwebui, litellm | Only caddy publishes ports (80/443). Egress allowed. |
-| `backend` | **yes** | litellm, ollama, litellm-db | No egress, unreachable from the LAN. Ollama is only addressable by LiteLLM. |
+| `edge` | no | caddy(+hub), openwebui, litellm, grafana | Only caddy publishes ports (80/443). Egress allowed. |
+| `backend` | **yes** | litellm, ollama, litellm-db, caddy(+hub) | No egress, unreachable from the LAN. Ollama is addressable only by LiteLLM (inference) and the hub (list/delete). |
+| `mgmt` | no | caddy(+hub), modeld | `modeld` is a pull-only Ollama with internet access and the model store. Only the hub talks to it. |
+| `monitoring` | yes | prometheus, node-exporter, dcgm-exporter, grafana | Grafana is also on `edge` for Caddy. |
+| `apps` | yes | fish-speech, comfyui (+edge) | Framework only; profile-gated. |
 | `tools` (reserved) | yes | future MCP/tool servers | No backend access; per-tool egress policy. |
 
-Model pulls happen in a throw-away container (`scripts/pull-model.sh`) so production Ollama never needs
-internet access.
-
 ## Services
-| Service | Image (pinned) | Runs as | Hardening |
-|---|---|---|---|
-| caddy | `caddy:2.11.4` | root | `read_only`, `cap_drop ALL` + `NET_BIND_SERVICE`, `no-new-privileges`; admin API on localhost only |
-| hub | `python:3.12-alpine` | root (container) | stdlib only; `network_mode: service:caddy`; may write only `sites-enabled/domain.caddy` |
-| openwebui | `open-webui:v0.11.4` | root | signup off, direct connections off, web search off, Ollama API off; holds a **virtual** LiteLLM key |
-| litellm | `litellm:main-stable` | root | VetoGuard callback; DB-backed virtual keys; admin UI disabled; `/v1/*` beyond the allow-list is 404 at the edge |
-| litellm-db | `postgres:16-alpine` | postgres | backend only |
-| ollama | `ollama/ollama:0.34.3` | root | backend only; GPU via NVIDIA runtime; `OLLAMA_KEEP_ALIVE=24h` |
+| Service | Image (pinned) | Hardening |
+|---|---|---|
+| caddy | `aegis/caddy:2.11.4-cloudflare` (local build: caddy 2.11.4 + caddy-dns/cloudflare) | `read_only`, `cap_drop ALL` + `NET_BIND_SERVICE`, admin API localhost-only |
+| hub | `python:3.12-alpine`, stdlib only | `network_mode: service:caddy`, read-only fs, writes only policy / site file / state / audit; CSRF on every POST |
+| modeld | `ollama/ollama:0.34.3`, no GPU | `mgmt` only; shares `llm/gguf` |
+| openwebui | `open-webui:v0.11.4` | signup off, direct connections off, web search off, Ollama API off; holds a **virtual** LiteLLM key |
+| litellm | `litellm:main-stable` | VetoGuard callback; DB-backed virtual keys + hub-exposed models; admin UI disabled; policy mounted read-only |
+| litellm-db | `postgres:16-alpine` | backend only |
+| ollama | `ollama/ollama:0.34.3` | backend only; NVIDIA runtime; `OLLAMA_KEEP_ALIVE=24h` |
+| prometheus / node-exporter / dcgm-exporter / grafana | pinned | profile `monitoring`; node-exporter has the stack's one broad (read-only) host mount |
+| fish-speech / comfyui | placeholders | profile `apps`; ComfyUI is 503 at the edge regardless |
 
-All containers drop every capability and set `no-new-privileges`. Because root without
-`CAP_DAC_OVERRIDE` obeys ordinary file permissions, container data directories are **root-owned, mode 700**.
+Every container drops all capabilities and sets `no-new-privileges`. Root without `CAP_DAC_OVERRIDE`
+obeys file permissions, so container data directories are **root-owned, mode 700**.
 
 ## Safety pipeline (VetoGuard, `proxy/veto_filter.py`)
 1. **Lexical tripwire** — regex over NFKC-normalised, zero-width-stripped, whitespace-collapsed text, plus
    decoded base64 runs and a despaced pass for unambiguous tokens. Scans the latest user turn, trailing
-   tool results, `prompt`, `input`, and multimodal text parts.
-2. **Classifier** — Llama Guard 3 via Ollama on the backend network. Pre-call on the request; post-call on
-   the output. Streaming responses are buffered and classified before release. **Fail-closed**: if the
-   classifier is unavailable, the request is refused (503 `guard_unavailable`).
-3. **Audit** — every veto appends a JSON line to `proxy/audit/veto-audit.jsonl` (timestamp, stage,
-   reason/category, call id, key alias, model). Never content.
-
-Rejections are HTTP 400 with code `veto_triggered`. A vetoed turn does not poison the conversation.
+   tool results, `prompt`, `input`, multimodal text parts. Admin may add patterns.
+2. **Classifier** — Llama Guard 3 via Ollama on the backend network, pre-call and post-call; streaming
+   is buffered and released only after classification. **Fail-closed** (503 `guard_unavailable`).
+3. **Policy** — `proxy/policy/veto-policy.json`, written only by the hub, hot-reloaded per request.
+   Category set and guard model are configurable; S4 is locked; the classifier and fail-closed are not
+   configurable. Default: illegal (S1–S4, S9) and protected (S10, S11) blocked; adult/legal allowed.
+4. **Audit** — `proxy/audit/veto-audit.jsonl` and `proxy/audit/hub-audit.jsonl`; never content.
+   Admin actions also go to an optional webhook.
 
 ## Privilege boundaries
-- **Gateway config is console-only.** `caddy/Caddyfile` is root-owned (640), mounted read-only everywhere.
-- **The hub** can only (re)generate `sites-enabled/domain.caddy` from a fixed template and reload Caddy.
-- **API keys** are minted on the console (`scripts/mint-key.sh`), never via the web.
-- **Secrets** live in `.env` (600) and are never tracked; `scripts/sanitize-check.sh` blocks commits that
-  contain the LAN IP, hostname, user name, email, or any secret/data path.
+- **Isolation layer is console-only:** `caddy/Caddyfile` (root 640, read-only in containers) and
+  `docker-compose.yml`. The hub shows both read-only.
+- **The hub** may change: VetoGuard policy, models (pull/remove/expose), API keys, public hostname
+  (one templated site file with the Cloudflare token), alert webhook. Nothing else.
+- **Secrets** live in `.env` (600). `scripts/sanitize-check.sh` blocks commits containing the LAN IP,
+  hostname, user name, email, or any secret/data path.
 
 ## Reproducibility
-`docs/MIGRATION.md` is the ordered apply procedure. `scripts/sentinel_test.py` is the acceptance suite;
-reports land in `docs/tests/`. Every significant change is logged in `docs/CHANGELOG.md`.
+`docs/MIGRATION.md` is the ordered install/upgrade procedure. `scripts/sentinel_test.py` is the
+acceptance suite (52 assertions); reports are committed in `docs/tests/`. Every significant change is
+logged in `docs/CHANGELOG.md`.

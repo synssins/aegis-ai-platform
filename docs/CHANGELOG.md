@@ -2,6 +2,20 @@
 
 All significant changes to the platform are recorded here. Every entry must name the files touched, the reason, who/what made the change, and how it was verified. Security-relevant changes must link an audit record in `docs/audits/`.
 
+## 2026-09-24 (day session)
+
+### Hub v2 admin plane, VetoGuard 2.2 policy, model pipeline, DNS-01, monitoring + apps frameworks — APPLIED. Acceptance: 52/52 (`docs/tests/…-post-v3.json`).
+- **caddy/hub/hub.py v2:** dark-themed admin control centre (Overview · Safety · Models · Access · Gateway). Edits VetoGuard policy (S4 locked; classifier/fail-closed not configurable), pulls/removes/exposes models, mints/revokes API keys, sets public hostname + Cloudflare token, alert webhook. Isolation layer view-only. CSRF on every POST; every change audited to `proxy/audit/hub-audit.jsonl` and alerted.
+- **proxy/veto_filter.py rev 2.2:** policy file `proxy/policy/veto-policy.json` hot-reloaded per request; default policy blocks S1–S4, S9–S11 and allows adult/legal categories; admin extra tripwires.
+- **docker-compose.yml rev 3:** `mgmt` network + `modeld` pull-only Ollama (apps never fetch models); caddy joins `backend`/`mgmt` for the hub; litellm `STORE_MODEL_IN_DB=True`; profiles `monitoring` (prometheus v3.5.0, node-exporter v1.9.1, dcgm-exporter 4.2.3, grafana 11.6.0 at `/grafana`, provisioned datasource + GPU/host dashboard) and `apps` (fish-speech, comfyui placeholders). Shared `x-hardened` anchor.
+- **caddy/Caddyfile rev 3 + caddy/build/Dockerfile:** local Caddy build with `caddy-dns/cloudflare`; routes `/grafana`, `/tts`, `/comfy` (hard 503 gate). Public hostname template uses DNS-01 — the box stays private.
+- **Guard model decision (measured):** 8B evicts Mixtral on 2× T4 (10 s + 26 s per request) and is 14–21 s on CPU; 1B stays (0.12 s). Numbers in `docs/HUB.md`. 8B becomes viable with a ≤ 20 GB main model or the guard on the Arc cards.
+- **scripts/sentinel_test.py:** phase 5 — hub pages, CSRF, policy file locks/permissions, modeld isolation, ComfyUI gate, mount modes (52 assertions total).
+- **scripts/pull-model.sh, mint-key.sh:** sudo fallback; LiteLLM driven via in-container Python (image has no curl).
+- **docs:** HUB.md (new), ARCHITECTURE.md rewritten, ROADMAP/MIGRATION updated.
+- **Agy adversarial review:** attempted in permission-gated print mode; produced no output (see report). Plan for operator-run review kept in `docs/tests/`.
+- Executor: Claude Code. Operator directives incorporated: UI-only configuration after install (except isolation layer), API stays exposed for other services, adult content allowed / illegal + protected never, security first.
+
 ## 2026-09-24 (overnight run, 02:00–03:00 UTC)
 
 ### Hardened stack rev 2 — APPLIED. Acceptance: 33/33 (`docs/tests/…-post-migration.json`), baseline was 7/32.

@@ -1,20 +1,26 @@
-# Aegis AI Platform — hardened compose rev 2 (2026-09-24 overnight run)
+# Aegis AI Platform — compose rev 3 (2026-09-24)
 #
-# Topology: ONE bridge -> TWO.
-#   edge     : caddy(+hub) <-> openwebui, caddy <-> litellm         (egress allowed; only caddy publishes ports)
-#   backend  : litellm <-> ollama, litellm <-> litellm-db  (internal: true — no egress, unreachable from LAN)
-# openwebui cannot see ollama. Every inference request traverses litellm (VetoGuard + Llama Guard).
+# Networks
+#   edge        caddy(+hub), openwebui, litellm, grafana        — only caddy publishes ports; egress allowed
+#   backend     litellm, ollama, litellm-db, caddy(+hub)         — internal: true; no egress; hub reads ollama state
+#   mgmt        caddy(+hub), modeld                              — pull-only ollama with egress; apps never fetch models
+#   monitoring  prometheus, exporters, grafana                   — profile "monitoring"
+#   apps        comfyui, fish-speech (+edge for caddy)           — profile "apps"; ComfyUI is 503 at the edge until gated
 #
-# Secrets: ./.env (0600). Model pulls: ./scripts/pull-model.sh. API keys: ./scripts/mint-key.sh.
-# Gateway config (caddy/Caddyfile) is console-only: root:root 0600, mounted read-only everywhere.
+# Profiles:  docker compose --profile monitoring --profile apps up -d
+# Secrets:   ./.env (0600).  Gateway config (caddy/Caddyfile) is console-only and view-only in the hub.
+
+x-hardened: &hardened
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  restart: unless-stopped
 
 services:
   caddy:
-    image: caddy:2.11.4
+    <<: *hardened
+    image: aegis/caddy:2.11.4-cloudflare          # caddy/build/Dockerfile — caddy:2.11.4 + caddy-dns/cloudflare
     container_name: caddy
-    ports:
-      - "80:80"
-      - "443:443"
+    ports: ["80:80", "443:443"]
     environment:
       - AEGIS_LAN_IP=${AEGIS_LAN_IP}
       - ACME_EMAIL=${ACME_EMAIL}
@@ -24,42 +30,54 @@ services:
       - ./caddy/sites-enabled:/etc/caddy/sites-enabled:ro
       - ./caddy/data:/data
       - ./caddy/config:/config
-    networks: [edge]
+    networks: [edge, backend, mgmt]
     read_only: true
     tmpfs: [/tmp]
-    cap_drop: [ALL]
     cap_add: [NET_BIND_SERVICE]
-    security_opt: [no-new-privileges:true]
-    restart: unless-stopped
 
   hub:
-    # Operator hub. Shares caddy's network namespace so it — and only it — can reach the admin
-    # API on localhost:2019. Reachable from the LAN only via caddy at /hub (basic-auth at the edge).
-    # May write ONLY sites-enabled/domain.caddy from a fixed template. See caddy/hub/hub.py.
+    # Admin control centre. Shares caddy's network namespace: reaches Caddy admin (localhost:2019),
+    # LiteLLM, ollama (backend, read/delete), modeld (mgmt, pulls). Reachable only via caddy at /hub
+    # behind basic-auth. Holds the LiteLLM master key (key/model management) — every action audited.
+    <<: *hardened
     image: python:3.12-alpine
     container_name: hub
     command: ["python3", "-u", "/app/hub.py"]
     environment:
       - AEGIS_LAN_IP=${AEGIS_LAN_IP}
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - GRAFANA_ENABLED=${GRAFANA_ENABLED:-0}
     volumes:
       - ./caddy/hub/hub.py:/app/hub.py:ro
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./docker-compose.yml:/app/view/docker-compose.yml:ro
       - ./caddy/sites-enabled:/etc/caddy/sites-enabled
+      - ./caddy/hub/state:/app/state
+      - ./proxy/policy:/app/policy
       - ./proxy/audit:/app/audit
     network_mode: "service:caddy"
     depends_on: [caddy]
     read_only: true
     tmpfs: [/tmp]
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    restart: unless-stopped
+
+  modeld:
+    # Pull-only Ollama. No GPU, egress via mgmt, shares the model store. Only the hub talks to it.
+    <<: *hardened
+    image: ollama/ollama:0.34.3
+    container_name: modeld
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    volumes:
+      - ./llm/gguf:/root/.ollama
+    networks: [mgmt]
 
   openwebui:
+    <<: *hardened
     image: ghcr.io/open-webui/open-webui:v0.11.4
     container_name: openwebui
     environment:
       - OPENAI_API_BASE_URL=http://litellm:4000/v1
-      - OPENAI_API_KEY=${OPENWEBUI_UPSTREAM_KEY}      # LiteLLM virtual key (alias: openwebui), never the master
+      - OPENAI_API_KEY=${OPENWEBUI_UPSTREAM_KEY}
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
       - WEBUI_URL=https://${AEGIS_LAN_IP}
       - CORS_ALLOW_ORIGIN=https://${AEGIS_LAN_IP}
@@ -75,38 +93,33 @@ services:
     volumes:
       - ./openwebui:/app/backend/data
     networks: [edge]
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    restart: unless-stopped
 
   litellm:
+    <<: *hardened
     image: ghcr.io/berriai/litellm:main-stable
     container_name: litellm
     command: --config /app/config/config.yaml --port 4000
     environment:
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
       - DATABASE_URL=postgresql://litellm:${POSTGRES_PASSWORD}@litellm-db:5432/litellm
-      - STORE_MODEL_IN_DB=False
+      - STORE_MODEL_IN_DB=True                      # models exposed from the hub persist in the DB
       - DISABLE_ADMIN_UI=True
       - LITELLM_LOG=INFO
-      - VETO_GUARD_ENABLED=1
       - VETO_GUARD_URL=http://ollama:11434
-      - VETO_GUARD_MODEL=llama-guard3:1b
-      - VETO_GUARD_IGNORE_CATEGORIES=${VETO_GUARD_IGNORE_CATEGORIES:-}
+      - VETO_POLICY_PATH=/app/policy/veto-policy.json
       - VETO_AUDIT_PATH=/app/audit/veto-audit.jsonl
     volumes:
       - ./proxy/config.yaml:/app/config/config.yaml:ro
       - ./proxy/veto_filter.py:/app/custom_logger/veto_filter.py:ro
+      - ./proxy/policy:/app/policy:ro
       - ./proxy/audit:/app/audit
     networks: [edge, backend]
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
     depends_on:
       litellm-db:
         condition: service_healthy
-    restart: unless-stopped
 
   litellm-db:
+    <<: *hardened
     image: postgres:16-alpine
     container_name: litellm-db
     environment:
@@ -116,22 +129,20 @@ services:
     volumes:
       - ./proxy/db:/var/lib/postgresql/data
     networks: [backend]
-    cap_drop: [ALL]
     cap_add: [CHOWN, FOWNER, SETUID, SETGID, DAC_READ_SEARCH]
-    security_opt: [no-new-privileges:true]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
       interval: 5s
       timeout: 3s
       retries: 10
-    restart: unless-stopped
 
   ollama:
+    <<: *hardened
     image: ollama/ollama:0.34.3
     container_name: ollama
     environment:
       - OLLAMA_HOST=0.0.0.0:11434
-      - OLLAMA_KEEP_ALIVE=24h              # keep mixtral + llama-guard resident; avoids reload latency on the guard
+      - OLLAMA_KEEP_ALIVE=24h
     deploy:
       resources:
         reservations:
@@ -142,13 +153,119 @@ services:
     volumes:
       - ./llm/gguf:/root/.ollama
     networks: [backend]
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    restart: unless-stopped
+
+  # ---------------------------------------------------------------- monitoring (profile) ----
+  prometheus:
+    <<: *hardened
+    image: prom/prometheus:v3.5.0
+    container_name: prometheus
+    profiles: [monitoring]
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=30d"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/data/prometheus:/prometheus
+    networks: [monitoring]
+    user: "65534:65534"
+
+  node-exporter:
+    <<: *hardened
+    image: prom/node-exporter:v1.9.1
+    container_name: node-exporter
+    profiles: [monitoring]
+    command: ["--path.rootfs=/host", "--collector.disable-defaults", "--collector.cpu", "--collector.meminfo", "--collector.filesystem", "--collector.diskstats", "--collector.netdev", "--collector.loadavg", "--collector.uname"]
+    volumes:
+      - /:/host:ro,rslave                          # read-only host view; the one broad mount in the stack
+    networks: [monitoring]
+    pid: host
+
+  dcgm-exporter:
+    <<: *hardened
+    image: nvidia/dcgm-exporter:4.2.3-4.1.3-ubuntu22.04
+    container_name: dcgm-exporter
+    profiles: [monitoring]
+    environment:
+      - DCGM_EXPORTER_LISTEN=:9400
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    cap_add: [SYS_ADMIN]                           # DCGM needs it for profiling metrics
+    networks: [monitoring]
+
+  grafana:
+    <<: *hardened
+    image: grafana/grafana:11.6.0
+    container_name: grafana
+    profiles: [monitoring]
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_SERVER_ROOT_URL=https://${AEGIS_LAN_IP}/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./monitoring/data/grafana:/var/lib/grafana
+    networks: [monitoring, edge]
+    user: "472:472"
+
+  # ---------------------------------------------------------------- apps (profile) ----------
+  # Frameworks only. Not started unless `--profile apps`. GPU assignment is an operator decision.
+  fish-speech:
+    <<: *hardened
+    image: fishaudio/fish-speech:latest             # TODO pin once selected; TTS web UI on :7860
+    container_name: fish-speech
+    profiles: [apps]
+    volumes:
+      - ./audio/voices:/app/voices
+      - ./audio/checkpoints:/app/checkpoints
+    networks: [apps, edge]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  comfyui:
+    # HARD GATE (docs/ROADMAP.md #8): caddy returns 503 for /comfy until a prompt classifier,
+    # an output multimodal classifier and an isolated audit log exist. Do not remove the gate here;
+    # enabling is a console-only Caddyfile change after the gate is tested with sentinels.
+    <<: *hardened
+    image: yanwk/comfyui-boot:cu126-slim            # TODO pin once selected; UI on :8188
+    container_name: comfyui
+    profiles: [apps]
+    volumes:
+      - ./comfyui/checkpoints:/root/ComfyUI/models/checkpoints
+      - ./comfyui/loras:/root/ComfyUI/models/loras
+    networks: [apps, edge]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
 networks:
   edge:
     driver: bridge
   backend:
+    driver: bridge
+    internal: true
+  mgmt:
+    driver: bridge
+  monitoring:
+    driver: bridge
+    internal: true
+  apps:
     driver: bridge
     internal: true

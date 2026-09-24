@@ -24,7 +24,7 @@ caddy/hub/hub.py          operator hub (stdlib Python)
 proxy/config.yaml         LiteLLM models + settings
 proxy/veto_filter.py      VetoGuard (tripwire + classifier + audit)
 scripts/                  pull-model, mint-key, sentinel_test, sanitize-check
-docs/                     ARCHITECTURE, SECURITY, ROADMAP, MIGRATION, CHANGELOG, tests/
+docs/                     ARCHITECTURE, HUB, SECURITY, ROADMAP, MIGRATION, CHANGELOG, tests/
 .env.example              every secret and site-specific value
 ```
 

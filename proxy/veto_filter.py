@@ -1,27 +1,24 @@
 """
-VetoGuard rev 2.1 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier.
+VetoGuard rev 2.2 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
+driven by an admin-editable policy file (hot-reloaded) that only the hub may write.
 
 Layers (all fail-closed):
-  1. Lexical tripwire (regex over normalised text). Cheap, catches sentinels and unambiguous terms.
+  1. Lexical tripwire (regex over normalised text). Built-in lists + admin "extra tripwires".
   2. Llama Guard 3 classifier via Ollama on the backend network. Pre-call on the request text,
      post-call on the model output. Streaming responses are BUFFERED and classified before any
-     token reaches the client. If the classifier is unreachable the request is refused (503).
+     token reaches the client. Classifier unreachable => request refused (503).
 
-Audit: every veto is appended to /app/audit/veto-audit.jsonl (timestamps, call id, stage,
-list/category, key alias, model — never content).
+Policy file (VETO_POLICY_PATH, default /app/policy/veto-policy.json), written by the hub:
+  {
+    "guard": {"model": "llama-guard3:8b", "chunk_chars": 6000, "max_chunks": 200, "timeout": 60},
+    "categories": {"S1": {"block": true}, ..., "S14": {"block": false}},   # S4 is ALWAYS blocked
+    "tripwires": {"enabled": true, "extra_patterns": ["..."]}
+  }
+Missing file => built-in defaults below. The classifier stage and fail-closed behaviour cannot be
+switched off by policy — only the category set and the guard model are configurable.
 
-Honest scope: the regex is a tripwire, not a boundary. The classifier is the control. Neither is
-perfect; both are logged so the operator can review and tune (VETO_GUARD_IGNORE_CATEGORIES).
-
-Env (set on the litellm service):
-  VETO_GUARD_ENABLED=1                 0 disables the classifier stage (regex still runs) — do not in prod
-  VETO_GUARD_URL=http://ollama:11434
-  VETO_GUARD_MODEL=llama-guard3:1b
-  VETO_GUARD_IGNORE_CATEGORIES=        comma list e.g. "S6,S8" to not block those Llama Guard categories
-  VETO_GUARD_CHUNK_CHARS=6000          classifier chunk size (Llama Guard ctx is small)
-  VETO_GUARD_MAX_CHUNKS=200            longer inputs are refused (413) rather than partially classified
-  VETO_GUARD_TIMEOUT=60                seconds per classifier call
-  VETO_AUDIT_PATH=/app/audit/veto-audit.jsonl
+Audit: every veto appends a JSON line to VETO_AUDIT_PATH (timestamp, stage, reason/category,
+call id, key alias, model). Never content.
 """
 from __future__ import annotations
 
@@ -42,17 +39,10 @@ from litellm.integrations.custom_logger import CustomLogger
 
 log = logging.getLogger("vetoguard")
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-GUARD_ENABLED = os.environ.get("VETO_GUARD_ENABLED", "1") == "1"
 GUARD_URL = os.environ.get("VETO_GUARD_URL", "http://ollama:11434").rstrip("/")
-GUARD_MODEL = os.environ.get("VETO_GUARD_MODEL", "llama-guard3:1b")
-GUARD_IGNORE = {c.strip().upper() for c in os.environ.get("VETO_GUARD_IGNORE_CATEGORIES", "").split(",") if c.strip()}
-CHUNK_CHARS = int(os.environ.get("VETO_GUARD_CHUNK_CHARS", "6000"))
-MAX_CHUNKS = int(os.environ.get("VETO_GUARD_MAX_CHUNKS", "200"))
-GUARD_TIMEOUT = float(os.environ.get("VETO_GUARD_TIMEOUT", "60"))
+POLICY_PATH = os.environ.get("VETO_POLICY_PATH", "/app/policy/veto-policy.json")
 AUDIT_PATH = os.environ.get("VETO_AUDIT_PATH", "/app/audit/veto-audit.jsonl")
+WITHHELD_MSG = "[Response withheld by policy: veto_triggered]"
 
 LLAMA_GUARD_CATEGORIES = {
     "S1": "Violent Crimes", "S2": "Non-Violent Crimes", "S3": "Sex-Related Crimes",
@@ -61,8 +51,72 @@ LLAMA_GUARD_CATEGORIES = {
     "S10": "Hate", "S11": "Suicide & Self-Harm", "S12": "Sexual Content",
     "S13": "Elections", "S14": "Code Interpreter Abuse",
 }
+LOCKED_CATEGORIES = {"S4"}  # cannot be unblocked by any policy
+# Operator policy 2026-09-24: illegal / protected-class content never passes; adult content may.
+DEFAULT_BLOCK = {"S1", "S2", "S3", "S4", "S9", "S10", "S11"}
 
-WITHHELD_MSG = "[Response withheld by policy: veto_triggered]"
+DEFAULT_POLICY = {
+    "guard": {"model": os.environ.get("VETO_GUARD_MODEL", "llama-guard3:1b"),
+              "chunk_chars": 6000, "max_chunks": 200, "timeout": 60},
+    "categories": {c: {"block": c in DEFAULT_BLOCK} for c in LLAMA_GUARD_CATEGORIES},
+    "tripwires": {"enabled": True, "extra_patterns": []},
+}
+
+
+# ---------------------------------------------------------------------------
+# Policy (hot reload on mtime)
+# ---------------------------------------------------------------------------
+class Policy:
+    def __init__(self):
+        self._mtime = None
+        self.data = copy.deepcopy(DEFAULT_POLICY)
+        self.extra_re: list[re.Pattern] = []
+        self.reload()
+
+    def reload(self) -> None:
+        try:
+            m = os.stat(POLICY_PATH).st_mtime
+        except OSError:
+            m = None
+        if m == self._mtime:
+            return
+        self._mtime = m
+        data = copy.deepcopy(DEFAULT_POLICY)
+        if m is not None:
+            try:
+                with open(POLICY_PATH, encoding="utf-8") as f:
+                    loaded = json.load(f)
+                for k in ("guard", "tripwires"):
+                    if isinstance(loaded.get(k), dict):
+                        data[k].update(loaded[k])
+                if isinstance(loaded.get("categories"), dict):
+                    for c, v in loaded["categories"].items():
+                        if c in data["categories"] and isinstance(v, dict):
+                            data["categories"][c]["block"] = bool(v.get("block", data["categories"][c]["block"]))
+            except Exception as e:  # noqa: BLE001 — bad policy file => defaults, loudly
+                log.error("policy load failed (%s); using built-in defaults", e)
+        for c in LOCKED_CATEGORIES:
+            data["categories"][c]["block"] = True
+        pats = []
+        for p in data["tripwires"].get("extra_patterns", []):
+            try:
+                pats.append(re.compile(p, re.IGNORECASE | re.DOTALL))
+            except re.error as e:
+                log.error("ignoring invalid extra tripwire %r: %s", p, e)
+        self.data, self.extra_re = data, pats
+        log.warning("VetoGuard policy loaded: model=%s blocked=%s extra_tripwires=%d",
+                    data["guard"]["model"], sorted(self.blocked()), len(pats))
+
+    def blocked(self) -> set[str]:
+        return {c for c, v in self.data["categories"].items() if v.get("block")} | LOCKED_CATEGORIES
+
+    @property
+    def guard(self) -> dict:
+        return self.data["guard"]
+
+
+POLICY = Policy()
+
 
 # ---------------------------------------------------------------------------
 # Lexical tripwire
@@ -80,8 +134,6 @@ CSAM_PATTERNS = [
     r".{0,60}?\b(porn|pornograph\w*|sex\w*|nude|naked|erotic\w*|explicit|molest\w*|abuse\w*)\b",
     r"\b(csam|csem|pedophil\w*|paedophil\w*|loli\w*|shota\w*)\b",
 ]
-# Scanned against text with ALL whitespace/underscores removed — defeats letter-spacing.
-# Only unambiguous tokens belong here (no word boundaries are available).
 DESPACED_PATTERNS = [r"testsentinelblockalpha", r"csam", r"pedophil", r"paedophil"]
 
 _FLAGS = re.IGNORECASE | re.DOTALL
@@ -125,11 +177,7 @@ def _content_to_text(content: Any) -> str:
 
 
 def collect_request_text(data: dict) -> list[str]:
-    """Latest user turn, plus any trailing tool results after it (+ prompt/input fields).
-
-    Tool results are untrusted input — the prompt-injection channel once MCP/tool calling lands
-    (roadmap) — so they are scanned like user text. Earlier turns were vetted when sent.
-    """
+    """Latest user turn plus trailing tool results (untrusted input), plus prompt/input fields."""
     texts: list[str] = []
     for m in reversed(data.get("messages") or []):
         if not isinstance(m, dict):
@@ -139,8 +187,7 @@ def collect_request_text(data: dict) -> list[str]:
             continue
         if m.get("role") == "user":
             texts.append(_content_to_text(m.get("content")))
-            break
-        break  # an assistant turn after the last user turn: stop
+        break
     for key in ("prompt", "input"):
         v = data.get(key)
         if isinstance(v, list):
@@ -201,40 +248,44 @@ class GuardUnavailable(Exception):
 
 
 async def _guard_call(messages: list[dict]) -> tuple[bool, list[str]]:
-    """Returns (unsafe, categories)."""
-    payload = {"model": GUARD_MODEL, "messages": messages, "stream": False,
+    g = POLICY.guard
+    payload = {"model": g["model"], "messages": messages, "stream": False,
                "options": {"temperature": 0, "num_predict": 32, "num_ctx": 8192}}
     try:
-        async with httpx.AsyncClient(timeout=GUARD_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=float(g.get("timeout", 60))) as client:
             r = await client.post(f"{GUARD_URL}/api/chat", json=payload)
             r.raise_for_status()
             verdict = (r.json().get("message", {}).get("content") or "").strip().lower()
-    except Exception as e:  # noqa: BLE001 — any failure is "unavailable"; caller fails closed
+    except Exception as e:  # noqa: BLE001
         raise GuardUnavailable(str(e)) from e
     if not verdict:
         raise GuardUnavailable("empty verdict")
     if verdict.startswith("safe"):
         return False, []
-    cats = [c.strip().upper() for c in re.findall(r"s\d{1,2}", verdict)]
+    cats = [c.upper() for c in re.findall(r"s\d{1,2}", verdict)]
     return True, cats or ["UNSPECIFIED"]
 
 
 def _chunks(text: str) -> list[str]:
-    return [text[i:i + CHUNK_CHARS] for i in range(0, len(text), CHUNK_CHARS)] or [""]
+    n = int(POLICY.guard.get("chunk_chars", 6000))
+    return [text[i:i + n] for i in range(0, len(text), n)] or [""]
+
+
+def _blocked_subset(cats: list[str]) -> list[str]:
+    blocked = POLICY.blocked()
+    return [c for c in cats if c in blocked or c == "UNSPECIFIED"]
 
 
 async def classify_request(texts: list[str]) -> tuple[bool, list[str]]:
-    joined = "\n".join(texts)
-    chunks = _chunks(joined)
-    if len(chunks) > MAX_CHUNKS:
-        _refuse(413, "prompt_too_long_for_guard", f"Input exceeds the classifier budget ({MAX_CHUNKS * CHUNK_CHARS} chars).")
+    chunks = _chunks("\n".join(texts))
+    if len(chunks) > int(POLICY.guard.get("max_chunks", 200)):
+        _refuse(413, "prompt_too_long_for_guard", "Input exceeds the classifier budget.")
     for ch in chunks:
         if not ch.strip():
             continue
         unsafe, cats = await _guard_call([{"role": "user", "content": ch}])
-        blocked = [c for c in cats if c not in GUARD_IGNORE]
-        if unsafe and blocked:
-            return True, blocked
+        if unsafe and (b := _blocked_subset(cats)):
+            return True, b
     return False, []
 
 
@@ -242,14 +293,13 @@ async def classify_output(request_text: str, output: str) -> tuple[bool, list[st
     if not output.strip():
         return False, []
     chunks = _chunks(output)
-    if len(chunks) > MAX_CHUNKS:
+    if len(chunks) > int(POLICY.guard.get("max_chunks", 200)):
         return True, ["OUTPUT_TOO_LONG_FOR_GUARD"]
-    user_ctx = request_text[:CHUNK_CHARS]
+    user_ctx = request_text[: int(POLICY.guard.get("chunk_chars", 6000))]
     for ch in chunks:
         unsafe, cats = await _guard_call([{"role": "user", "content": user_ctx}, {"role": "assistant", "content": ch}])
-        blocked = [c for c in cats if c not in GUARD_IGNORE]
-        if unsafe and blocked:
-            return True, blocked
+        if unsafe and (b := _blocked_subset(cats)):
+            return True, b
     return False, []
 
 
@@ -258,37 +308,36 @@ async def classify_output(request_text: str, output: str) -> tuple[bool, list[st
 # ---------------------------------------------------------------------------
 class VetoGuard(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        POLICY.reload()
         texts = collect_request_text(data)
         if not texts:
             return data
-        for name, pats in (("sentinel", SENTINEL_RE), ("csam", CSAM_RE), ("malware", MALWARE_RE)):
-            hit = scan(texts, pats)
+        if POLICY.data["tripwires"].get("enabled", True):
+            for name, pats in (("sentinel", SENTINEL_RE), ("csam", CSAM_RE), ("malware", MALWARE_RE), ("extra", POLICY.extra_re)):
+                hit = scan(texts, pats) if pats else None
+                if hit:
+                    audit("pre_call", f"regex:{name}", hit, data, user_api_key_dict)
+                    _refuse(400, "veto_triggered", "Request refused by policy.")
+            hit = scan_despaced(texts)
             if hit:
-                audit("pre_call", f"regex:{name}", hit, data, user_api_key_dict)
+                audit("pre_call", "regex:despaced", hit, data, user_api_key_dict)
                 _refuse(400, "veto_triggered", "Request refused by policy.")
-        hit = scan_despaced(texts)
-        if hit:
-            audit("pre_call", "regex:despaced", hit, data, user_api_key_dict)
+        try:
+            unsafe, cats = await classify_request(texts)
+        except GuardUnavailable as e:
+            audit("pre_call", "guard_unavailable", str(e)[:200], data, user_api_key_dict)
+            _refuse(503, "guard_unavailable", "Safety classifier unavailable; request refused (fail-closed).")
+        if unsafe:
+            audit("pre_call", "classifier", ",".join(cats), data, user_api_key_dict)
             _refuse(400, "veto_triggered", "Request refused by policy.")
-        if GUARD_ENABLED:
-            try:
-                unsafe, cats = await classify_request(texts)
-            except GuardUnavailable as e:
-                audit("pre_call", "guard_unavailable", str(e)[:200], data, user_api_key_dict)
-                _refuse(503, "guard_unavailable", "Safety classifier unavailable; request refused (fail-closed).")
-            if unsafe:
-                audit("pre_call", "classifier", ",".join(cats), data, user_api_key_dict)
-                _refuse(400, "veto_triggered", "Request refused by policy.")
         return data
 
     async def async_post_call_success_hook(self, data, user_api_key_dict, response):
-        if not GUARD_ENABLED:
-            return response
+        POLICY.reload()
         try:
             outputs = []
             for c in getattr(response, "choices", []) or []:
                 outputs.append(_content_to_text(getattr(c.message, "content", None)))
-                # Outgoing tool-call arguments are model output too (roadmap: MCP/tools).
                 for tc in getattr(c.message, "tool_calls", None) or []:
                     fn = getattr(tc, "function", None)
                     outputs.append(f"{getattr(fn, 'name', '')} {getattr(fn, 'arguments', '')}")
@@ -307,17 +356,13 @@ class VetoGuard(CustomLogger):
 
     async def async_post_call_streaming_iterator_hook(self, user_api_key_dict, response, request_data: dict) -> AsyncGenerator:
         """Buffer the whole stream, classify, then release (or withhold). Nothing unclassified is sent."""
+        POLICY.reload()
         buffered = []
         async for chunk in response:
             buffered.append(chunk)
-        if not GUARD_ENABLED or not buffered:
-            for c in buffered:
-                yield c
+        if not buffered:
             return
-        text = "".join(
-            (getattr(c.choices[0].delta, "content", None) or "")
-            for c in buffered if getattr(c, "choices", None)
-        )
+        text = "".join((getattr(c.choices[0].delta, "content", None) or "") for c in buffered if getattr(c, "choices", None))
         req_text = "\n".join(collect_request_text(request_data))
         try:
             unsafe, cats = await classify_output(req_text, text)
