@@ -36,8 +36,7 @@ echo $(basename $r) $(basename $(readlink -f $r/device)); done`. DCGM/Grafana do
 `/status` read Ollama's own discovery numbers.
 
 ## Model store for images (`comfyui/`)
-Start image generation: `docker compose --profile apps up -d comfyui` (the hub's Services page can restart it once
-running). The output classifier (Safety → VetoGuard policy) must be resident or every submission is refused.
+Start image generation: `docker compose --profile apps up -d comfyui-intel` (Arc; default target) or `--profile apps-nvidia up -d comfyui` (T4; set `COMFY_URL` on the hub accordingly). The hub's Services page can restart either once running. Workflows: `python3 scripts/comfy-workflows.py` regenerates the Aegis set. The output classifier (Safety → VetoGuard policy) must be resident or every submission is refused.
 Filled by Hub → Models → Browse (downloads) and read by ComfyUI when its profile is up. Directories must stay
 `root:<operator group> 2775` (root-owned, group-writable, setgid) — the hub runs with all capabilities dropped, so it can only write directories root owns.
 Delete a model by removing its file; the browser refuses to overwrite an existing file.

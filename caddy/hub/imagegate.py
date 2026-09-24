@@ -239,6 +239,46 @@ def destroy(path: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------- uploads (input images) ----------
+UPLOADS = os.path.join(STORE, "input", ".aegis-uploads.json")
+
+
+def _uploads() -> dict:
+    try:
+        with open(UPLOADS, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def uploads_add(user: str, name: str) -> None:
+    with _LOCK:
+        u = _uploads(); u[name] = {"user": user, "ts": datetime.now(timezone.utc).isoformat()}
+        tmp = UPLOADS + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(u, f)
+        os.chmod(tmp, 0o600); os.replace(tmp, UPLOADS)
+
+
+def uploads_owner(name: str) -> str | None:
+    return (_uploads().get(os.path.basename(name)) or {}).get("user")
+
+
+def uploads_of(user: str) -> list[str]:
+    d = os.path.join(STORE, "input")
+    return sorted(n for n, v in _uploads().items() if v.get("user") == user and os.path.isfile(os.path.join(d, n)))
+
+
+def input_refs(workflow: dict) -> list[str]:
+    """String inputs that name a file in the input directory (LoadImage etc.)."""
+    d = os.path.join(STORE, "input"); out = []
+    for _, _, _, v in _walk_strings(workflow):
+        b = os.path.basename(v.replace("\\", "/"))
+        if b and b != "example.png" and os.path.isfile(os.path.join(d, b)) and b not in out:
+            out.append(b)
+    return out
+
+
 # ---------------------------------------------------------------- gallery ---------------------
 SAFE_USER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,40}$")
 

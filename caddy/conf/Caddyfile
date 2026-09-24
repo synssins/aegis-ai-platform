@@ -81,7 +81,7 @@
     # Image generation behind the hub's gate. The hub handles the calls that carry prompts, model choices and
     # outputs; everything else (UI assets, websocket progress, queue) is allowed only for a session the hub
     # vouches for (forward_auth). Uploads stay off until an input-image gate exists. Previews are disabled.
-    @comfy_hub path /comfy/prompt /comfy/api/prompt /comfy/view /comfy/api/view /comfy/object_info* /comfy/api/object_info* /comfy/history* /comfy/api/history*
+    @comfy_hub path /comfy/prompt /comfy/api/prompt /comfy/view /comfy/api/view /comfy/object_info* /comfy/api/object_info* /comfy/history* /comfy/api/history* /comfy/upload/image /comfy/api/upload/image
     handle @comfy_hub {
         reverse_proxy localhost:9000 {
             header_up X-Device-Fingerprint {http.request.tls.client.fingerprint}
@@ -90,7 +90,7 @@
     }
     @comfy_upload path /comfy/upload* /comfy/api/upload*
     handle @comfy_upload {
-        respond "image uploads are not enabled" 403
+        respond "only gated image uploads are enabled" 403
     }
     redir /comfy /comfy/ 308
     handle /comfy/* {

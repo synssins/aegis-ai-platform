@@ -25,6 +25,15 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 ## Public status page
 `https://<LAN_IP>/status` (and `/status/api` as JSON) shows the same load/health view **without a login** — GPU/CPU/memory/disk load, models in memory, service up/down. It deliberately contains no accounts, keys, aliases or content; the acceptance suite asserts that. It is the first tile of the future portal.
 
+## GPU pools and fit badges
+Two pools: `nvidia` (2× T4 15 GB) and `intel` (2× Arc Pro B60 24 GB). Chat models are exposed **on a pool** (Models
+→ Installed → Expose → pool); Ollama spreads a model over every card of its pool when it does not fit one (gemma3:27b
+already spans both T4s; a ~40 GB Q4 model would span both B60s). The classifier lives on the Intel pool by policy;
+image generation takes one Arc. Fit badges in the browser judge **each card separately** (image/video models need
+one card; language models may spread over a pool) — "fits now on B60", "fits on T4 after unload", "spread across
+intel pool (2×24 GB)". Intel cards are invisible to DCGM, so they are declared in `AEGIS_INTEL_GPUS` (compose) and
+their free memory is approximate.
+
 ## Model browser (Hub → Models → Browse)
 Admin-only. Two sources today (Hugging Face, CivitAI) behind one experience; a source is a small provider in
 `caddy/hub/browse.py` (search + detail + normalised item), so more registries slot in. Cards show name, author,
@@ -65,6 +74,25 @@ Three gates on every workflow, all in `caddy/hub/imagegate.py` + `hub.py` (`_com
    audit (S12). Unreadable verdict or classifier error → destroyed (fail closed). Approved images are copied to
    `gallery/<user>/` and the output file wiped; `/comfy/view` serves only from the user's gallery (long-polls the
    gate for up to 25 s so the ComfyUI canvas shows the result).
+
+**Where it runs.** The image engine is `comfyui-intel` — Intel's `llm-scaler-omni` image (upstream ComfyUI on
+PyTorch XPU) pinned to **one Arc Pro B60** (`ONEAPI_DEVICE_SELECTOR=level_zero:0`); the other B60 holds the safety
+classifier. Image/video generation uses one card by design; the T4s keep chat + the image classifier. The NVIDIA
+instance (`comfyui`, profile `apps-nvidia`) exists for smaller models; the hub targets one instance (`COMFY_URL`).
+Measured: SDXL 1024² ≈ 24 s cold (6.5 GB load) and a few seconds warm; 4x model upscale of 1024² ≈ 10 s.
+
+**Uploads (input images) are gated too.** `/comfy/upload/image` is handled by the hub: the file is classified by
+the same vision model *before* ComfyUI can read it; illegal → destroyed + immutable audit + sealed evidence (never
+the image); NSFW without the grant → destroyed; clean → stored as `<user>-<id>-<name>` in `comfyui/input/`, owned by
+that account. `LoadImage` choosers list only the account's own uploads; a workflow that names someone else's input
+file is refused; `/comfy/view?type=input` serves only your own. Other upload endpoints (masks) stay 403.
+
+**Pre-built workflows** (`scripts/comfy-workflows.py` → `comfyui/user/default/workflows/Aegis/`, shown in the
+workflow browser): *Photoreal txt2img (RealVisXL 5)*, *Car photo refine (img2img, denoise 0.35 keeps geometry)*,
+*Upscale 4x accurate (UltraSharpV2 — model upscale only, no diffusion, lines stay straight)*, *Upscale 2x
+supersampled (4x model then Lanczos ½ — the most accurate 2x)*, *Upscale then refine (optional low-denoise texture
+pass; can bend fine lines, so it is separate)*. Models come from the browser (RealVisXL_V5.0_fp16, 4x-UltraSharp,
+4x-UltraSharpV2), all SHA-verified and classified SFW.
 
 **Gallery** (portal section, `images` grant): grid of the user's approved images with select-all / bulk delete.
 Deletion wipes the file, its record and ComfyUI's history entry — users purge their own without review, by

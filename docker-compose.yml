@@ -46,6 +46,8 @@ services:
     environment:
       - AEGIS_LAN_IP=${AEGIS_LAN_IP}
       - GUARD_OLLAMA=http://ollama-intel:11434         # where the hub loads/checks the safety classifier
+      - COMFY_URL=http://comfyui-intel:8188            # the ComfyUI instance behind the gate (comfyui:8188 for the NVIDIA one)
+      - AEGIS_INTEL_GPUS=Arc Pro B60:24576,Arc Pro B60:24576   # Intel cards are invisible to DCGM; declared for fit badges/status
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
       - HUB_SECRET_KEY=${HUB_SECRET_KEY}
       - VETO_EVIDENCE_KEY=${VETO_EVIDENCE_KEY}      # evidence handoff export (re-encrypts one record with a fresh key)
@@ -267,14 +269,39 @@ services:
               count: 1
               capabilities: [gpu]
 
+  comfyui-intel:
+    # Image generation on ONE Intel Arc (Intel's llm-scaler-omni: upstream ComfyUI on PyTorch XPU, no download at start).
+    # Reachable ONLY through the hub's gate (see comfyui below for the routing). Same store, input, output and user dirs
+    # as the NVIDIA instance, so workflows and the gate are identical; only one instance is the target (hub COMFY_URL).
+    <<: *hardened
+    image: intel/llm-scaler-omni:0.2.0-b1
+    container_name: comfyui-intel
+    profiles: [apps]
+    working_dir: /llm/ComfyUI
+    command: ["python", "main.py", "--listen", "0.0.0.0", "--port", "8188", "--extra-model-paths-config", "/data/extra_model_paths.yaml", "--reserve-vram", "2", "--input-directory", "/data/input", "--output-directory", "/data/output", "--user-directory", "/data/user", "--preview-method", "none", "--disable-auto-launch", "--disable-metadata"]
+    environment:
+      - ONEAPI_DEVICE_SELECTOR=level_zero:0            # one card; the second Arc stays with the classifier pool
+    shm_size: 16g
+    devices:
+      - /dev/dri/renderD129
+      - /dev/dri/card0
+    group_add: ["991", "44"]
+    volumes:
+      - ./comfyui:/models/host:ro
+      - ./comfyui/extra_model_paths.yaml:/data/extra_model_paths.yaml:ro
+      - ./comfyui/input:/data/input
+      - ./comfyui/output:/data/output
+      - ./comfyui/user:/data/user
+    networks: [apps]
+
   comfyui:
-    # Image generation. Reachable ONLY through the hub's gate (Caddy: /comfy -> hub for /prompt, /view, /object_info,
+    # Image generation on the NVIDIA pool (profile apps-nvidia). Reachable ONLY through the hub's gate (Caddy: /comfy -> hub for /prompt, /view, /object_info,
     # /history; forward_auth for the rest). The hub classifies every prompt (VetoGuard), every model file (per-file
     # NSFW attribute) and every output (vision classifier) — docs/HUB.md -> Images. No egress (apps is internal).
     <<: *hardened
     image: yanwk/comfyui-boot:cu126-slim-20260921     # community image that BUNDLES upstream ComfyUI (no fork; copies /default-comfyui-bundle at first start, no download)
     container_name: comfyui
-    profiles: [apps]
+    profiles: [apps-nvidia]
     environment:
       - CLI_ARGS=--listen 0.0.0.0 --port 8188 --preview-method none --disable-auto-launch --disable-metadata
     devices:
@@ -286,6 +313,7 @@ services:
       - ./comfyui/controlnet:/root/ComfyUI/models/controlnet
       - ./comfyui/upscale_models:/root/ComfyUI/models/upscale_models
       - ./comfyui/embeddings:/root/ComfyUI/models/embeddings
+      - ./comfyui/input:/root/ComfyUI/input            # gated uploads land here
       - ./comfyui/output:/root/ComfyUI/output          # the hub gates and MOVES files out of here
       - ./comfyui/temp:/root/ComfyUI/temp
       - ./comfyui/user:/root/ComfyUI/user

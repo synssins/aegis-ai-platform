@@ -34,7 +34,7 @@ POLL, STATUS_EVERY = 2, 5
 DEPENDENTS = {                      # name -> direct dependents (must be down while name restarts)
     "caddy": ["hub"], "hub": [], "litellm-db": ["litellm"], "ollama": ["litellm"], "ollama-intel": ["litellm"], "litellm": [],
     "openwebui": [], "modeld": [], "prometheus": ["grafana"], "grafana": [], "node-exporter": [], "dcgm-exporter": [],
-    "fish-speech": [], "comfyui": [],
+    "fish-speech": [], "comfyui": [], "comfyui-intel": [],
 }
 ALLOWED = set(DEPENDENTS)
 PROTECTED = {"caddy", "hub"}

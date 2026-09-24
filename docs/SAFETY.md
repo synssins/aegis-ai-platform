@@ -70,5 +70,5 @@ every output judged by a vision model before anyone can see it. Illegal / minor 
 as evidence **without the image** (prompt, files, verdict, perceptual hash); NSFW without the grant is destroyed;
 an unreadable verdict destroys. ComfyUI is reachable only through the hub's gate, has no egress, and the chat UI
 has no route to it. Known limits: the output classifier is a general vision model, not a hash-matching CSAM
-detector — the prompt gate and the destroy-on-doubt policy are the primary controls; uploads (img2img) stay
-disabled until an input-image gate exists.
+detector — the prompt gate and the destroy-on-doubt policy are the primary controls; uploads (img2img) pass the
+same classifier before ComfyUI can read them and are owned per account.

@@ -69,20 +69,35 @@ def _ext_ok(name: str) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------- hardware fit ----------
-def fit_badge(size_bytes: int | float | None, gpus: dict, kind: str) -> dict:
-    """Operational guidance, not a control: compare the file to one card's memory. LLMs get a KV-cache band;
-    diffusion checkpoints run mostly as-is (fp16) plus working memory. Intel cards are counted only if a runtime
-    reports them in `gpus`."""
-    if not size_bytes or not gpus:
-        return {"label": "unknown", "cls": "mut", "why": "no size or no GPU inventory"}
+def fit_badge(size_bytes: int | float | None, cards: list[dict] | dict, kind: str) -> dict:
+    """Operational guidance, not a control. Image/video models run on ONE card; a language model may be spread by
+    Ollama over every card of a pool. Each card is judged on its own memory (Intel cards are declared, so their free
+    memory is approximate)."""
+    if isinstance(cards, dict):        # legacy shape {idx: {...}}
+        cards = [{"pool": "nvidia", "name": g.get("name", ""), "mem_total": (g.get("mem_used") or 0) + (g.get("mem_free") or 0), "mem_free": g.get("mem_free") or 0} for g in cards.values()]
+    if not size_bytes or not cards:
+        return {"label": "unknown", "cls": "mut", "why": "no size or no GPU inventory", "cards": []}
     need = size_bytes * (1.20 if kind == "llm" else 1.35) + (1.5 * 2**30 if kind == "llm" else 2.0 * 2**30)
-    best_total = max((g.get("mem_total") or (g.get("mem_used", 0) + g.get("mem_free", 0))) * 2**20 for g in gpus.values())
-    best_free = max((g.get("mem_free") or 0) * 2**20 for g in gpus.values())
-    if need <= best_free:
-        return {"label": "fits now", "cls": "ok", "why": f"needs ≈{_fmt_size(need)}, {_fmt_size(best_free)} free on one card"}
-    if need <= best_total:
-        return {"label": "fits after unload", "cls": "warn", "why": f"needs ≈{_fmt_size(need)}, a card has {_fmt_size(best_total)} total"}
-    return {"label": "won't fit one card", "cls": "bad", "why": f"needs ≈{_fmt_size(need)}, largest card {_fmt_size(best_total)}"}
+    per = []
+    for c in cards:
+        tot, free = (c.get("mem_total") or 0) * 2**20, (c.get("mem_free") or 0) * 2**20
+        per.append({"card": c.get("name", "?"), "pool": c.get("pool", "?"), "fit": "now" if need <= free else "after unload" if need <= tot else "no"})
+    short = lambda n: n.replace("Tesla ", "").replace("Intel(R) Arc(tm) ", "").replace("Arc Pro ", "").replace("NVIDIA ", "")
+    now = sorted({short(x["card"]) for x in per if x["fit"] == "now"}); later = sorted({short(x["card"]) for x in per if x["fit"] == "after unload"})
+    if now:
+        lab, cls = "fits now on " + "/".join(now), "ok"
+    elif later:
+        lab, cls = "fits on " + "/".join(later) + " after unload", "warn"
+    else:
+        lab, cls = "won't fit one card", "bad"
+        if kind == "llm":
+            pools = {}
+            for c in cards:
+                pools.setdefault(c.get("pool", "?"), []).append((c.get("mem_total") or 0) * 2**20)
+            ok = [f"{k} pool ({len(v)}×{_fmt_size(v[0])})" for k, v in pools.items() if sum(v) >= need]
+            if ok:
+                lab, cls = "spread across " + ", ".join(ok), "warn"
+    return {"label": lab, "cls": cls, "why": f"needs ≈{_fmt_size(need)} ({'one card, image/video' if kind != 'llm' else 'per card; Ollama spreads over a pool'})", "cards": per}
 
 
 # ---------------------------------------------------------------- Hugging Face ----------

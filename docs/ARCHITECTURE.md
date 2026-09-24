@@ -36,7 +36,8 @@ hub ──► modeld (mgmt, egress) ── pulls into the shared model store ─
 | litellm-db | `postgres:16-alpine` | backend only |
 | ollama | `ollama/ollama:0.34.3` | backend only; NVIDIA runtime; `OLLAMA_KEEP_ALIVE=24h` |
 | prometheus / node-exporter / dcgm-exporter / grafana | pinned | profile `monitoring`; node-exporter has the stack's one broad (read-only) host mount |
-| comfyui | `yanwk/comfyui-boot:cu126-slim-20260921` (bundles upstream ComfyUI) | profile `apps`; reachable only through the hub gate (prompt / file / output); no egress; previews off |
+| comfyui-intel | `intel/llm-scaler-omni:0.2.0-b1` (upstream ComfyUI on PyTorch XPU, one Arc B60) | profile `apps`; gate target; reachable only through the hub gate (prompt / file / upload / output); no egress; previews off |
+| comfyui | `yanwk/comfyui-boot:cu126-slim-20260921` (bundles upstream ComfyUI, T4) | profile `apps-nvidia`; alternative target |
 | fish-speech | placeholder | profile `apps` |
 
 Every container drops all capabilities and sets `no-new-privileges`. Root without `CAP_DAC_OVERRIDE`
