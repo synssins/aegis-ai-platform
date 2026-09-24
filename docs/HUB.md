@@ -38,7 +38,7 @@ Llama Guard 3 categories, grouped:
 - **protected (blocked by default):** S10 hate / protected classes, S11 suicide & self-harm.
 - **adult/legal (allowed by default):** S5, S6, S7, S8, S12 sexual content (adult), S13, S14.
 
-**Classifier is mandatory and fail-closed:** if the chosen model is not installed, not loadable or unreachable, every request is refused (503 `guard_unavailable`). If VRAM pressure evicts it, Ollama reloads it on the next request (~20 s once). Load the main model *before* choosing a larger classifier so both fit. The dropdown lists installed models named *guard*, *shield* or *guardian*; VetoGuard parses the Llama Guard verdict format, so other families need an output adapter first (roadmap #11).
+**Classifier is mandatory and fail-closed:** if the chosen model is not installed, not loadable or unreachable, every request is refused (503 `guard_unavailable`). If VRAM pressure evicts it, Ollama reloads it on the next request (~20 s once). Load the main model *before* choosing a larger classifier so both fit. The dropdown lists installed models named *guard*, *shield* or *guardian*. Each family needs a **verdict adapter** (how it is asked, how its answer is read); today only Llama Guard has one, so other families are listed but not selectable. If a classifier ever returns an answer the adapter cannot read, the request is **refused** (503 `guard_verdict_unparseable`) and the audit entry records `got='<first 120 chars of the classifier's answer>' expected='…'` — classifier output only, never user content — and the event is alerted.
 
 The lexical tripwire (sentinel, CSAM terms, malware intent, plus admin-added regexes) runs before
 the classifier. The classifier runs on input and on output (streaming is buffered and released only

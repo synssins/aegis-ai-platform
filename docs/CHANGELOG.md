@@ -4,6 +4,8 @@ All significant changes to the platform are recorded here. Every entry must name
 
 ## 2026-09-24 (night) — 8B guard live with Gemma 3 27B
 
+- **VetoGuard 2.8 — verdict adapters.** Adapter registry (request template + parser per safety family; Llama Guard shipped). No adapter or unreadable answer ⇒ refused with 503 `guard_no_adapter` / `guard_verdict_unparseable`; audit records `got=` (classifier answer, ≤ 120 chars) and `expected=`; alerted. Hub refuses to select adapter-less families and says why. Operator rule: unreadable verdict = fail closed + diagnose, never allow. Test 3.13.
+
 - **Classifier selection is now one action** (operator finding: it took two places). Safety → VetoGuard policy chooses the model *and* loads it (unloading other guard models); Models → Installed offers "Set as classifier" (same action) and no longer exposes Load/Unload for guard-family models. Policy page and dashboard show classifier residency; a missing classifier is flagged as "all requests refused". Guard-family detection: *guard* / *shield* / *guardian*; other families need verdict adapters (roadmap #11).
 
 - Operator loaded `gemma3:27b` and `llama-guard3:8b`; loading Gemma first lets both stay 100% GPU (27/30 GB). Policy switched to 8B (hot-reloaded). Full request through LiteLLM with pre + post classification: 2.9 s; Gemma 15.5 tok/s (Mixtral was 12.5). Keys `openwebui`, `sentinel-tests`, `home-assistant-test` updated to allow `gemma3`; suite model now `TEST_MODEL` (gemma3) so tests never pull a second large model into VRAM. Hub: keys page gains "Update models"; client-disconnect no longer logs `hub_error`.

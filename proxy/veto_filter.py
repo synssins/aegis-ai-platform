@@ -1,6 +1,11 @@
 """
-VetoGuard rev 2.7 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
+VetoGuard rev 2.8 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
 driven by an admin-editable policy file (hot-reloaded) that only the hub may write.
+
+rev 2.8: verdict ADAPTERS. Each safety-model family has an adapter that builds the classifier request and
+parses its answer; only Llama Guard ships today. A model with no adapter, or an answer the adapter cannot
+parse, is REFUSED (503 guard_verdict_unparseable / guard_no_adapter) and the audit entry records what came
+back (first 120 chars of the classifier's answer — never user content) and what was expected.
 
 rev 2.7 (Agy round 5, docs/tests/agy-vetoguard-review-r5-2026-09-24.md): oversized multipart leaves are
 never dropped; base64 fragments with stray non-printables are kept (cleaned) instead of discarded;
@@ -481,7 +486,8 @@ def _short_err(e: Any) -> str:
 
 
 def audit(stage: str, reason: str, detail: str, data: dict, key_dict: Any) -> None:
-    rec = {"ts": datetime.now(timezone.utc).isoformat(), "stage": stage, "reason": reason, "detail": detail.splitlines()[0][:120] if detail else "",
+    dcap = 240 if reason in ("guard_verdict_unparseable", "guard_no_adapter") else 120
+    rec = {"ts": datetime.now(timezone.utc).isoformat(), "stage": stage, "reason": reason, "detail": (detail.replace("\n", "\\n")[:dcap] if detail else ""),
            "call_id": data.get("litellm_call_id"), "model": data.get("model"), "key_alias": _key_alias(key_dict)}
     log.warning("VETO %s", json.dumps(rec))
     try:
@@ -524,6 +530,47 @@ class GuardUnavailable(Exception):
     pass
 
 
+class GuardVerdictUnparseable(Exception):
+    def __init__(self, got: str, expected: str, reason: str = "guard_verdict_unparseable"):
+        super().__init__(f"got={got!r} expected={expected}")
+        self.got, self.expected, self.reason = got, expected, reason
+
+
+def _parse_llama_guard(verdict: str) -> tuple[bool, list[str]]:
+    lines = [l.strip() for l in verdict.strip().lower().splitlines() if l.strip()]
+    if not lines:
+        raise GuardUnavailable("empty verdict")
+    if lines[0] == "safe":
+        return False, []
+    if lines[0] == "unsafe":
+        cats = [c.upper() for c in re.findall(r"s\d{1,2}", " ".join(lines[1:]))]
+        return True, cats or ["UNSPECIFIED"]
+    raise GuardVerdictUnparseable(verdict[:120], ADAPTERS["llama_guard"]["expected"])
+
+
+# Verdict adapters: how to ask each safety-model family and how to read its answer.
+# Families recognised by name but WITHOUT an adapter are refused (fail-closed) until one is written.
+ADAPTERS = {
+    "llama_guard": {
+        "match": re.compile(r"llama-?guard", re.I),
+        "expected": '"safe" or "unsafe" followed by S-codes on the next line (e.g. "unsafe\\nS1,S4")',
+        "messages": lambda msgs: msgs,                        # Llama Guard takes the conversation as-is
+        "parse": _parse_llama_guard,
+    },
+    # "shieldgemma": pending — per-policy yes/no prompt template, answer "Yes"/"No"
+    # "granite_guardian": pending — "Yes"/"No" with risk definition in the system prompt
+    # "wildguard": pending — three-line "Harmful request / Response refusal / Harmful response" block
+}
+KNOWN_FAMILIES_WITHOUT_ADAPTER = re.compile(r"shield|guardian|wildguard", re.I)
+
+
+def adapter_for(model: str) -> dict | None:
+    for a in ADAPTERS.values():
+        if a["match"].search(model):
+            return a
+    return None
+
+
 _CLIENT: httpx.AsyncClient | None = None
 _CLIENT_LOOP: asyncio.AbstractEventLoop | None = None
 _SEM: asyncio.Semaphore | None = None
@@ -550,25 +597,20 @@ def _sem() -> asyncio.Semaphore:
 
 async def _guard_call(messages: list[dict]) -> tuple[bool, list[str]]:
     g = POLICY.guard
-    payload = {"model": g["model"], "messages": messages, "stream": False,
+    ad = adapter_for(g["model"])
+    if ad is None:
+        fam = "recognised safety family without an adapter yet" if KNOWN_FAMILIES_WITHOUT_ADAPTER.search(g["model"]) else "unknown model family"
+        raise GuardVerdictUnparseable("(not called)", f"an adapter for {g['model']} ({fam}); available: {', '.join(ADAPTERS)}", reason="guard_no_adapter")
+    payload = {"model": g["model"], "messages": ad["messages"](messages), "stream": False,
                "options": {"temperature": 0, "num_predict": 32, "num_ctx": 8192}}
     try:
         async with _sem():
             r = await _client().post(f"{GUARD_URL}/api/chat", json=payload, timeout=float(g.get("timeout", 60)))
         r.raise_for_status()
-        verdict = (r.json().get("message", {}).get("content") or "").strip().lower()
+        verdict = (r.json().get("message", {}).get("content") or "")
     except Exception as e:  # noqa: BLE001
         raise GuardUnavailable(str(e)) from e
-    lines = [l.strip() for l in verdict.splitlines() if l.strip()]
-    if not lines:
-        raise GuardUnavailable("empty verdict")
-    if lines[0] == "safe":
-        return False, []
-    if lines[0] == "unsafe":
-        cats = [c.upper() for c in re.findall(r"s\d{1,2}", " ".join(lines[1:]))]
-        return True, cats or ["UNSPECIFIED"]
-    log.error("unexpected guard verdict shape: %r", verdict[:80])
-    return True, ["UNPARSEABLE_VERDICT"]
+    return ad["parse"](verdict)
 
 
 def _chunks(text: str) -> list[str]:
@@ -686,6 +728,9 @@ class VetoGuard(CustomLogger):
                 _refuse(400, "veto_triggered", "Request refused by policy.")
         try:
             unsafe, cats = await classify_request(view)
+        except GuardVerdictUnparseable as e:
+            audit("pre_call", e.reason, f"got={e.got!r} expected={e.expected}", data, user_api_key_dict)
+            _refuse(503, e.reason, "Safety classifier returned an unreadable verdict; request refused (fail-closed). See the audit log.")
         except GuardUnavailable as e:
             audit("pre_call", "guard_unavailable", _short_err(e), data, user_api_key_dict)
             _refuse(503, "guard_unavailable", "Safety classifier unavailable; request refused (fail-closed).")
@@ -711,6 +756,8 @@ class VetoGuard(CustomLogger):
             except SchemaBudgetExceeded:
                 last_user = ""
             unsafe, cats = await classify_output(last_user, outputs)
+        except GuardVerdictUnparseable as e:
+            audit(stage, e.reason, f"got={e.got!r} expected={e.expected}", data, key); return ["GUARD_UNPARSEABLE"]
         except GuardUnavailable as e:
             audit(stage, "guard_unavailable", _short_err(e), data, key); return ["GUARD_UNAVAILABLE"]
         if unsafe:
@@ -734,6 +781,8 @@ class VetoGuard(CustomLogger):
         if reasons:
             if "GUARD_UNAVAILABLE" in reasons:
                 _refuse(503, "guard_unavailable", "Safety classifier unavailable; response withheld (fail-closed).")
+            if "GUARD_UNPARSEABLE" in reasons:
+                _refuse(503, "guard_verdict_unparseable", "Safety classifier returned an unreadable verdict; response withheld (fail-closed). See the audit log.")
             _refuse(400, "veto_triggered", "Response withheld by policy.")
         return response
 

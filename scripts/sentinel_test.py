@@ -250,6 +250,8 @@ class Suite:
         self.rec("3.10", "veto", "streaming request passes through buffered classifier", "200 + data:", f"{st} {b[:60]!r}", st == 200 and b.startswith(b"data:"))
         rc, out = docker("exec ollama ollama ps", timeout=15)
         self.rec("3.11", "veto", "guard model resident in ollama", "llama-guard3 listed", out[:120], "llama-guard3" in out)
+        rc, out = docker("exec litellm python3 -c \"import sys;sys.path.insert(0,'/app');from custom_logger import veto_filter as v\nimport json\ntry:\n v._parse_llama_guard('This looks fine to me.')\nexcept v.GuardVerdictUnparseable as e: print(e.reason, 'got' in str(e), 'expected' in str(e))\nprint('noadapter', v.adapter_for('shieldgemma:2b') is None)\"", timeout=30)
+        self.rec("3.13", "veto", "unreadable classifier verdict is refused and logged with got/expected", "guard_verdict_unparseable True True + noadapter True", out.replace("\n", " ")[:80], "guard_verdict_unparseable True True" in out and "noadapter True" in out)
         rc, out = docker("exec ollama sh -c 'ollama ps | grep -c GPU'", timeout=15)
         self.rec("3.12", "veto", "main model resident on GPU (not CPU fallback)", ">=1 model on GPU", out.strip(), out.strip().isdigit() and int(out) >= 1)
 

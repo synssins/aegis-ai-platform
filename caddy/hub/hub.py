@@ -120,7 +120,13 @@ NAV = [
     ("gateway", "Gateway", [("certs", "Certificates"), ("hostname", "Public hostname"), ("isolation", "Isolation (read-only)")]),
 ]
 PAGE_SIZES = (10, 25, 50, 100)
-ALERT_ON = ("S1 ", "S2 ", "S3 ", "S4 ", "S9 ", "S10 ", "S11 ", "regex:csam", "regex:despaced", "regex:extra", "regex:malware")
+ALERT_ON = ("S1 ", "S2 ", "S3 ", "S4 ", "S9 ", "S10 ", "S11 ", "regex:csam", "regex:despaced", "regex:extra", "regex:malware",
+            "guard_verdict_unparseable", "guard_no_adapter", "guard_unavailable")
+ADAPTER_RE = re.compile(r"llama-?guard", re.I)   # families with a verdict adapter in proxy/veto_filter.py
+
+
+def has_adapter(model: str) -> bool:
+    return bool(ADAPTER_RE.search(model or ""))
 
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
@@ -649,7 +655,7 @@ def p_policy(msg="", ok=True):
     resident = any(m["name"] == cur and m["loaded"] for m in inst)
     if missing:
         guards.append(cur)
-    opts = "".join(f'<option value="{esc(g)}"{" selected" if g == cur else ""}>{esc(g)}{" (NOT INSTALLED)" if g == cur and missing else ""}</option>' for g in guards)
+    opts = "".join(f'<option value="{esc(g)}"{" selected" if g == cur else ""}{"" if has_adapter(g) else " disabled"}>{esc(g)}{" (NOT INSTALLED)" if g == cur and missing else ""}{"" if has_adapter(g) else " — no verdict adapter yet"}</option>' for g in guards)
     gstate = ('<span class="bad">not installed — every request is being refused (fail-closed). Pull it or choose another.</span>' if missing else
               ('<span class="ok">resident in memory</span>' if resident else '<span class="warn">on disk, not resident — loads on the next request (~20 s once)</span>'))
     rows = ""
@@ -660,7 +666,7 @@ def p_policy(msg="", ok=True):
     body = f"""<form method="post" action="/hub/api/policy">{csrf_field()}
 <div class="card"><h2 style="margin-top:0">Classifier (Llama Guard 3)</h2><label>Classifier model (installed models named *guard*, *shield* or *guardian*)</label><select name="guard_model">{opts}</select>
 <div style="margin-top:6px">Status: {gstate}</div>
-<div class="mut" style="margin-top:6px">This is the only place the classifier is chosen. Saving loads it into memory and unloads any other guard model. It runs on every request and every response (streaming buffered), cannot be disabled, and if it is missing or unreachable every request is refused. Load your main model <b>before</b> choosing a larger guard so both fit in VRAM. Note: VetoGuard parses the Llama Guard verdict format (safe / unsafe + S-codes); other safety families need an output adapter first (roadmap).</div></div>
+<div class="mut" style="margin-top:6px">This is the only place the classifier is chosen. Saving loads it into memory and unloads any other guard model. It runs on every request and every response (streaming buffered), cannot be disabled, and if it is missing or unreachable every request is refused. Load your main model <b>before</b> choosing a larger guard so both fit in VRAM. Verdict adapters decide how a family is asked and how its answer is read; today: Llama Guard (expects "safe" or "unsafe" + S-codes). Recognised families without an adapter (ShieldGemma, Granite Guardian, WildGuard) are listed but cannot be selected. If an answer ever fails to parse, the request is refused and the audit log records what came back and what was expected.</div></div>
 <div class="card"><h2 style="margin-top:0">Blocked categories</h2><table><tr><th>Block</th><th>Code</th><th>Category</th><th>Class</th><th></th></tr>{rows}</table><div class="mut">Illegal and protected-class content never passes; adult content may. Unchecking an "illegal" class is allowed but audited and alerted.</div></div>
 <div class="card"><h2 style="margin-top:0">Lexical tripwires</h2><label><input type="checkbox" name="tripwires" {"checked" if pol["tripwires"].get("enabled", True) else ""}> Enabled (built-in lists for sentinel / CSAM terms / malware intent)</label><label>Extra patterns — one Python regex per line</label><textarea name="extra">{esc(extra)}</textarea></div>
 <div class="card"><h2 style="margin-top:0">Diagnostics</h2><label><input type="checkbox" name="store_snippet" {"checked" if pol.get("audit", {}).get("store_snippet") else ""}> Store a 160-character snippet of <b>flagged output</b> (root-only file)</label><div class="mut">Off by default: logs never contain content. Never applies to S4 or CSAM-tripwire vetoes. Toggling is audited and alerted.</div></div>
@@ -804,6 +810,8 @@ def act_policy(form):
         return p_policy("Classifier must be an installed model named *guard*, *shield* or *guardian*.", False)
     if gm not in [m["name"] for m in installed_models()]:
         return p_policy(f"{gm} is not installed. Pull it first (Models → Pull).", False)
+    if not has_adapter(gm):
+        return p_policy(f"{gm} has no verdict adapter yet; selecting it would refuse every request. Adapters: Llama Guard.", False)
     for c in CATEGORIES:
         pol["categories"][c]["block"] = (f"block_{c}" in form) or c == "S4"
     extra = [l.strip() for l in form.get("extra", "").splitlines() if l.strip()]
@@ -864,6 +872,8 @@ def act_setguard(form):
     m = form.get("model", "")
     if not MODEL_RE.match(m) or not is_guard_name(m) or m not in [x["name"] for x in installed_models()]:
         return p_installed("Not an installed guard-family model.", False)
+    if not has_adapter(m):
+        return p_installed(f"{m} has no verdict adapter yet (roadmap #11); it cannot be the classifier.", False)
     pol = policy(); prev = pol["guard"]["model"]; pol["guard"]["model"] = m; pol["updated"], pol["updated_by"] = now(), getattr(REQ, "user", "admin")
     save_json(POLICY_FILE, pol); audit("policy_saved", guard_model=m, changed="none", tripwires=pol["tripwires"]["enabled"], extra_patterns=len(pol["tripwires"].get("extra_patterns", [])))
     if m != prev:
