@@ -53,7 +53,7 @@
 
     # Admin control centre (hub shares this container's network namespace). The hub enforces its own
     # authentication: argon2id passwords, mandatory TOTP, signed cookies, lockout. Nothing at the edge.
-    @hub path /hub* /login* /logout /portal* /account* /setup*
+    @hub path /hub* /login* /logout /portal* /account* /setup* /chat/api/*
     handle @hub {
         reverse_proxy localhost:9000 {
             header_up X-Device-Fingerprint {http.request.tls.client.fingerprint}

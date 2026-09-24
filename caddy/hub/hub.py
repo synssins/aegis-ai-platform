@@ -581,6 +581,110 @@ def exposed_models() -> list[dict]:
     return j.get("data", []) if isinstance(j, dict) else []
 
 
+PORTAL_RPM, PORTAL_TPM = 60, 200000       # per-user portal key limits (LiteLLM enforces)
+CHAT_MAX_BODY = 256 * 1024
+
+
+def portal_models() -> list[dict]:
+    """Models a portal user may pick: exposed through LiteLLM (admin: Models -> Exposed) AND resident in the
+    engine right now. Users never load or unload anything; what an administrator has resident is the menu."""
+    st, ps = http("GET", OLLAMA + "/api/ps", timeout=5)
+    resident = {m.get("name", "") for m in (ps.get("models", []) if isinstance(ps, dict) else [])}
+    base = lambda n: n.split("/", 1)[1] if n.startswith(("ollama/", "ollama_chat/")) else n
+    same = lambda a, b: a.removesuffix(":latest") == b.removesuffix(":latest")
+    out = []
+    for m in exposed_models():
+        pub, lm = m.get("model_name"), (m.get("litellm_params") or {}).get("model", "")
+        if not pub or not lm.startswith(("ollama/", "ollama_chat/")):
+            continue
+        out.append({"name": pub, "engine_model": base(lm), "resident": any(same(base(lm), r) for r in resident)})
+    return sorted(out, key=lambda x: (not x["resident"], x["name"]))
+
+
+def portal_key(user: str) -> str | None:
+    """The user's own LiteLLM virtual key (alias portal-<user>): minted on first use, Fernet-encrypted in the
+    account record, never sent to the browser. Every request carries it, so vetoes and evidence name the user."""
+    u = users(); rec = u.get(user)
+    if not rec:
+        return None
+    if rec.get("portal_key"):
+        try:
+            return fernet().decrypt(rec["portal_key"].encode()).decode()
+        except InvalidToken:
+            pass
+    alias = f"portal-{user}"
+    litellm("POST", "/key/delete", {"key_aliases": [alias]})          # a stale alias from an older record
+    st, j = litellm("POST", "/key/generate", {"key_alias": alias, "models": [], "rpm_limit": PORTAL_RPM, "tpm_limit": PORTAL_TPM,
+                                              "metadata": {"minted_by": "hub", "portal_user": user, "at": now()}})
+    if st != 200 or not isinstance(j, dict) or not j.get("key"):
+        audit("portal_key_failed", user=user, status=st); return None
+    rec["portal_key"] = fernet().encrypt(j["key"].encode()).decode(); u[user] = rec; save_users(u)
+    audit("portal_key_minted", user=user, alias=alias)
+    return j["key"]
+
+
+CHAT_HTML = r"""<div class="chat"><aside class="clist"><button id="newc" class="ghost">+ New chat</button><div id="convs"></div></aside>
+<section class="cmain"><header class="ctop"><select id="model" title="Models an administrator has loaded and exposed"></select><span id="mstate" class="mut"></span></header>
+<div id="msgs" class="cmsgs"><div class="cempty mut">Pick a model and ask something. Every request passes the safety gate; there are no settings to change.</div></div>
+<form id="cform" class="cform"><textarea id="inp" rows="1" placeholder="Message… (Enter to send, Shift+Enter for a new line)" required></textarea><button id="send">Send</button><button id="stop" type="button" class="danger" hidden>Stop</button></form></section></div>
+<script>
+(()=>{const CSRF="__CSRF__",USER="__USER__",LS="aegis_chat_"+USER;const $=s=>document.querySelector(s);
+const esc=t=>t.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function md(t){const f=[];t=esc(t).replace(/```\w*\n?([\s\S]*?)```/g,(m,c)=>{f.push("<pre><code>"+c.replace(/\n$/,"")+"</code></pre>");return "\u0000"+(f.length-1)+"\u0000"});
+t=t.replace(/`([^`\n]+)`/g,"<code>$1</code>").replace(/\*\*([^*\n]+)\*\*/g,"<b>$1</b>").replace(/^### (.*)$/gm,"<h4>$1</h4>").replace(/^## (.*)$/gm,"<h3>$1</h3>").replace(/^# (.*)$/gm,"<h2>$1</h2>");
+t=t.replace(/^(?:[-*] .*(?:\n|$))+/gm,b=>"<ul>"+b.trim().split("\n").map(l=>"<li>"+l.replace(/^[-*] /,"")+"</li>").join("")+"</ul>\n");
+t=t.replace(/^(?:\d+\. .*(?:\n|$))+/gm,b=>"<ol>"+b.trim().split("\n").map(l=>"<li>"+l.replace(/^\d+\. /,"")+"</li>").join("")+"</ol>\n");
+t=t.split(/\n{2,}/).map(p=>p.trim()).filter(Boolean).map(p=>/^<(ul|ol|h\d)/.test(p)||/^\u0000/.test(p)?p:"<p>"+p.replace(/\n/g,"<br>")+"</p>").join("");
+return t.replace(/\u0000(\d+)\u0000/g,(m,i)=>f[+i]);}
+let store;try{store=JSON.parse(localStorage.getItem(LS)||"{}")}catch(e){store={}}store.convs=store.convs||[];
+const save=()=>{try{localStorage.setItem(LS,JSON.stringify(store))}catch(e){}};
+let cur=null,ctrl=null;
+function conv(){if(!cur){cur={id:Date.now().toString(36),title:"New chat",msgs:[],model:$("#model").value};store.convs.unshift(cur);}return cur}
+function renderList(){$("#convs").innerHTML=store.convs.map(c=>`<div class="citem${cur&&c.id===cur.id?" on":""}" data-id="${c.id}"><span>${esc(c.title)}</span><a class="cdel" title="delete" data-id="${c.id}">×</a></div>`).join("")}
+function renderMsgs(){const box=$("#msgs");if(!cur||!cur.msgs.length){box.innerHTML='<div class="cempty mut">Pick a model and ask something. Every request passes the safety gate; there are no settings to change.</div>';return}
+box.innerHTML=cur.msgs.map(m=>`<div class="m ${m.role}">${m.role==="assistant"?md(m.content||"…"):"<p>"+esc(m.content).replace(/\n/g,"<br>")+"</p>"}${m.note?`<div class="veto">${esc(m.note)}</div>`:""}</div>`).join("");box.scrollTop=box.scrollHeight}
+$("#convs").addEventListener("click",e=>{const d=e.target.closest(".cdel");if(d){store.convs=store.convs.filter(c=>c.id!==d.dataset.id);if(cur&&cur.id===d.dataset.id)cur=null;save();renderList();renderMsgs();return}
+const it=e.target.closest(".citem");if(it){cur=store.convs.find(c=>c.id===it.dataset.id);if(cur.model)$("#model").value=cur.model;renderList();renderMsgs()}});
+$("#newc").onclick=()=>{cur=null;renderList();renderMsgs();$("#inp").focus()};
+async function models(){const r=await fetch("/chat/api/models",{headers:{"X-CSRF":CSRF}});const j=await r.json();const sel=$("#model");const last=store.model;
+sel.innerHTML=j.models.filter(m=>m.resident).map(m=>`<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("");
+if(!sel.options.length){sel.innerHTML='<option value="">no model loaded</option>';$("#mstate").textContent="Ask an administrator to load a model.";$("#send").disabled=true}
+else{if(last&&[...sel.options].some(o=>o.value===last))sel.value=last;$("#mstate").textContent=sel.options.length+" available";$("#send").disabled=false}}
+$("#model").onchange=()=>{store.model=$("#model").value;if(cur)cur.model=store.model;save()};
+async function send(text){const c=conv();c.model=$("#model").value;if(!c.model)return;if(c.msgs.length===0)c.title=text.slice(0,40);
+c.msgs.push({role:"user",content:text});const a={role:"assistant",content:""};c.msgs.push(a);save();renderList();renderMsgs();
+$("#send").hidden=true;$("#stop").hidden=false;ctrl=new AbortController();
+try{const r=await fetch("/chat/api/stream",{method:"POST",signal:ctrl.signal,headers:{"Content-Type":"application/json","X-CSRF":CSRF},body:JSON.stringify({model:c.model,messages:c.msgs.slice(0,-1).map(m=>({role:m.role,content:m.content}))})});
+if(!r.ok){let t="";try{t=(await r.json()).error||""}catch(e){}a.note="Request failed ("+r.status+(t?": "+t:"")+").";renderMsgs();return}
+const rd=r.body.getReader(),dec=new TextDecoder();let buf="";
+for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;
+while((i=buf.indexOf("\n"))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line.startsWith("data:"))continue;const d=line.slice(5).trim();if(d==="[DONE]")continue;let j;try{j=JSON.parse(d)}catch(e){continue}
+if(j.error){a.note=j.error==="veto"?"Refused by the safety gate. This request has been logged.":"The model could not answer ("+(j.message||j.error)+").";if(typeof j.error==="object")a.note="The model could not answer.";renderMsgs();continue}
+const ch=(j.choices&&j.choices[0]&&j.choices[0].delta&&j.choices[0].delta.content)||"";if(ch){a.content+=ch;renderMsgs()}}}}
+catch(e){if(e.name!=="AbortError"){a.note="Connection lost.";}}
+finally{if(!a.content&&!a.note)a.note="No answer.";ctrl=null;$("#send").hidden=false;$("#stop").hidden=true;save();renderMsgs()}}
+$("#cform").onsubmit=e=>{e.preventDefault();const t=$("#inp").value.trim();if(!t||ctrl)return;$("#inp").value="";send(t)};
+$("#stop").onclick=()=>{if(ctrl)ctrl.abort()};
+$("#inp").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();$("#cform").requestSubmit()}});
+models().catch(()=>{$("#mstate").textContent="model list unavailable"});renderList();renderMsgs();})();
+</script>"""
+
+CHAT_CSS = """
+.chat{flex:1;min-width:0;display:flex}.clist{width:220px;flex:none;border-right:1px solid var(--line);background:#121212;display:flex;flex-direction:column;padding:12px;gap:6px;overflow-y:auto}
+.citem{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-radius:8px;cursor:pointer;color:#cfcfcf;font-size:13px}.citem span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.citem:hover{background:#1a1a1a}.citem.on{background:#262626;color:#fff}.cdel{color:var(--mut);padding:0 4px}.cdel:hover{color:var(--bad)}
+.cmain{flex:1;min-width:0;display:flex;flex-direction:column}.ctop{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}.ctop select{max-width:320px}
+.cmsgs{flex:1;overflow-y:auto;padding:18px 20px;display:flex;flex-direction:column;gap:12px}.cempty{margin:auto;text-align:center;max-width:420px}
+.m{max-width:820px;padding:10px 14px;border-radius:12px;line-height:1.5;word-wrap:break-word}.m.user{align-self:flex-end;background:#2a2a2a}.m.assistant{align-self:flex-start;background:var(--card);border:1px solid var(--line)}
+.m p{margin:0 0 8px}.m p:last-child{margin:0}.m pre{background:#0d0d0d;padding:10px;border-radius:8px;overflow-x:auto}.m code{font-size:13px}.m ul,.m ol{margin:4px 0 8px 20px}
+.veto{margin-top:8px;color:var(--bad);font-size:13px}
+.cform{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--line)}.cform textarea{flex:1;resize:none;min-height:42px;max-height:180px}
+@media (max-width:760px){.chat{flex-direction:column;min-height:80vh}.clist{width:auto;flex-direction:row;flex-wrap:wrap;border-right:0;border-bottom:1px solid var(--line)}.citem{max-width:200px}}"""
+
+
+def p_chat_body(user: str) -> str:
+    return CHAT_HTML.replace("__CSRF__", CSRF).replace("__USER__", esc(user))
+
+
 def current_domain() -> str | None:
     h = (state().get("hostname") or "").strip().lower()
     if h:
@@ -1100,7 +1204,8 @@ def p_users(msg="", ok=True, invite=None):
 
 
 PORTAL_SECTIONS = [  # (key, label, flag or None, kind, description)
-    ("chat", "Chat", "chat", "app", "Open WebUI — conversations, documents"),
+    ("chat", "Chat", "chat", "chat", "Open WebUI — conversations, documents"),
+    ("webui", "Open WebUI", "chat", "app", "The full Open WebUI (documents, voice, workspaces)."),
     ("images", "Images", "images", "placeholder", "Image generation (ComfyUI). Gated until its safety gate exists."),
     ("gallery", "Gallery", "images", "placeholder", "Your generated images. Administrators may review galleries when review is enabled."),
     ("speech", "Speech", "speech", "placeholder", "Text-to-speech (Fish Speech)."),
@@ -1113,7 +1218,7 @@ PORTAL_SECTIONS = [  # (key, label, flag or None, kind, description)
 
 def _section_target(key: str) -> str | None:
     dom = current_domain()
-    return {"chat": "/", "grafana": "/grafana/", "status": "/status", "admin": "/hub/overview/dashboard", "settings": "/account"}.get(key)
+    return {"webui": "/", "grafana": "/grafana/", "status": "/status", "admin": "/hub/overview/dashboard", "settings": "/account"}.get(key)
 
 
 def p_portal_section(key: str):
@@ -1127,9 +1232,11 @@ def p_portal_section(key: str):
     target = _section_target(key)
     if sec[3] == "placeholder":
         body = f'<div class="ph"><h1>{esc(sec[1])}</h1><p class="mut">{esc(sec[4])}</p><p class="mut">Coming soon.</p></div>'
+    elif sec[3] == "chat":
+        body = p_chat_body(user)
     else:
         body = f'<iframe src="{esc(target)}" title="{esc(sec[1])}"></iframe>'
-    css = CSS + """
+    css = CSS + CHAT_CSS + """
 .pwrap{display:flex;height:100vh;height:100dvh;overflow:hidden}.pnav{width:200px;flex:none;background:var(--side);border-right:1px solid var(--line);padding:18px 12px;display:flex;flex-direction:column;overflow-y:auto;scrollbar-width:none}.pnav::-webkit-scrollbar{display:none}
 .pnav a{display:block;padding:9px 12px;border-radius:8px;text-decoration:none;color:#cfcfcf}.pnav a:hover{background:#1a1a1a}.pnav a.on{background:#262626;color:#fff}
 .pmain{flex:1;min-width:0;display:flex}.pmain iframe{flex:1;border:0;width:100%;height:100%;background:var(--bg)}.ph{padding:32px 40px}
@@ -1478,7 +1585,7 @@ def act_user_delete(form):
     name = form.get("user", ""); u = users()
     if name not in u or name == getattr(REQ, "user", "") or form.get("confirm") != name:
         return p_users("Refused.", False)
-    u.pop(name); save_users(u); audit("user_deleted", user=name)
+    u.pop(name); save_users(u); litellm("POST", "/key/delete", {"key_aliases": [f"portal-{name}"]}); audit("user_deleted", user=name)
     return p_users(f"Deleted {name}.")
 
 
@@ -1653,6 +1760,58 @@ class Handler(BaseHTTPRequestHandler):
         audit("login_ok", user=user, ip=client_ip(self), device=(dv.get("devices", {}).get(fp, {}).get("name") if fp else None), fingerprint=fp or "none", session=ttl if ttl in SESSION_TTLS else "24h"); clear_fail("u:" + user)
         return self._redirect("/", cookie=self._cookie(tok, age))
 
+    def _chat_stream(self, user: str, raw: bytes):
+        """Relay one chat turn to LiteLLM as the user's own virtual key and stream the answer back. The hub is the
+        enforcement point: only resident, exposed models; user/assistant roles only; bounded sizes; no options
+        (no system prompt, no keep_alive, no num_gpu — nothing a user could use to steer the engine)."""
+        try:
+            body = json.loads(raw.decode())
+        except (ValueError, UnicodeDecodeError):
+            return self._send(400, '{"error":"bad request"}', "application/json")
+        model, msgs = str(body.get("model", "")), body.get("messages")
+        if model not in {m["name"] for m in portal_models() if m["resident"]}:
+            return self._send(400, '{"error":"that model is not loaded"}', "application/json")
+        if not isinstance(msgs, list) or not 1 <= len(msgs) <= 64:
+            return self._send(400, '{"error":"bad conversation"}', "application/json")
+        clean, total = [], 0
+        for m in msgs:
+            if not isinstance(m, dict) or m.get("role") not in ("user", "assistant") or not isinstance(m.get("content"), str):
+                return self._send(400, '{"error":"bad conversation"}', "application/json")
+            c = m["content"][:32000]; total += len(c); clean.append({"role": m["role"], "content": c})
+        if total > 200000 or clean[-1]["role"] != "user":
+            return self._send(400, '{"error":"bad conversation"}', "application/json")
+        key = portal_key(user)
+        if not key:
+            return self._send(503, '{"error":"the gateway refused to issue your key; tell an administrator"}', "application/json")
+        audit("portal_chat", user=user, model=model, turns=len(clean), ip=client_ip(self), fingerprint=self._fp() or "none")
+        req = urllib.request.Request(LITELLM + "/v1/chat/completions", data=json.dumps({"model": model, "messages": clean, "stream": True}).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}", "Accept": "text/event-stream"})
+        self.send_response(200)
+        for k, v in (("Content-Type", "text/event-stream"), ("Cache-Control", "no-store"), ("X-Accel-Buffering", "no"), ("X-Frame-Options", "SAMEORIGIN"),
+                     ("Content-Security-Policy", "frame-ancestors 'self'"), ("Referrer-Policy", "no-referrer")):
+            self.send_header(k, v)
+        self.end_headers()
+        try:
+            with urllib.request.urlopen(req, timeout=600) as r:
+                for line in r:
+                    self.wfile.write(line); self.wfile.flush()
+        except urllib.error.HTTPError as e:
+            txt = e.read().decode(errors="replace")
+            kind = "veto" if "veto" in txt.lower() else "error"
+            try:
+                j = json.loads(txt); err = j.get("error", j.get("detail", txt)); msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            except ValueError:
+                msg = txt
+            self.wfile.write(f"data: {json.dumps({'error': kind, 'status': e.code, 'message': msg[:300]})}\n\n".encode())
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as e:  # noqa: BLE001
+            self.wfile.write(f"data: {json.dumps({'error': 'error', 'message': str(e)[:200]})}\n\n".encode())
+        try:
+            self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _fp(self) -> str:
         v = (self.headers.get("X-Device-Fingerprint", "") or "").strip().lower()
         # Caddy's placeholder yields SHA-256("") when no client certificate was presented; that is "none".
@@ -1688,6 +1847,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, p_portal_section(p.split("/", 2)[2]))
         if p == "/account":
             return self._send(200, p_account_plain())
+        if p == "/chat/api/models":
+            if not flags_of(users().get(user, {})).get("chat"):
+                return self._send(403, '{"error":"chat is not granted"}', "application/json")
+            return self._send(200, json.dumps({"models": portal_models()}), "application/json")
         if p.startswith("/hub") and not is_admin(user):
             audit("admin_refused", user=user, path=p); return self._send(403, plain_page("Admin only", '<p>This area is for administrators. <a href="/portal">Back to the portal</a>.</p>'))
         if p == "/hub":
@@ -1722,6 +1885,19 @@ class Handler(BaseHTTPRequestHandler):
         REQ.q, REQ.path, REQ.user, REQ.device_fp = {}, u.path, None, self._fp()
         p = u.path
         n = int(self.headers.get("Content-Length", "0"))
+        if p.startswith("/chat/api/"):
+            if self.headers.get("X-CSRF") != CSRF:
+                return self._send(403, '{"error":"invalid token — reload the page"}', "application/json")
+            user = self._session()
+            if not user:
+                return self._send(401, '{"error":"signed out"}', "application/json")
+            REQ.user = user; rec = users().get(user, {})
+            if rec.get("must_change") or getattr(REQ, "limited", False) or not flags_of(rec).get("chat"):
+                return self._send(403, '{"error":"chat is not granted"}', "application/json")
+            raw = self.rfile.read(min(n, CHAT_MAX_BODY))
+            if p == "/chat/api/stream":
+                return self._chat_stream(user, raw)
+            return self._send(404, '{"error":"unknown"}', "application/json")
         form = Form(self.rfile.read(min(n, 65536)).decode())
         if form.get("csrf") != CSRF:
             return self._send(403, "invalid or expired form token — reload the page", "text/plain")

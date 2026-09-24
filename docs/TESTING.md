@@ -27,3 +27,4 @@ was fixed. Findings that were false positives are noted as such. New classes bec
 - `/status` shows both GPUs with VRAM and the expected resident models.
 - A benign request through the API returns 200; a request containing the sentinel returns 400 `veto_triggered`.
 - Hub → Safety → Audit log shows the sentinel vetoes as *clearable* (no lock icon).
+- Portal chat (`/portal/chat` with a `chat`-granted account): the model menu lists only resident, exposed models; a benign message streams; a message containing the sentinel shows *Refused by the safety gate* and the veto audit names `portal-<user>`; `curl` to `/chat/api/stream` with a `system` role or a non-resident model is refused with 400.
