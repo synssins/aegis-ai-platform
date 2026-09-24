@@ -26,6 +26,13 @@ device access on a host `systemctl daemon-reload` (symptom: `Failed to initializ
 resident with 0 VRAM). After a driver upgrade run `sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`
 and restart `ollama` and `dcgm-exporter`.
 
+Intel Arc (when the `ollama-intel` pool is enabled): the stock Ollama image uses its Vulkan backend. Pass **only**
+the Intel render/card nodes (`/dev/dri/renderD*` whose `device` symlink points at the Intel PCI address) and set
+`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/intel_icd.json`. Passing the whole `/dev/dri` makes GPU discovery hang
+unkillably in a VM (the virtio display device's Vulkan ICD blocks). Map nodes: `for r in /sys/class/drm/renderD*; do
+echo $(basename $r) $(basename $(readlink -f $r/device)); done`. DCGM/Grafana do not see Intel cards; the hub and
+`/status` read Ollama's own discovery numbers.
+
 ## Disk
 Model store `llm/gguf/` dominates. Watch `/status`. To grow an LVM root online:
 `sudo lvextend -L +<size> -r /dev/<vg>/<lv>`. Reclaim: `docker image prune`, remove models from the hub,
