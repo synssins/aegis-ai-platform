@@ -991,8 +991,13 @@ def p_setup(msg="", ok=True):
     return plain_page("First-run setup", body, msg, ok)
 
 
-def p_login(msg="", ok=True):
-    return plain_page("Sign in", f'<form method="post" action="/login">{csrf_field()}<label>Username</label><input name="user" autocomplete="username" required autofocus><label>Password</label><input name="password" type="password" autocomplete="current-password" required><label>Stay signed in for</label><select name="ttl">{"".join(f'<option value="{k}">{esc(v[0])}</option>' for k, v in SESSION_TTLS.items())}</select><div style="margin-top:14px"><button>Continue</button></div></form>', msg, ok)
+def safe_next(v: str | None) -> str:
+    v = (v or "").strip()
+    return v if re.fullmatch(r"/[A-Za-z0-9_./?=&%-]{0,200}", v) and not v.startswith("//") else "/"
+
+
+def p_login(msg="", ok=True, nxt="/"):
+    return plain_page("Sign in", f'<form method="post" action="/login">{csrf_field()}<input type="hidden" name="next" value="{esc(safe_next(nxt))}"><label>Username</label><input name="user" autocomplete="username" required autofocus><label>Password</label><input name="password" type="password" autocomplete="current-password" required><label>Stay signed in for</label><select name="ttl">{"".join(f'<option value="{k}">{esc(v[0])}</option>' for k, v in SESSION_TTLS.items())}</select><div style="margin-top:14px"><button>Continue</button></div></form>', msg, ok)
 
 
 def p_totp(pre: str, msg="", ok=True):
@@ -2073,15 +2078,15 @@ class Handler(BaseHTTPRequestHandler):
                         return d["u"]
         return None
 
-    def _pre(self, user: str, stage: str, ttl: str = "24h") -> str:
-        return sign({"kind": "pre", "u": user, "stage": stage, "ttl": ttl, "exp": time.time() + 300})
+    def _pre(self, user: str, stage: str, ttl: str = "24h", nxt: str = "/") -> str:
+        return sign({"kind": "pre", "u": user, "stage": stage, "ttl": ttl, "next": safe_next(nxt), "exp": time.time() + 300})
 
     def _session_token(self, user: str, ttl: str | None, **extra) -> tuple[str, int]:
         ttl = ttl if ttl in SESSION_TTLS else "24h"; secs = SESSION_TTLS[ttl][1]
         rec = users().get(user, {})
         return sign({"kind": "session", "u": user, "epoch": rec.get("session_epoch", 0), "exp": time.time() + secs, "ttl": ttl, "n": secrets.token_hex(8), "fp": self._fp(), **extra}), min(secs, COOKIE_MAX_AGE)
 
-    def _login_ok(self, user: str, ttl: str | None = None):
+    def _login_ok(self, user: str, ttl: str | None = None, nxt: str = "/"):
         rec = users()[user]; fp = self._fp(); dv = devices()
         if dv.get("require_for_admin") and not device_ok(fp):
             audit("login_refused_no_device", user=user, ip=client_ip(self), fingerprint=fp or "none")
@@ -2090,7 +2095,7 @@ class Handler(BaseHTTPRequestHandler):
             dv["devices"][fp]["last_seen"] = now(); save_devices(dv)
         tok, age = self._session_token(user, ttl)
         audit("login_ok", user=user, ip=client_ip(self), device=(dv.get("devices", {}).get(fp, {}).get("name") if fp else None), fingerprint=fp or "none", session=ttl if ttl in SESSION_TTLS else "24h"); clear_fail("u:" + user)
-        return self._redirect("/", cookie=self._cookie(tok, age))
+        return self._redirect(safe_next(nxt), cookie=self._cookie(tok, age))
 
     def _comfy_prompt(self, user: str, raw: bytes):
         try:
@@ -2281,11 +2286,14 @@ class Handler(BaseHTTPRequestHandler):
         if p in ("/hub/setup", "/setup"):
             return self._redirect("/login")
         if p in ("/hub/login", "/login"):
-            return self._send(200, p_login())
+            return self._send(200, p_login(nxt=(REQ.q.get("next") or ["/"])[0]))
         if p in ("/hub/logout", "/logout"):
             return self._redirect("/login", cookie=self._cookie("", 0))
         user = self._session()
         if not user:
+            if p == "/hub/authz/comfy":       # forward_auth: send the frame to sign in and back to what it asked for
+                uri = self.headers.get("X-Forwarded-Uri") or "/"          # Caddy has already stripped /comfy when forward_auth runs
+                return self._redirect("/login?next=" + urllib.parse.quote(safe_next("/comfy" + uri if not uri.startswith("/comfy") else uri), safe="/?=&"))
             return self._redirect("/login")
         REQ.user = user
         if users().get(user, {}).get("must_change") or getattr(REQ, "limited", False):
@@ -2433,15 +2441,15 @@ class Handler(BaseHTTPRequestHandler):
             except VerifyMismatchError:
                 fail("ip:" + ip); fail("u:" + user); audit("login_failed", user=user, ip=ip); time.sleep(0.5)
                 return self._send(401, p_login("Invalid username or password.", False))
-            ttl = form.get("ttl", "24h") if form.get("ttl", "24h") in SESSION_TTLS else "24h"
+            ttl = form.get("ttl", "24h") if form.get("ttl", "24h") in SESSION_TTLS else "24h"; nxt = safe_next(form.get("next"))
             if rec.get("must_change"):
                 REQ.user = user
                 tok = sign({"kind": "session", "u": user, "epoch": rec.get("session_epoch", 0), "exp": time.time() + 900, "ttl": ttl, "n": secrets.token_hex(8), "fp": self._fp(), "limited": True})
                 return self._send(200, p_force_password(), cookie=self._cookie(tok, 900))
             if not rec.get("totp"):
                 sec = base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
-                return self._send(200, p_enroll(self._pre(user, "enroll", ttl), sec, user))
-            return self._send(200, p_totp(self._pre(user, "totp", ttl)))
+                return self._send(200, p_enroll(self._pre(user, "enroll", ttl, nxt), sec, user))
+            return self._send(200, p_totp(self._pre(user, "totp", ttl, nxt)))
         if p in ("/login/totp", "/login/enroll"):
             p = "/hub" + p
         if p in ("/hub/login/totp", "/hub/login/enroll"):
@@ -2460,19 +2468,19 @@ class Handler(BaseHTTPRequestHandler):
                 c = totp_verify(sec, form.get("code", ""), 0)
                 if c is None:
                     fail("u:" + user); audit("mfa_enroll_failed", user=user, ip=ip)
-                    return self._send(401, p_enroll(self._pre(user, "enroll", d.get("ttl", "24h")), sec, user, "Code did not match — check the clock on your device and try again.", False))
+                    return self._send(401, p_enroll(self._pre(user, "enroll", d.get("ttl", "24h"), d.get("next", "/")), sec, user, "Code did not match — check the clock on your device and try again.", False))
                 rec["totp"] = fernet().encrypt(sec.encode()).decode(); rec["totp_last"] = c; rec["updated"] = now(); u_all[user] = rec; save_users(u_all)
                 REQ.user = user; audit("mfa_enrolled", user=user, ip=ip)
-                return self._login_ok(user, d.get("ttl"))
+                return self._login_ok(user, d.get("ttl"), d.get("next", "/"))
             if p == "/hub/login/totp" and d.get("stage") == "totp":
                 try: sec = fernet().decrypt(rec["totp"].encode()).decode()
                 except (InvalidToken, AttributeError): return self._send(500, p_login("MFA secret unreadable; use the console reset script.", False))
                 c = totp_verify(sec, form.get("code", ""), rec.get("totp_last", 0))
                 if c is None:
                     fail("ip:" + ip); fail("u:" + user); audit("mfa_failed", user=user, ip=ip); time.sleep(0.5)
-                    return self._send(401, p_totp(self._pre(user, "totp", d.get("ttl", "24h")), "Code incorrect or already used.", False))
+                    return self._send(401, p_totp(self._pre(user, "totp", d.get("ttl", "24h"), d.get("next", "/")), "Code incorrect or already used.", False))
                 rec["totp_last"] = c; u_all[user] = rec; save_users(u_all); REQ.user = user
-                return self._login_ok(user, d.get("ttl"))
+                return self._login_ok(user, d.get("ttl"), d.get("next", "/"))
             return self._send(400, p_login("Invalid step.", False))
         # ---- everything else needs a session ----
         user = self._session()

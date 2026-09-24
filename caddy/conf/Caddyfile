@@ -97,6 +97,8 @@
         forward_auth localhost:9000 {
             uri /hub/authz/comfy
             copy_headers X-Aegis-User
+            header_up X-Device-Fingerprint {http.request.tls.client.fingerprint}   # sessions are bound to the device certificate
+            header_up X-Device-Subject {http.request.tls.client.subject}
         }
         uri strip_prefix /comfy
         reverse_proxy comfyui:8188
