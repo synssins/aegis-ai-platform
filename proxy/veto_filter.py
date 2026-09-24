@@ -508,6 +508,11 @@ def snippet(stage: str, reason: str, detail: str, data: dict, key_dict: Any, tex
     threading.Thread(target=_w, daemon=True).start()
 
 
+def cats_str(cats: list[str]) -> str:
+    """'S4 Child Sexual Exploitation, S1 Violent Crimes' — codes with names, for humans and alerts."""
+    return ", ".join(f"{c} {LLAMA_GUARD_CATEGORIES[c]}" if c in LLAMA_GUARD_CATEGORIES else c for c in cats)
+
+
 def _refuse(status: int, code: str, message: str) -> None:
     raise HTTPException(status_code=status, detail={"error": {"code": code, "type": "invalid_request_error", "message": message}})
 
@@ -685,7 +690,7 @@ class VetoGuard(CustomLogger):
             audit("pre_call", "guard_unavailable", _short_err(e), data, user_api_key_dict)
             _refuse(503, "guard_unavailable", "Safety classifier unavailable; request refused (fail-closed).")
         if unsafe:
-            audit("pre_call", "classifier", ",".join(cats), data, user_api_key_dict)
+            audit("pre_call", "classifier", cats_str(cats), data, user_api_key_dict)
             _refuse(400, "veto_triggered", "Request refused by policy.")
         return data
 
@@ -709,7 +714,7 @@ class VetoGuard(CustomLogger):
         except GuardUnavailable as e:
             audit(stage, "guard_unavailable", _short_err(e), data, key); return ["GUARD_UNAVAILABLE"]
         if unsafe:
-            audit(stage, "classifier", ",".join(cats), data, key); snippet(stage, "classifier", ",".join(cats), data, key, "\n".join(outputs)); return cats
+            audit(stage, "classifier", cats_str(cats), data, key); snippet(stage, "classifier", cats_str(cats), data, key, "\n".join(outputs)); return cats
         return None
 
     async def async_post_call_success_hook(self, data, user_api_key_dict, response):

@@ -28,6 +28,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -87,6 +88,33 @@ NAV = [
     ("access", "Access", [("keys", "API keys"), ("password", "Admin password")]),
     ("gateway", "Gateway", [("certs", "Certificates"), ("hostname", "Public hostname"), ("isolation", "Isolation (read-only)")]),
 ]
+
+ALERT_ON = ("S1 ", "S2 ", "S3 ", "S4 ", "S9 ", "S10 ", "S11 ", "regex:csam", "regex:despaced", "regex:extra", "regex:malware")
+
+
+def _veto_watcher():
+    """Tail the veto audit log; push illegal/protected-class vetoes to the webhook. Codes/names/key/time only."""
+    pos = None
+    while True:
+        try:
+            with open(VETO_AUDIT, encoding="utf-8") as f:
+                if pos is None:
+                    f.seek(0, 2); pos = f.tell()
+                else:
+                    f.seek(pos)
+                    for line in f:
+                        try: e = json.loads(line)
+                        except ValueError: continue
+                        d, r = str(e.get("detail", "")), str(e.get("reason", ""))
+                        if any(k in d or k in r for k in ALERT_ON) and "sentinel" not in r and "sentinel" not in d:
+                            alert(f"[aegis-veto] {e.get('stage')} {r} {d} key={e.get('key_alias')} model={e.get('model')} at {e.get('ts', '')[:19]}")
+                    pos = f.tell()
+        except FileNotFoundError:
+            pos = None
+        except OSError:
+            pass
+        time.sleep(3)
+
 
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
@@ -472,8 +500,10 @@ def p_installed(msg="", ok=True):
         act = '<span class="tag">guard model</span>' if m["is_guard"] else (
             f'<span class="tag ok">exposed as {esc(exp)}</span>' if exp else
             f'<form class="inline" method="post" action="/hub/api/models/expose">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input name="public" placeholder="public name" style="width:150px" value="{esc(n.split(":")[0].split("/")[-1])}"> <button class="ghost">Expose</button></form>')
+        ld = (f'<form class="inline" method="post" action="/hub/api/models/unload">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Unload</button></form>' if m["loaded"]
+              else f'<form class="inline" method="post" action="/hub/api/models/load">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Load</button></form>')
         rm = "" if exp or m["loaded"] else f'<form class="inline" method="post" action="/hub/api/models/remove">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input type="hidden" name="confirm" value="{esc(n)}"><button class="danger">Remove</button></form>'
-        rows += f'<tr><td>{esc(n)}</td><td>{size:.1f} GiB</td><td>{"<span class=ok>resident</span>" if m["loaded"] else "<span class=mut>on disk</span>"}</td><td>{act}</td><td>{rm}</td></tr>'
+        rows += f'<tr><td>{esc(n)}</td><td>{size:.1f} GiB</td><td>{"<span class=ok>resident</span>" if m["loaded"] else "<span class=mut>on disk</span>"}</td><td>{act}</td><td>{ld} {rm}</td></tr>'
     body = f'<div class="card">{mctl}<table><tr><th>Model</th><th>Size</th><th>State</th><th>Exposure</th><th></th></tr>{rows or "<tr><td colspan=5 class=mut>none</td></tr>"}</table></div><p class="mut">"Expose" registers the model in LiteLLM under a public name so Open WebUI and API keys can use it — through VetoGuard. Guard models are never exposable. A model that is exposed or resident cannot be removed.</p>'
     return page("models", "installed", "Installed models", "What is in the shared model store, and what apps can see.", body, msg, ok)
 
@@ -613,6 +643,24 @@ def act_unexpose(form):
     return p_exposed(f"Unexposed {pub}." if ok else f"LiteLLM refused ({st}).", ok)
 
 
+def act_unload(form):
+    m = form.get("model", "")
+    if not MODEL_RE.match(m):
+        return p_installed("Invalid model name.", False)
+    st, j = http("POST", OLLAMA + "/api/generate", {"model": m, "keep_alive": 0}, timeout=120); ok = st == 200
+    audit("model_unloaded" if ok else "model_unload_failed", model=m, status=st)
+    return p_installed(f"Unloaded {m} from memory." if ok else f"Ollama refused ({st}): {str(j)[:160]}", ok)
+
+
+def act_load(form):
+    m = form.get("model", "")
+    if not MODEL_RE.match(m):
+        return p_installed("Invalid model name.", False)
+    st, j = http("POST", OLLAMA + "/api/generate", {"model": m, "keep_alive": "24h"}, timeout=600); ok = st == 200
+    audit("model_loaded" if ok else "model_load_failed", model=m, status=st)
+    return p_installed(f"Loaded {m} into memory." if ok else f"Ollama refused ({st}): {str(j)[:160]}", ok)
+
+
 def act_remove(form):
     m = form.get("model", "")
     if form.get("confirm") != m or not MODEL_RE.match(m):
@@ -740,7 +788,7 @@ def act_password(form):
 
 
 ACTIONS = {"/hub/api/policy": act_policy, "/hub/api/alerts": act_alerts, "/hub/api/models/pull": act_pull,
-           "/hub/api/models/expose": act_expose, "/hub/api/models/unexpose": act_unexpose, "/hub/api/models/remove": act_remove,
+           "/hub/api/models/expose": act_expose, "/hub/api/models/unexpose": act_unexpose, "/hub/api/models/remove": act_remove, "/hub/api/models/unload": act_unload, "/hub/api/models/load": act_load,
            "/hub/api/keys/mint": act_mint, "/hub/api/keys/revoke": act_revoke, "/hub/api/password": act_password, "/hub/api/hostname": act_hostname}
 PAGES = {("overview", "dashboard"): p_dashboard, ("overview", "services"): p_services, ("safety", "policy"): p_policy,
          ("safety", "audit"): p_audit, ("safety", "alerts"): p_alerts, ("models", "installed"): p_installed,
@@ -809,4 +857,5 @@ if __name__ == "__main__":
     os.makedirs(SITES_DIR, exist_ok=True); os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     if not os.path.exists(POLICY_FILE):
         save_json(POLICY_FILE, DEFAULT_POLICY)
+    threading.Thread(target=_veto_watcher, name="veto-watcher", daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", 9000), Handler).serve_forever()
