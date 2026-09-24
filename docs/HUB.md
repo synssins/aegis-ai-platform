@@ -15,6 +15,7 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 | | Pull | pull | via `modeld` — the only container with both internet and the model store. Apps never fetch their own |
 | | Exposed to apps | unexpose (hub-created only) | models from `config.yaml` are console-managed |
 | Access | API keys | mint / revoke | per-client, model-scoped, rate-limited; key shown once |
+| | Devices | issue a certificate bundle (one-time download), revoke, delete (revoked only) | every action audited with the fingerprint |
 | | Admin account | change password; re-enroll MFA | argon2id; policy ≥ 14 chars / 3 of 4 classes; changing the password signs out other sessions |
 | Gateway | Certificates | — | live TLS probe of every served host |
 | | Public hostname | hostname + Cloudflare token | writes exactly one templated site file; Let's Encrypt via DNS-01, no inbound ports |
