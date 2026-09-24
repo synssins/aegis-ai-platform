@@ -65,3 +65,10 @@ sentinel suite. Model store, databases, audit and evidence directories are untou
 
 ## Rollback
 `git checkout <previous tag> -- docker-compose.yml caddy/conf/Caddyfile proxy/ caddy/hub/hub.py && docker compose up -d`.
+
+## Image generation and the chat pool (after the base stack works)
+1. Directories the cap-dropped hub must write are root-owned and group-writable: `sudo chown -R root:<operator group> comfyui gallery && sudo chmod -R 2775 comfyui gallery`.
+2. Declare the Intel cards and pools in `docker-compose.yml` (`AEGIS_INTEL_GPUS`, `AEGIS_POOLS`; map render nodes as in `docs/OPERATIONS.md` → GPUs).
+3. `docker compose --profile apps up -d comfyui-intel` (image engine on one Arc) and, once, `docker compose --profile wide create ollama-intel-wide` so the hub can switch chat-pool modes through the watchdog.
+4. Reinstall the watchdog after any change to `ops/aegis-watchdog.py` (`docs/OPERATIONS.md` → Container control).
+5. Pull models through Hub → Models → Browse; classify files under Models → Image model store; pick the image classifier in Safety → VetoGuard policy. Workflows: `python3 scripts/comfy-workflows.py`.

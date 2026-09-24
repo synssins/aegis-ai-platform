@@ -9,7 +9,17 @@ caddy/data/
 caddy/config/
 caddy/sites-enabled/
 llm/
-comfyui/
+# ComfyUI store: weights, uploads, outputs, user data stay local. Only the model-path config and the pre-built
+# Aegis workflows are tracked (regenerate with scripts/comfy-workflows.py).
+comfyui/*
+!comfyui/extra_model_paths.yaml
+!comfyui/user/
+comfyui/user/*
+!comfyui/user/default/
+comfyui/user/default/*
+!comfyui/user/default/workflows/
+comfyui/user/default/workflows/*
+!comfyui/user/default/workflows/Aegis/
 audio/
 proxy/db/
 proxy/audit/

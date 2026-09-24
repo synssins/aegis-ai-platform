@@ -1,0 +1,10 @@
+# Model store layout for the Intel ComfyUI instance (mounted read-only at /models/host). Same directories the
+# NVIDIA instance mounts directly. Managed by the hub's model browser; classified per file in the hub.
+aegis:
+  base_path: /models/host
+  checkpoints: checkpoints
+  loras: loras
+  vae: vae
+  controlnet: controlnet
+  upscale_models: upscale_models
+  embeddings: embeddings

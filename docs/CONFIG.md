@@ -22,6 +22,18 @@ the administrator changes after installation is changed in the hub, not in files
 Not in `.env` by design: the hub administrator password (argon2id hash in `caddy/hub/state/users.json`),
 the Cloudflare API token (root-only site file written by the hub), the public hostname (hub state).
 
+## Set in `docker-compose.yml` (isolation layer, console-only)
+| Variable | Service | Purpose |
+|---|---|---|
+| `VETO_GUARD_URL` | litellm | pool that runs the text classifier (the T4 pool) |
+| `GUARD_OLLAMA` | hub | where the hub loads/checks the classifier (same pool) |
+| `AEGIS_POOLS` | hub | `name=url,…` GPU pools; `intel` points at the `chatpool` alias so it follows the chat-pool mode |
+| `CHATPOOL_NARROW`, `CHATPOOL_WIDE` | hub | the two chat-pool containers behind the alias (mode detection) |
+| `AEGIS_INTEL_GPUS` | hub | Intel cards `name:MiB:role` (invisible to DCGM); role `images` or `intel` |
+| `COMFY_URL` | hub | the ComfyUI instance behind the gate (`comfyui-intel` by default) |
+| `ONEAPI_DEVICE_SELECTOR` | comfyui-intel | which Arc image generation uses |
+| `OLLAMA_CONTEXT_LENGTH`, `OLLAMA_KV_CACHE_TYPE`, `OLLAMA_FLASH_ATTENTION` | ollama (T4 pool) | keep both classifiers fully on GPU |
+
 ## Hub-managed settings
 Safety policy (`proxy/policy/veto-policy.json`), alert webhook and hostname (`caddy/hub/state/hub.json`),
 API keys and exposed models (LiteLLM database), device certificates (`caddy/hub/state/devices/`). All written
