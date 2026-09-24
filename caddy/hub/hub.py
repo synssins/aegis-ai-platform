@@ -9,7 +9,7 @@ Auth (replaces Caddy basic-auth):
   * sessions are HMAC-signed, HttpOnly, Secure, SameSite=Strict cookies scoped to /hub, 12 h;
   * lockout: 5 failures per user => 5 min; 20 failures per client IP => 15 min; all audited;
   * first run: no administrator exists => /hub serves a setup wizard (choose the admin username, set a
-    policy-checked password, enrol MFA) entirely in the browser. Nothing is printed or stored in files.
+    policy-checked password, enroll MFA) entirely in the browser. Nothing is printed or stored in files.
   * console recovery: `python3 /app/hub.py --reset-admin` REMOVES the administrator, which makes the
     wizard reappear (scripts/hub-reset-admin.sh). No bootstrap passwords exist anywhere.
 
@@ -285,7 +285,7 @@ def password_policy(pw: str) -> str | None:
 def reset_admin() -> None:
     """Console recovery: remove every account so the first-run wizard runs again."""
     save_users({})
-    print("All hub accounts removed. Open /hub in a browser to run the setup wizard (create admin, enrol MFA).", flush=True)
+    print("All hub accounts removed. Open /hub in a browser to run the setup wizard (create admin, enroll MFA).", flush=True)
     audit("admin_reset_wizard_rearmed")
 
 
@@ -532,7 +532,7 @@ def csrf_field():
 
 # ---------------------------------------------------------------- auth pages ---------------
 def p_setup(msg="", ok=True):
-    body = ("<p class=\"mut\">No administrator exists yet. Create the administrator account now; you will then enrol a second factor. "
+    body = ("<p class=\"mut\">No administrator exists yet. Create the administrator account now; you will then enroll a second factor. "
             "Passwords are stored only as argon2id hashes.</p>"
             "<form method=\"post\" action=\"/hub/setup\">" + csrf_field() +
             "<label>Administrator username</label><input name=\"user\" value=\"admin\" pattern=\"[a-z0-9][a-z0-9._-]+\" required autofocus>"
@@ -552,11 +552,21 @@ def p_totp(pre: str, msg="", ok=True):
     return plain_page("Second factor", f'<form method="post" action="/hub/login/totp">{csrf_field()}<input type="hidden" name="pre" value="{esc(pre)}"><label>Authenticator code</label><input name="code" inputmode="numeric" pattern="[0-9 ]*" autocomplete="one-time-code" required autofocus><div style="margin-top:14px"><button>Sign in</button></div></form>', msg, ok)
 
 
+def qr_svg(data: str) -> str:
+    import qrcode
+    import qrcode.image.svg as svg
+    img = qrcode.make(data, image_factory=svg.SvgPathImage, box_size=10, border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    raw = img.to_string().decode() if isinstance(img.to_string(), bytes) else img.to_string()
+    raw = re.sub(r"<\?xml[^>]*>", "", raw)
+    return re.sub(r"<svg ", '<svg style="width:220px;height:220px;background:#fff;border-radius:10px;padding:8px" ', raw, 1)
+
+
 def p_enrol(pre: str, secret: str, user: str, msg="", ok=True):
-    uri = f"otpauth://totp/Aegis%20Hub:{urllib.parse.quote(user)}?secret={secret}&issuer=Aegis%20Hub&digits=6&period=30"
-    return plain_page("Enrol MFA", f'''<p class="mut">Add this account to your authenticator app (manual entry or paste the URI), then confirm with a code. MFA is mandatory.</p>
-<label>Secret</label><div class="key">{esc(secret)}</div><label>otpauth URI</label><div class="key" style="font-size:11px">{esc(uri)}</div>
-<form method="post" action="/hub/login/enrol">{csrf_field()}<input type="hidden" name="pre" value="{esc(pre)}"><input type="hidden" name="secret" value="{esc(secret)}"><label>Code from the app</label><input name="code" inputmode="numeric" required autofocus><div style="margin-top:14px"><button>Confirm and sign in</button></div></form>''', msg, ok)
+    uri = f"otpauth://totp/Aegis%20Hub:{urllib.parse.quote(user)}?secret={secret}&issuer=Aegis%20Hub&algorithm=SHA1&digits=6&period=30"
+    return plain_page("Enroll MFA", f'''<p class="mut">Scan this with Google Authenticator, Authy, 1Password or any TOTP app, then enter the 6-digit code it shows. MFA is mandatory.</p>
+<div style="text-align:center;margin:10px 0">{qr_svg(uri)}</div>
+<details><summary class="mut">Can't scan? Manual entry</summary><label>Account</label><div class="key">Aegis Hub:{esc(user)}</div><label>Key (base32, time-based, 6 digits, 30 s)</label><div class="key">{esc(" ".join(secret[i:i + 4] for i in range(0, len(secret), 4)))}</div></details>
+<form method="post" action="/hub/login/enrol">{csrf_field()}<input type="hidden" name="pre" value="{esc(pre)}"><input type="hidden" name="secret" value="{esc(secret)}"><label>Code from the app</label><input name="code" inputmode="numeric" autocomplete="one-time-code" required autofocus><div style="margin-top:14px"><button>Confirm and sign in</button></div></form>''', msg, ok)
 
 
 def p_force_password(msg="", ok=True):
@@ -702,7 +712,7 @@ def p_account(msg="", ok=True):
     u = users().get(getattr(REQ, "user", "admin"), {})
     body = f"""<div class="card"><h2 style="margin-top:0">Password</h2><form method="post" action="/hub/account/password">{csrf_field()}<label>Current password</label><input name="current" type="password" autocomplete="current-password" required><label>New password</label><input name="new" type="password" autocomplete="new-password" required minlength="14"><label>Confirm</label><input name="confirm" type="password" autocomplete="new-password" required minlength="14"><div class="mut" style="margin-top:6px">≥ 14 chars; 3 of 4 classes; no spaces; no "admin"/"aegis"/"password". Stored as argon2id (64 MiB, t=3). Changing it signs out other sessions.</div><div style="margin-top:12px"><button>Change password</button></div></form></div>
 <div class="card"><h2 style="margin-top:0">Multi-factor authentication</h2><p>Status: <b class="{"ok" if u.get("totp") else "bad"}">{"enrolled" if u.get("totp") else "NOT enrolled"}</b> · last updated {esc(u.get("updated", ""))[:19]}</p>
-<form method="post" action="/hub/account/mfa-reset">{csrf_field()}<label>Current password</label><input name="current" type="password" required><label>Current authenticator code</label><input name="code" inputmode="numeric" required><div style="margin-top:12px"><button class="ghost">Re-enrol MFA (new secret)</button></div></form>
+<form method="post" action="/hub/account/mfa-reset">{csrf_field()}<label>Current password</label><input name="current" type="password" required><label>Current authenticator code</label><input name="code" inputmode="numeric" required><div style="margin-top:12px"><button class="ghost">Re-enroll MFA (new secret)</button></div></form>
 <p class="mut">Lost the authenticator or password? Console only: <code>scripts/hub-reset-admin.sh</code> removes the administrator; the setup wizard then runs again in the browser.</p></div>"""
     return page("access", "account", "Admin account", "Your credential. Passwords are never stored — only argon2id hashes; the TOTP secret is encrypted at rest.", body, msg, ok)
 
@@ -894,7 +904,7 @@ def act_mfa_reset(form):
         audit("mfa_reset_rejected"); return p_account("Authenticator code incorrect.", False)
     rec["totp"] = None; rec["updated"] = now(); rec["session_epoch"] = rec.get("session_epoch", 0) + 1; u[user] = rec; save_users(u)
     audit("mfa_reset")
-    return None  # caller redirects to login, which forces enrolment
+    return None  # caller redirects to login, which forces enrollment
 
 
 def act_hostname(form):
@@ -1072,10 +1082,10 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/hub/login/enrol" and d.get("stage") == "enrol":
                 sec = form.get("secret", "")
                 if not re.fullmatch(r"[A-Z2-7]{32}", sec):
-                    return self._send(400, p_login("Invalid enrolment.", False))
+                    return self._send(400, p_login("Invalid enrollment.", False))
                 c = totp_verify(sec, form.get("code", ""), 0)
                 if c is None:
-                    fail("u:" + user); audit("mfa_enrol_failed", user=user, ip=ip)
+                    fail("u:" + user); audit("mfa_enroll_failed", user=user, ip=ip)
                     return self._send(401, p_enrol(self._pre(user, "enrol"), sec, user, "Code did not match — check the clock on your device and try again.", False))
                 rec["totp"] = fernet().encrypt(sec.encode()).decode(); rec["totp_last"] = c; rec["updated"] = now(); u_all[user] = rec; save_users(u_all)
                 REQ.user = user; audit("mfa_enrolled", user=user, ip=ip)

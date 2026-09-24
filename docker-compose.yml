@@ -39,7 +39,7 @@ services:
     # LiteLLM, ollama (backend, read/delete), modeld (mgmt, pulls). Reachable only via caddy at /hub
     # behind basic-auth. Holds the LiteLLM master key (key/model management) — every action audited.
     <<: *hardened
-    image: aegis/hub:3                             # caddy/hub/build/Dockerfile — python:3.12-alpine + argon2id + Fernet
+    image: aegis/hub:4                             # caddy/hub/build/Dockerfile — python:3.12-alpine + argon2id + Fernet + qrcode
     container_name: hub
     command: ["python3", "-u", "/app/hub.py"]
     environment:
