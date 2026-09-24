@@ -7,10 +7,10 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 |---|---|---|---|
 | Overview | Dashboard | — | services by network, safety posture, VRAM residency, certificates, recent vetoes |
 | | Services | start / stop / restart (checked containers) | real container status from the host **watchdog**; caddy and hub can only be restarted; one request at a time; every watchdog response (log + errors) listed |
-| Safety | VetoGuard policy | guard model, blocked categories, tripwires, extra regexes, **diagnostics snippet toggle (default off)** | **S4 is locked on**; classifier and fail-closed cannot be disabled; every save is audited + alerted |
+| Safety | VetoGuard policy | **classifier model (the one place it is chosen — saving loads it and unloads other guards)**, blocked categories, tripwires, extra regexes, diagnostics snippet toggle (default off) | **S4 is locked on**; classifier and fail-closed cannot be disabled; every save is audited + alerted |
 | | Audit log | — | last 150 vetoes and 100 admin actions; never contains content |
 | | Alerts | webhook URL | Discord/Slack/generic JSON; "Send test" |
-| Models | Installed | expose / remove | expose = register in LiteLLM under a public name (through VetoGuard); guard models never exposable; resident/exposed models cannot be removed |
+| Models | Installed | expose / load / unload / remove; "Set as classifier" for guard-family models | expose = register in LiteLLM under a public name (through VetoGuard); guard models never exposable and not loaded/unloaded by hand — their residency follows the policy choice; the active classifier cannot be removed |
 | | Pull | pull | via `modeld` — the only container with both internet and the model store. Apps never fetch their own |
 | | Exposed to apps | unexpose (hub-created only) | models from `config.yaml` are console-managed |
 | Access | API keys | mint / revoke | per-client, model-scoped, rate-limited; key shown once |
@@ -37,6 +37,8 @@ Llama Guard 3 categories, grouped:
 - **illegal (blocked by default):** S1 violent crimes, S2 non-violent crimes, S3 sex-related crimes, S9 indiscriminate weapons.
 - **protected (blocked by default):** S10 hate / protected classes, S11 suicide & self-harm.
 - **adult/legal (allowed by default):** S5, S6, S7, S8, S12 sexual content (adult), S13, S14.
+
+**Classifier is mandatory and fail-closed:** if the chosen model is not installed, not loadable or unreachable, every request is refused (503 `guard_unavailable`). If VRAM pressure evicts it, Ollama reloads it on the next request (~20 s once). Load the main model *before* choosing a larger classifier so both fit. The dropdown lists installed models named *guard*, *shield* or *guardian*; VetoGuard parses the Llama Guard verdict format, so other families need an output adapter first (roadmap #11).
 
 The lexical tripwire (sentinel, CSAM terms, malware intent, plus admin-added regexes) runs before
 the classifier. The classifier runs on input and on output (streaming is buffered and released only

@@ -13,4 +13,6 @@ Ordered by dependency, not by desire. Each item names its safety precondition.
 | 7 | Fish Speech (TTS) under the hub | GPU assignment; output stays text→audio only |
 | 8 | ComfyUI (image generation) | **Hard gate:** prompt classifier + output multimodal classifier + isolated audit log, tested with sentinels before any model is loaded |
 | 9 | **Portal + single identity** — landing page at `/` with Chat · Images · Speech · Gallery · Monitoring tiles by group; one login for everything (Authelia IdP behind Caddy `forward_auth`; Open WebUI via OIDC; Grafana via auth-proxy roles; hub trusts the `admins` group); per-user gallery with admin-published globals; per-user feature grants (e.g. `grafana-viewers`) | Supervised (changes how you log in); design doc first, Gemini review, then phased: IdP → portal → app SSO → gallery |
-| 10 | Hub key management UI | **Done** — by operator decision the hub holds the master key; mitigations: edge basic-auth, Caddy-namespace-only reachability, read-only fs, CSRF, audit + alert on every action |
+| 10 | Hub key management UI — **done** (mint / revoke / update models) |
+| 11 | Classifier adapters for other safety families (ShieldGemma, WildGuard, Granite Guardian): map each model's verdict format onto the S-category policy; run two classifiers in parallel as an option |  Benchmarked against the sentinel suite before selectable |
+ **Done** — by operator decision the hub holds the master key; mitigations: edge basic-auth, Caddy-namespace-only reachability, read-only fs, CSRF, audit + alert on every action |

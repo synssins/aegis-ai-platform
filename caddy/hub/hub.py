@@ -349,8 +349,26 @@ def installed_models() -> list[dict]:
     for m in models:
         m["loaded"] = m.get("name") in loaded
         m["vram"] = loaded.get(m.get("name"), {}).get("size_vram", 0)
-        m["is_guard"] = "guard" in (m.get("name") or "").lower()
+        m["is_guard"] = is_guard_name(m.get("name") or "")
     return sorted(models, key=lambda m: m.get("name", ""))
+
+
+GUARD_NAME_RE = re.compile(r"guard|shield|guardian", re.I)
+
+
+def is_guard_name(n: str) -> bool:
+    return bool(GUARD_NAME_RE.search(n or ""))
+
+
+def activate_guard(model: str) -> None:
+    """Make the policy's classifier resident and drop other guard models (one selection, one residency)."""
+    def run():
+        for m in installed_models():
+            if m["is_guard"] and m["loaded"] and m["name"] != model:
+                http("POST", OLLAMA + "/api/generate", {"model": m["name"], "keep_alive": 0}, timeout=120)
+        st, j = http("POST", OLLAMA + "/api/generate", {"model": model, "keep_alive": "24h"}, timeout=900)
+        audit("guard_loaded" if st == 200 else "guard_load_failed", model=model, status=st)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def exposed_models() -> list[dict]:
@@ -588,8 +606,10 @@ def p_dashboard(msg="", ok=True):
     certrows = "".join(f'<tr><td>{esc(c["host"])}</td><td>{esc(c.get("issuer", c.get("error")))}</td><td class="{"warn" if c.get("days", 99) < 14 else "ok"}">{c.get("days", "—")}</td></tr>' for c in certs)
     events = tail_jsonl(VETO_AUDIT, 8)
     evrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))}</td><td>{esc(e.get("detail", ""))[:70]}</td><td>{esc(e.get("key_alias"))}</td></tr>' for e in events) or '<tr><td colspan="5" class="mut">no vetoes recorded</td></tr>'
+    g = pol["guard"]["model"]; g_inst = any(m["name"] == g for m in models); g_res = any(m["name"] == g and m["loaded"] for m in models)
+    gtag = f'<span class="tag">{esc(g)}</span> ' + ('<span class="bad">NOT INSTALLED — all requests refused</span>' if not g_inst else ('<span class="ok">resident</span>' if g_res else '<span class="warn">not resident (loads on next request)</span>'))
     body = f"""<div class="grid">{tiles}</div><p class="mut">Container status via host watchdog · {esc(cts[:19])}</p>
-<div class="card"><h2 style="margin-top:0">Safety posture</h2>Guard model <span class="tag">{esc(pol["guard"]["model"])}</span> · blocking {len(blocked)} categories: {esc(", ".join(blocked))} · tripwires {"on" if pol["tripwires"].get("enabled") else "OFF"} · <b>fail-closed</b> · streaming buffered · snippets {"ON" if pol.get("audit", {}).get("store_snippet") else "off"}
+<div class="card"><h2 style="margin-top:0">Safety posture</h2>Classifier {gtag} · blocking {len(blocked)} categories: {esc(", ".join(blocked))} · tripwires {"on" if pol["tripwires"].get("enabled") else "OFF"} · <b>fail-closed</b> · streaming buffered · snippets {"ON" if pol.get("audit", {}).get("store_snippet") else "off"}
 <div class="mut" style="margin-top:6px">Resident in VRAM: {vram}</div></div>
 <div class="card"><h2 style="margin-top:0">Certificates</h2><table><tr><th>Host</th><th>Issuer</th><th>Days left</th></tr>{certrows}</table></div>
 <div class="card"><h2 style="margin-top:0">Recent vetoes</h2><table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Detail</th><th>Key</th></tr>{evrows}</table></div>"""
@@ -624,18 +644,23 @@ def p_services(msg="", ok=True):
 
 
 def p_policy(msg="", ok=True):
-    pol = policy(); guards = [m["name"] for m in installed_models() if m["is_guard"]]
-    if pol["guard"]["model"] not in guards:
-        guards.append(pol["guard"]["model"])
-    opts = "".join(f'<option value="{esc(g)}"{" selected" if g == pol["guard"]["model"] else ""}>{esc(g)}</option>' for g in guards)
+    pol = policy(); inst = installed_models(); guards = [m["name"] for m in inst if m["is_guard"]]
+    cur = pol["guard"]["model"]; missing = cur not in guards
+    resident = any(m["name"] == cur and m["loaded"] for m in inst)
+    if missing:
+        guards.append(cur)
+    opts = "".join(f'<option value="{esc(g)}"{" selected" if g == cur else ""}>{esc(g)}{" (NOT INSTALLED)" if g == cur and missing else ""}</option>' for g in guards)
+    gstate = ('<span class="bad">not installed — every request is being refused (fail-closed). Pull it or choose another.</span>' if missing else
+              ('<span class="ok">resident in memory</span>' if resident else '<span class="warn">on disk, not resident — loads on the next request (~20 s once)</span>'))
     rows = ""
     for c, (name, kind) in CATEGORIES.items():
         b = pol["categories"][c]["block"]; locked_c = c == "S4"
         rows += f'<tr class="{"lock" if locked_c else ""}"><td><input type="checkbox" name="block_{c}" {"checked" if b else ""} {"disabled" if locked_c else ""}></td><td>{c}</td><td>{esc(name)}</td><td><span class="tag">{esc(kind)}</span></td><td class="mut">{"always blocked — cannot be changed" if locked_c else ""}</td></tr>'
     extra = "\n".join(pol["tripwires"].get("extra_patterns", []))
     body = f"""<form method="post" action="/hub/api/policy">{csrf_field()}
-<div class="card"><h2 style="margin-top:0">Classifier (Llama Guard 3)</h2><label>Guard model (installed models containing "guard")</label><select name="guard_model">{opts}</select>
-<div class="mut" style="margin-top:6px">Runs on every request and every response (streaming buffered). Cannot be disabled; if unreachable, requests are refused. Do not select 8B while a ~26 GB main model is resident — they evict each other.</div></div>
+<div class="card"><h2 style="margin-top:0">Classifier (Llama Guard 3)</h2><label>Classifier model (installed models named *guard*, *shield* or *guardian*)</label><select name="guard_model">{opts}</select>
+<div style="margin-top:6px">Status: {gstate}</div>
+<div class="mut" style="margin-top:6px">This is the only place the classifier is chosen. Saving loads it into memory and unloads any other guard model. It runs on every request and every response (streaming buffered), cannot be disabled, and if it is missing or unreachable every request is refused. Load your main model <b>before</b> choosing a larger guard so both fit in VRAM. Note: VetoGuard parses the Llama Guard verdict format (safe / unsafe + S-codes); other safety families need an output adapter first (roadmap).</div></div>
 <div class="card"><h2 style="margin-top:0">Blocked categories</h2><table><tr><th>Block</th><th>Code</th><th>Category</th><th>Class</th><th></th></tr>{rows}</table><div class="mut">Illegal and protected-class content never passes; adult content may. Unchecking an "illegal" class is allowed but audited and alerted.</div></div>
 <div class="card"><h2 style="margin-top:0">Lexical tripwires</h2><label><input type="checkbox" name="tripwires" {"checked" if pol["tripwires"].get("enabled", True) else ""}> Enabled (built-in lists for sentinel / CSAM terms / malware intent)</label><label>Extra patterns — one Python regex per line</label><textarea name="extra">{esc(extra)}</textarea></div>
 <div class="card"><h2 style="margin-top:0">Diagnostics</h2><label><input type="checkbox" name="store_snippet" {"checked" if pol.get("audit", {}).get("store_snippet") else ""}> Store a 160-character snippet of <b>flagged output</b> (root-only file)</label><div class="mut">Off by default: logs never contain content. Never applies to S4 or CSAM-tripwire vetoes. Toggling is audited and alerted.</div></div>
@@ -668,11 +693,12 @@ def p_installed(msg="", ok=True):
     for m in models:
         n = m["name"]; size = m.get("size", 0) / 2**30
         exp = exposed.get(n) or exposed.get(n.replace(":latest", ""))
-        act = '<span class="tag">guard model</span>' if m["is_guard"] else (f'<span class="tag ok">exposed as {esc(exp)}</span>' if exp else f'<form class="inline" method="post" action="/hub/api/models/expose">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input name="public" placeholder="public name" style="width:150px" value="{esc(n.split(":")[0].split("/")[-1])}"> <button class="ghost">Expose</button></form>')
-        ld = (f'<form class="inline" method="post" action="/hub/api/models/unload">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Unload</button></form>' if m["loaded"] else f'<form class="inline" method="post" action="/hub/api/models/load">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Load</button></form>')
-        rm = "" if exp or m["loaded"] else f'<form class="inline" method="post" action="/hub/api/models/remove">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input type="hidden" name="confirm" value="{esc(n)}"><button class="danger">Remove</button></form>'
+        act = (f'<span class="tag ok">active classifier</span>' if n == policy()["guard"]["model"] else
+                f'<form class="inline" method="post" action="/hub/api/models/setguard">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Set as classifier</button></form>') if m["is_guard"] else (f'<span class="tag ok">exposed as {esc(exp)}</span>' if exp else f'<form class="inline" method="post" action="/hub/api/models/expose">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input name="public" placeholder="public name" style="width:150px" value="{esc(n.split(":")[0].split("/")[-1])}"> <button class="ghost">Expose</button></form>')
+        ld = "" if m["is_guard"] else (f'<form class="inline" method="post" action="/hub/api/models/unload">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Unload</button></form>' if m["loaded"] else f'<form class="inline" method="post" action="/hub/api/models/load">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Load</button></form>')
+        rm = "" if exp or m["loaded"] or n == policy()["guard"]["model"] else f'<form class="inline" method="post" action="/hub/api/models/remove">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input type="hidden" name="confirm" value="{esc(n)}"><button class="danger">Remove</button></form>'
         rows += f'<tr><td>{esc(n)}</td><td>{size:.1f} GiB</td><td>{"<span class=ok>resident</span>" if m["loaded"] else "<span class=mut>on disk</span>"}</td><td>{act}</td><td>{ld} {rm}</td></tr>'
-    body = f'<div class="card">{mctl}<table><tr><th>Model</th><th>Size</th><th>State</th><th>Exposure</th><th></th></tr>{rows or "<tr><td colspan=5 class=mut>none</td></tr>"}</table></div><p class="mut">"Expose" registers the model in LiteLLM under a public name (through VetoGuard). Guard models are never exposable. Unload before removing.</p>'
+    body = f'<div class="card">{mctl}<table><tr><th>Model</th><th>Size</th><th>State</th><th>Exposure</th><th></th></tr>{rows or "<tr><td colspan=5 class=mut>none</td></tr>"}</table></div><p class="mut">"Expose" registers the model in LiteLLM under a public name (through VetoGuard). Guard models are never exposable; the active classifier is chosen in Safety → VetoGuard policy (or "Set as classifier" here — same action) and is loaded/unloaded by that choice, not by hand. Unload before removing.</p>'
     return page("models", "installed", "Installed models", "What is in the shared model store, and what apps can see.", body, msg, ok)
 
 
@@ -772,10 +798,12 @@ def act_ops(form):
 
 
 def act_policy(form):
-    pol = policy(); before = {c: v["block"] for c, v in pol["categories"].items()}
+    pol = policy(); before = {c: v["block"] for c, v in pol["categories"].items()}; before_model = pol["guard"]["model"]
     gm = form.get("guard_model", pol["guard"]["model"])
-    if not MODEL_RE.match(gm) or "guard" not in gm.lower():
-        return p_policy("Guard model must be an installed model whose name contains 'guard'.", False)
+    if not MODEL_RE.match(gm) or not is_guard_name(gm):
+        return p_policy("Classifier must be an installed model named *guard*, *shield* or *guardian*.", False)
+    if gm not in [m["name"] for m in installed_models()]:
+        return p_policy(f"{gm} is not installed. Pull it first (Models → Pull).", False)
     for c in CATEGORIES:
         pol["categories"][c]["block"] = (f"block_{c}" in form) or c == "S4"
     extra = [l.strip() for l in form.get("extra", "").splitlines() if l.strip()]
@@ -790,6 +818,9 @@ def act_policy(form):
     save_json(POLICY_FILE, pol)
     changed = [f"{c}:{'block' if pol['categories'][c]['block'] else 'allow'}" for c in CATEGORIES if before[c] != pol["categories"][c]["block"]]
     audit("policy_saved", guard_model=gm, changed=",".join(changed) or "none", tripwires=pol["tripwires"]["enabled"], extra_patterns=len(extra))
+    if gm != before_model:
+        activate_guard(gm)
+        return p_policy(f"Policy saved. Loading {gm} into memory now (other guard models are being unloaded); refresh in ~20 s to see it resident.")
     return p_policy("Policy saved. LiteLLM picks it up within seconds (no restart).")
 
 
@@ -827,6 +858,17 @@ def act_unexpose(form):
     st, j = litellm("POST", "/model/delete", {"id": mid}); ok = st == 200
     audit("model_unexposed" if ok else "model_unexpose_failed", public=pub, status=st)
     return p_exposed(f"Unexposed {pub}." if ok else f"LiteLLM refused ({st}).", ok)
+
+
+def act_setguard(form):
+    m = form.get("model", "")
+    if not MODEL_RE.match(m) or not is_guard_name(m) or m not in [x["name"] for x in installed_models()]:
+        return p_installed("Not an installed guard-family model.", False)
+    pol = policy(); prev = pol["guard"]["model"]; pol["guard"]["model"] = m; pol["updated"], pol["updated_by"] = now(), getattr(REQ, "user", "admin")
+    save_json(POLICY_FILE, pol); audit("policy_saved", guard_model=m, changed="none", tripwires=pol["tripwires"]["enabled"], extra_patterns=len(pol["tripwires"].get("extra_patterns", [])))
+    if m != prev:
+        activate_guard(m)
+    return p_installed(f"{m} is now the classifier and is being loaded; the previous guard is being unloaded.")
 
 
 def act_unload(form):
@@ -955,7 +997,7 @@ def act_hostname(form):
 
 ACTIONS = {"/hub/api/ops": act_ops, "/hub/api/policy": act_policy, "/hub/api/alerts": act_alerts, "/hub/api/models/pull": act_pull,
            "/hub/api/models/expose": act_expose, "/hub/api/models/unexpose": act_unexpose, "/hub/api/models/remove": act_remove,
-           "/hub/api/models/unload": act_unload, "/hub/api/models/load": act_load,
+           "/hub/api/models/unload": act_unload, "/hub/api/models/load": act_load, "/hub/api/models/setguard": act_setguard,
            "/hub/api/keys/mint": act_mint, "/hub/api/keys/revoke": act_revoke, "/hub/api/keys/update": act_keys_update, "/hub/api/hostname": act_hostname}
 PAGES = {("overview", "dashboard"): p_dashboard, ("overview", "services"): p_services, ("safety", "policy"): p_policy,
          ("safety", "audit"): p_audit, ("safety", "alerts"): p_alerts, ("models", "installed"): p_installed,
