@@ -10,7 +10,7 @@ Follows the overnight run (`2026-09-25-overnight-run.md`). Executor: Claude Code
 | VetoGuard | 2.2 → **2.7** through five completed Agy rounds (round 6 was blocked by Gemini's content filter — not a clean verdict) (records in `docs/tests/agy-vetoguard-review-*.md`). Whole-history tripwires, multi-turn window classification, every request field and output field covered, fail-closed on every unscannable path, bounded executors/queues. |
 | Models | `modeld` pull-only sidecar; pull/remove/expose from the hub; apps never fetch models. `gemma3:27b` pulled as the ≤ 20 GB main-model candidate for pairing with the 8B guard. |
 | Access | API keys minted/revoked in the hub; **admin password rotation** in the hub (file-based Caddy credential, complexity policy, bcrypt 14). |
-| Gateway | Local Caddy build with Cloudflare DNS-01; **Let's Encrypt certificate live for `aegis.denofsyn.com`** with no inbound ports; certificate monitor; isolation layer view-only. |
+| Gateway | Local Caddy build with Cloudflare DNS-01; **Let's Encrypt certificate live for `<public-hostname>`** with no inbound ports; certificate monitor; isolation layer view-only. |
 | Frameworks | Monitoring profile (Prometheus, node-exporter, DCGM, Grafana at `/grafana`) — up and scraping. Apps profile (Fish Speech, ComfyUI hard-503). |
 | Tests | 76 assertions; 64/64 on the final run with 12 hub-page tests skipped (password rotated from the UI). |
 

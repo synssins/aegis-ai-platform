@@ -14,6 +14,9 @@ if [ -f .env ]; then
   [ -n "$em" ] && [ "$em" != "CHANGE_ME@example.com" ] && printf '%s\n' "${em//./\\.}" >> "$PATS"
 fi
 printf '%s\n' "$(hostname)" "$(id -un)" >> "$PATS"
+# public hostname configured from the hub (root-only state file) and its registrable domain
+hn=$(sudo -n python3 -c "import json;print(json.load(open('caddy/hub/state/hub.json')).get('hostname',''))" 2>/dev/null || true)
+[ -n "$hn" ] && { printf '%s\n' "${hn//./\\.}"; printf '%s\n' "$(echo "$hn" | awk -F. '{print $(NF-1)"\\."$NF}')"; } >> "$PATS"
 [ -f .sanitize-patterns ] && cat .sanitize-patterns >> "$PATS"
 fail=0
 while IFS= read -r file; do
