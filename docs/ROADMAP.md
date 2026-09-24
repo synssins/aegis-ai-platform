@@ -17,3 +17,10 @@ Ordered by dependency, not by desire. Each item names its safety precondition.
 | 10 | Hub key management UI — **done** (mint / revoke / update models) |
 | 11 | Verdict adapters for other safety families (ShieldGemma, WildGuard, Granite Guardian) in `proxy/veto_filter.py` `ADAPTERS` — request template + answer parser per family, mapped onto the S-category policy; optional two-classifier mode | Framework shipped 2026-09-24 (Llama Guard adapter); each new adapter benchmarked against the sentinel suite before it is selectable |
  **Done** — by operator decision the hub holds the master key; mitigations: edge basic-auth, Caddy-namespace-only reachability, read-only fs, CSRF, audit + alert on every action |
+
+## Next session (plan as of 2026-09-24 late)
+1. **Adversarial audit round 6** with Gemini (`agy`) over everything shipped since round 5 — brief and scope in
+   `docs/audits/2026-09-24-round6-brief.md`. Fix, add suite assertions (new phase 10: portal/scheduler), re-review
+   until clean. Record rounds in `docs/tests/agy-review-round6-*.md` like earlier rounds.
+2. Then, in order: API-key requests under the scheduler policy (LiteLLM hook), mask uploads, Fish Speech under the
+   portal, farm mode (design phase 4).
