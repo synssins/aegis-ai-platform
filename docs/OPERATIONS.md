@@ -15,6 +15,8 @@ The service runs the **installed copy** `/usr/local/sbin/aegis-watchdog.py`; aft
 container in its allow-list) install it again: `sudo install -m 755 ops/aegis-watchdog.py /usr/local/sbin/ && sudo systemctl restart aegis-watchdog`.
 
 ## Models
+- Chat-pool **wide mode** needs the wide container to exist: `docker compose --profile wide create ollama-intel-wide`
+  once after install (the watchdog only starts/stops existing containers). Switch modes from Models → Installed.
 - Pull from the hub (Models → Pull) or `scripts/pull-model.sh <name>` — both use a throw-away puller; the
   inference engine never has internet access.
 - Load order matters for VRAM: load the main model, then choose the classifier in Safety → VetoGuard policy.

@@ -32,9 +32,9 @@ STATUS = os.path.join(RESP_DIR, "status.json")
 POLL, STATUS_EVERY = 2, 5
 
 DEPENDENTS = {                      # name -> direct dependents (must be down while name restarts)
-    "caddy": ["hub"], "hub": [], "litellm-db": ["litellm"], "ollama": ["litellm"], "ollama-intel": ["litellm"], "litellm": [],
+    "caddy": ["hub"], "hub": [], "litellm-db": ["litellm"], "ollama": ["litellm"], "ollama-intel": [], "litellm": [],
     "openwebui": [], "modeld": [], "prometheus": ["grafana"], "grafana": [], "node-exporter": [], "dcgm-exporter": [],
-    "fish-speech": [], "comfyui": [], "comfyui-intel": [],
+    "fish-speech": [], "comfyui": [], "comfyui-intel": [], "ollama-intel-wide": [],
 }
 ALLOWED = set(DEPENDENTS)
 PROTECTED = {"caddy", "hub"}
@@ -100,6 +100,17 @@ def topo(names: list[str]) -> list[str]:
 def run(req: dict) -> dict:
     log, errors = [], []
     action = req.get("action"); raw = req.get("targets")
+    if action == "sequence":               # ordered steps (chat-pool mode switches); each step is validated like a request
+        steps = req.get("steps")
+        if not isinstance(steps, list) or not 1 <= len(steps) <= 8:
+            return {"ok": False, "errors": ["sequence needs 1-8 steps"], "log": []}
+        for i, step in enumerate(steps):
+            r = run({"action": step.get("action"), "targets": step.get("targets")})
+            log += [f"step {i + 1} {step.get('action')} {step.get('targets')}: " + l for l in r["log"]]
+            errors += r["errors"]
+            if not r["ok"]:
+                log.append(f"step {i + 1} failed; sequence stopped"); break
+        return {"ok": not errors, "errors": errors, "log": log}
     if action not in ACTIONS:
         return {"ok": False, "errors": [f"unknown action {action!r}"], "log": []}
     if not isinstance(raw, list) or not raw:

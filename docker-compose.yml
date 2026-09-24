@@ -46,7 +46,9 @@ services:
     environment:
       - AEGIS_LAN_IP=${AEGIS_LAN_IP}
       - GUARD_OLLAMA=http://ollama:11434               # where the hub loads/checks the safety classifier (T4 pool)
-      - AEGIS_POOLS=nvidia=http://ollama:11434,intel=http://ollama-intel:11434   # GPU pools: nvidia = safety (text guard + image classifier), intel = chat/coding
+      - AEGIS_POOLS=nvidia=http://ollama:11434,intel=http://chatpool:11434     # GPU pools: nvidia = safety (text guard + image classifier), intel = chat/coding (alias follows the mode)
+      - CHATPOOL_NARROW=http://ollama-intel:11434
+      - CHATPOOL_WIDE=http://ollama-intel-wide:11434
       - COMFY_URL=http://comfyui-intel:8188            # the ComfyUI instance behind the gate (comfyui:8188 for the NVIDIA one)
       - AEGIS_INTEL_GPUS=Arc Pro B60:24576:images,Arc Pro B60:24576:intel   # Intel cards are invisible to DCGM; declared with their role (images = ComfyUI, intel = Ollama pool)
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
@@ -57,6 +59,7 @@ services:
       - ./caddy/hub/hub.py:/app/hub.py:ro
       - ./caddy/hub/browse.py:/app/browse.py:ro
       - ./caddy/hub/imagegate.py:/app/imagegate.py:ro
+      - ./caddy/hub/scheduler.py:/app/scheduler.py:ro
       - ./gallery:/app/gallery                        # approved images per user; users purge their own
       - ./comfyui:/app/comfy-store                # model browser downloads (checkpoints/, loras/, …); ComfyUI reads the same tree
       - ./caddy/conf:/etc/caddy/conf:ro
@@ -192,7 +195,36 @@ services:
     group_add: ["991", "44"]                          # render, video (host gids)
     volumes:
       - ./llm/gguf:/root/.ollama                      # shared model store (pulled by modeld)
-    networks: [backend]
+    networks:
+      backend:
+        aliases: [chatpool]                           # LiteLLM and the hub address the chat pool by this name in either mode
+
+  ollama-intel-wide:
+    # The same chat pool on BOTH Arcs ("wide" mode): one large chat model spread over 2×24 GB. Image generation is
+    # paused meanwhile (the hub stops comfyui-intel first). Created once (`docker compose --profile wide create
+    # ollama-intel-wide`); the hub switches modes through the watchdog, which only starts/stops existing containers.
+    <<: *hardened
+    image: ollama/ollama:0.34.3
+    container_name: ollama-intel-wide
+    profiles: [wide]
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_VULKAN=1
+      - VK_DRIVER_FILES=/usr/share/vulkan/icd.d/intel_icd.json
+      - OLLAMA_CONTEXT_LENGTH=16384
+      - OLLAMA_SCHED_SPREAD=1                         # use both cards for one model
+    devices:
+      - /dev/dri/renderD129
+      - /dev/dri/renderD131
+      - /dev/dri/card0
+      - /dev/dri/card3
+    group_add: ["991", "44"]
+    volumes:
+      - ./llm/gguf:/root/.ollama
+    networks:
+      backend:
+        aliases: [chatpool]
 
   prometheus:
     <<: *hardened

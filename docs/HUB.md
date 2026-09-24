@@ -102,6 +102,22 @@ Deletion wipes the file, its record and ComfyUI's history entry — users purge 
 operator decision. Safety → VetoGuard policy → *Administrator review of user galleries* opens Safety → Galleries
 for admins (every open audited); the Gallery page tells users when review is on.
 
+## Chat-model scheduling and chat-pool modes (administrators first)
+`caddy/hub/scheduler.py`. Users never load or unload; they pick any **exposed** model in the portal (the menu shows
+*loaded* / *loads on request* / *busy*). Picking a non-resident model makes the scheduler load it on its pool,
+evicting other chat models unless one is **pinned** (Models → Installed → Pin), was used by an **administrator
+within the hold** (Safety → VetoGuard policy, default 10 min), or is **still answering** (the scheduler waits up to
+45 s). A refused user gets a 409 with the reason and is told to pick a loaded model. Administrators' requests always
+win. The safety pool (T4s) is never touched. Every eviction and load is audited (`model_evicted`, `model_loaded`).
+API keys bypass this layer: LiteLLM talks to the pool directly and Ollama's own LRU applies.
+
+**Chat-pool modes.** *Normal*: one Arc for chat (`ollama-intel`), the other for images. *Wide*: both Arcs for one
+large chat model (`ollama-intel-wide`, `OLLAMA_SCHED_SPREAD`); image generation is paused and users see why. Only
+administrators switch (Models → Installed); the switch is an ordered watchdog sequence (stop images → stop the
+normal pool → start the wide pool, and the reverse), about a minute. LiteLLM and the hub reach the chat pool through
+the network alias `chatpool`, which follows whichever container runs. Wide reverts to normal automatically after
+`wide_idle_min` minutes without chat (default 20). Image workflows from administrators are queued at the front.
+
 ## Portal chat (portal-native)
 The portal's **Chat** section is the hub's own chat, not Open WebUI. Deliberately minimal: no user settings — a model picker, a message box, and a conversation list kept in the user's browser (localStorage; nothing stored server-side). Rules, all enforced server-side in `caddy/hub/hub.py` (`_chat_stream`):
 
