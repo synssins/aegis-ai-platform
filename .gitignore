@@ -31,3 +31,6 @@ ops/requests/
 ops/responses/
 ops/archive/
 proxy/evidence/
+
+# user galleries: approved generated images, per account — never committed
+gallery/
