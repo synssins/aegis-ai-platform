@@ -1,25 +1,37 @@
 """
-VetoGuard rev 2.3 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
+VetoGuard rev 2.5 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
 driven by an admin-editable policy file (hot-reloaded) that only the hub may write.
 
-rev 2.3 addresses the Agy adversarial review of 2026-09-24 (docs/tests/agy-vetoguard-review-2026-09-24.md):
-  1.1/1.2/4.2  scan everything the caller supplied in this request: the latest user turn AND every
-               message after it (assistant prefill, tool results, tool_calls args), top-level `system`,
-               `prompt`, `input`, and tool/function schema text. A request whose last message is not
-               a user turn is no longer skipped.
-  2.1/2.2/2.3  normalisation strips combining marks and Unicode format chars, maps common confusables,
-               decodes standard + URL-safe base64 and feeds decoded text to the classifier too;
-               despaced matching removes every non-alphanumeric.
-  3.1/3.2/3.3/3.4  streaming: tool_calls deltas are classified, tripwires run on output, buffered
-               output is capped, empty `choices` are tolerated, withholding never raises mid-stream.
-  4.1          extraction failure is fail-closed.
-  5.1/5.3      overlapping chunk windows; lower chunk budget; bounded concurrency.
-  6.1/6.2/6.3  policy reload keeps the last good policy on a bad read; admin regexes are checked for
-               pathological backtracking at load and every scan runs under a wall-clock budget
-               (timeout => refuse); reload checks are rate-limited.
-  7.1/7.2      verdict = exact first line; stream withholding emits a synthetic content_filter chunk.
-  8.1/8.2      key attribution works for dict-shaped key info; audit writes are off the event loop and
-               the log rotates at 50 MB.
+rev 2.5 (Agy round 3, docs/tests/agy-vetoguard-review-r3-2026-09-24.md): hook signatures are the ones
+verified in LiteLLM's source (no argument-order guessing); top-level system + tool schemas reach the
+CLASSIFIER, not only the tripwires; JSON keys are scanned and a schema-budget overflow REFUSES; base64
+wrapped across lines is joined and decoded; the withhold chunk clears reasoning fields; streamed output
+that yields nothing scannable is withheld; head+tail slicing instead of one-sided truncation; the ReDoS
+probe covers more alphabets; the HTTP client is per event loop; audit rotation takes an flock and
+exception text is reduced to class + short message.
+
+rev 2.4 addresses the Agy adversarial review, round 2 (docs/tests/agy-vetoguard-review-r2-2026-09-24.md):
+  1.1  history: an API client can fabricate earlier turns, so tripwires now run over EVERY message and
+       the classifier sees the last CONVERSATION_WINDOW turns as a real multi-turn conversation (Llama
+       Guard's intended mode) in addition to chunk-classifying the new segment. Full-history
+       re-classification on every turn is deliberately NOT done (O(n²) over a chat); recorded trade-off.
+  1.2  a request that carries messages/prompt/input but yields no scannable text is REFUSED (fail-closed);
+       content parts of any type with text-like fields are extracted.
+  1.3  schema traversal depth 24 with a node cap.
+  2.1  responses may be dicts or objects.        2.2  reasoning/thinking fields are scanned.
+  2.3  tool-call argument strings are JSON-unescaped before scanning.
+  3.1  streaming aggregates every choice index (n>1); any unsafe choice withholds the stream.
+  3.2  synthetic withhold chunk uses the first chunk that has a choice; never raises.
+  4.1  decoded base64 fragments are part of the texts the CLASSIFIER sees (2.3 only fed the regex).
+  4.2/4.3  base64 runs are matched on the original text (no whitespace collapsing) with threshold 16.
+  4.4  lowercase Cyrillic/Greek confusables.     4.5  malware roots in the despaced list.
+  5.1  process-wide classifier semaphore.        5.2  output context = the actual last user turn.
+  5.3  first blocked verdict cancels the remaining chunk calls.   5.4  persistent HTTP client.
+  6.1  ReDoS: admin patterns get a static nested-quantifier check plus a multi-charset timing probe; the
+       per-request regex budget stays as the second line. (re2 is not available in this image.)
+  6.2  a stat() failure keeps the previous policy.   6.3  probe is exception-safe.
+  7.1/7.2  audit writes go through one bounded queue and one writer thread (locked rotation).
+  7.3  hook argument order is detected, not assumed (LiteLLM's real order is (key, response, request)).
 
 Layers (all fail-closed): 1. lexical tripwire  2. Llama Guard classifier (pre + post, streaming buffered).
 Policy file: VETO_POLICY_PATH (default /app/policy/veto-policy.json), written by the hub. S4 always blocked.
@@ -30,10 +42,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import fcntl
 import copy
 import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
@@ -52,9 +66,11 @@ POLICY_PATH = os.environ.get("VETO_POLICY_PATH", "/app/policy/veto-policy.json")
 AUDIT_PATH = os.environ.get("VETO_AUDIT_PATH", "/app/audit/veto-audit.jsonl")
 AUDIT_ROTATE_BYTES = 50 * 1024 * 1024
 WITHHELD_MSG = "[Response withheld by policy: veto_triggered]"
-SCAN_BUDGET_S = 5.0            # wall-clock budget for all regex work on one request (ReDoS guard)
-MAX_OUTPUT_CHARS = 400_000     # buffered stream cap (~100k tokens); beyond => withheld
+SCAN_BUDGET_S = 5.0
+MAX_OUTPUT_CHARS = 400_000
 POLICY_CHECK_INTERVAL_S = 2.0
+CONVERSATION_WINDOW = 8
+MAX_SCHEMA_NODES = 5000
 
 LLAMA_GUARD_CATEGORIES = {
     "S1": "Violent Crimes", "S2": "Non-Violent Crimes", "S3": "Sex-Related Crimes",
@@ -74,18 +90,30 @@ DEFAULT_POLICY = {
 
 
 # ---------------------------------------------------------------------------
-# Policy (hot reload; keeps last good policy on failure; rate-limited stat)
+# Policy (hot reload; keeps last good policy on any failure; rate-limited stat)
 # ---------------------------------------------------------------------------
+NESTED_QUANT_RE = re.compile(r"\([^()]*[+*][^()]*\)\s*[+*{]|\([^()]*\)[+*]\??\s*\([^()]*\)[+*]|\.\*.*\.\*.*\.\*")
+
+
 def _pathological(pattern: str) -> bool:
-    """Reject regexes that back-track catastrophically: probe with adversarial input under a budget."""
+    """True if the regex is invalid, statically suspicious, or slow on adversarial probes."""
     try:
         rx = re.compile(pattern, re.IGNORECASE | re.DOTALL)
     except re.error:
         return True
-    probe = ("a" * 40 + "!") * 3 + "x" * 400 + " " * 50 + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+    if NESTED_QUANT_RE.search(pattern):
+        return True
+    alphabet = ("a", "z", "1", "0", " ", "\n", "x", "-", "_", ".", "/", "\\", "(", "é", "ж", "!", "\t", "=")
+    probes = [(ch * 60 + tail) * 3 for ch in alphabet for tail in ("", "!", "aaaaaaaaaaaaaaaaaaaaaaaaaab", "ab" * 20)]
     t = time.perf_counter()
-    rx.search(probe)
-    return (time.perf_counter() - t) > 0.05
+    try:
+        for pr in probes:
+            rx.search(pr)
+            if time.perf_counter() - t > 0.1:
+                return True
+    except Exception:  # noqa: BLE001
+        return True
+    return False
 
 
 class Policy:
@@ -105,8 +133,13 @@ class Policy:
             self._last_check = now
             try:
                 m = os.stat(POLICY_PATH).st_mtime
-            except OSError:
+            except FileNotFoundError:
+                if self._mtime is None and not force:
+                    return
                 m = None
+            except OSError as e:
+                log.error("policy stat failed (%s); keeping previous policy", e)
+                return
             if m == self._mtime and not force:
                 return
             data = copy.deepcopy(DEFAULT_POLICY)
@@ -121,9 +154,12 @@ class Policy:
                         for c, v in loaded["categories"].items():
                             if c in data["categories"] and isinstance(v, dict):
                                 data["categories"][c]["block"] = bool(v.get("block", data["categories"][c]["block"]))
-                except Exception as e:  # noqa: BLE001 — keep the last good policy, do not fall back to defaults
+                except Exception as e:  # noqa: BLE001
                     log.error("policy read failed (%s); keeping previous policy", e)
                     return
+            elif self._mtime is not None:
+                log.error("policy file vanished; keeping previous policy")
+                return
             for c in LOCKED_CATEGORIES:
                 data["categories"][c]["block"] = True
             pats = []
@@ -152,35 +188,40 @@ POLICY = Policy()
 # ---------------------------------------------------------------------------
 SENTINEL_PATTERNS = [r"test[\s_]*sentinel[\s_]*block[\s_]*alpha"]
 MALWARE_PATTERNS = [
-    r"\b(reverse|bind)\s*shell\b",
-    r"\b(keylogger|ransomware|rootkit|botnet|credential\s*stealer|info\s*stealer)\b",
-    r"\bc2\s*(server|beacon|framework)\b",
-    r"\b(bypass|evade|disable)\s+(the\s+)?(edr|antivirus|anti-virus|defender|amsi|security\s*controls?)\b",
-    r"\b(write|create|build|make)\s+(me\s+)?(a\s+|some\s+)?(malware|a\s+virus|a\s+worm|a\s+trojan)\b",
+    r"\b(reverse|bind)[\s\W_]*shell\b",
+    r"\b(keylogger|ransomware|rootkit|botnet|credential[\s\W_]*stealer|info[\s\W_]*stealer)\b",
+    r"\bc2[\s\W_]*(server|beacon|framework)\b",
+    r"\b(bypass|evade|disable)[\s\W_]+(the[\s\W_]+)?(edr|antivirus|anti-virus|defender|amsi|security[\s\W_]*controls?)\b",
+    r"\b(write|create|build|make)[\s\W_]+(me[\s\W_]+)?(a[\s\W_]+|some[\s\W_]+)?(malware|a[\s\W_]+virus|a[\s\W_]+worm|a[\s\W_]+trojan)\b",
 ]
 CSAM_PATTERNS = [
     r"\b(child|children|underage|minor|minors|teen|teens|infant|toddler|preteen|kid|kids)\b"
     r".{0,60}?\b(porn|pornograph\w*|sex\w*|nude|naked|erotic\w*|explicit|molest\w*|abuse\w*)\b",
     r"\b(csam|csem|pedophil\w*|paedophil\w*|loli\w*|shota\w*)\b",
 ]
-DESPACED_PATTERNS = [r"testsentinelblockalpha", r"csam", r"pedophil", r"paedophil"]
+DESPACED_PATTERNS = [r"testsentinelblockalpha", r"csam", r"pedophil", r"paedophil",
+                     r"reverseshell", r"bindshell", r"keylogger", r"ransomware", r"rootkit", r"c2beacon"]
 
 _FLAGS = re.IGNORECASE | re.DOTALL
 SENTINEL_RE = [re.compile(p, _FLAGS) for p in SENTINEL_PATTERNS]
 MALWARE_RE = [re.compile(p, _FLAGS) for p in MALWARE_PATTERNS]
 CSAM_RE = [re.compile(p, _FLAGS) for p in CSAM_PATTERNS]
 DESPACED_RE = [re.compile(p, _FLAGS) for p in DESPACED_PATTERNS]
-OUTPUT_TRIPWIRES = ("sentinel", "csam", "extra")   # malware phrases legitimately appear in defensive answers
+OUTPUT_TRIPWIRES = ("sentinel", "csam", "extra")
 
 WS_RE = re.compile(r"\s+")
 NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
-B64_RUN_RE = re.compile(r"[A-Za-z0-9+/_-]{24,}={0,2}")
+B64_RUN_RE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{16,}={0,2}(?![A-Za-z0-9+/_-])")
 MAX_SCAN_CHARS = 2_000_000
-# Common cross-script confusables -> Latin (Cyrillic / Greek letters that render like ASCII)
 CONFUSABLES = str.maketrans({
-    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y", "і": "i", "ј": "j", "ѕ": "s", "ԁ": "d", "ɡ": "g",
-    "А": "A", "Е": "E", "О": "O", "Р": "P", "С": "C", "Х": "X", "У": "Y", "І": "I", "Ј": "J", "Ѕ": "S", "К": "K", "М": "M", "Н": "H", "Т": "T", "В": "B",
-    "α": "a", "ο": "o", "ε": "e", "ι": "i", "ν": "v", "κ": "k", "ρ": "p", "τ": "t", "υ": "u", "χ": "x", "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X",
+    # Cyrillic lower/upper -> Latin
+    "а": "a", "в": "b", "е": "e", "к": "k", "м": "m", "н": "h", "о": "o", "р": "p", "с": "c", "т": "t", "х": "x", "у": "y",
+    "і": "i", "ј": "j", "ѕ": "s", "ԁ": "d", "ɡ": "g", "ԛ": "q", "ԝ": "w", "ӏ": "l", "ь": "b", "ғ": "f", "ԍ": "g",
+    "А": "A", "В": "B", "Е": "E", "К": "K", "М": "M", "Н": "H", "О": "O", "Р": "P", "С": "C", "Т": "T", "Х": "X", "У": "Y",
+    "І": "I", "Ј": "J", "Ѕ": "S", "Ԁ": "D", "Ԛ": "Q", "Ԝ": "W",
+    # Greek lower/upper -> Latin
+    "α": "a", "β": "b", "ε": "e", "ι": "i", "κ": "k", "ν": "v", "ο": "o", "ρ": "p", "τ": "t", "υ": "u", "χ": "x", "γ": "y", "η": "n", "μ": "u",
+    "Α": "A", "Β": "B", "Ε": "E", "Ζ": "Z", "Η": "H", "Ι": "I", "Κ": "K", "Μ": "M", "Ν": "N", "Ο": "O", "Ρ": "P", "Τ": "T", "Υ": "Y", "Χ": "X",
 })
 
 
@@ -192,18 +233,50 @@ def normalise(text: str) -> str:
     return WS_RE.sub(" ", text).lower()
 
 
+B64_BLOCK_RE = re.compile(r"(?:[A-Za-z0-9+/_-]{4,}={0,2}[ \t]*\r?\n){2,}[A-Za-z0-9+/_-]{4,}={0,2}")
+
+
 def _decoded_b64_fragments(text: str) -> list[str]:
     out = []
-    for m in B64_RUN_RE.finditer(re.sub(r"[\r\n\t ]", "", text) if len(text) < 200_000 else text):
-        s = m.group(0).replace("-", "+").replace("_", "/")
+    joined = " ".join(re.sub(r"\s+", "", m.group(0)) for m in B64_BLOCK_RE.finditer(text))
+    for m in B64_RUN_RE.finditer(text + ("\n" + joined if joined else "")):
+        s = m.group(0).rstrip("=").replace("-", "+").replace("_", "/")
         s += "=" * (-len(s) % 4)
         try:
             dec = base64.b64decode(s, validate=True).decode("utf-8")
         except (binascii.Error, ValueError, UnicodeDecodeError):
             continue
-        if dec.isprintable() or "\n" in dec:
+        if dec.strip() and all(ch.isprintable() or ch in "\n\t\r" for ch in dec):
             out.append(dec)
     return out
+
+
+def _unescape_json_string(s: str) -> str:
+    """Tool-call arguments arrive as serialized JSON; recover the string leaves for scanning."""
+    try:
+        return "\n".join(_string_leaves(json.loads(s), 0))
+    except (ValueError, TypeError):
+        pass
+    except SchemaBudgetExceeded:
+        raise
+    try:
+        return json.loads(f'"{s}"') if "\\" in s else s
+    except ValueError:
+        return s
+
+
+def _string_leaves(obj: Any, depth: int, budget: list | None = None) -> list[str]:
+    budget = budget if budget is not None else [MAX_SCHEMA_NODES]
+    if budget[0] <= 0 or depth > 24:
+        raise SchemaBudgetExceeded("schema/argument structure exceeds scan budget")
+    budget[0] -= 1
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, dict):
+        return [str(k) for k in obj.keys()] + [s for v in obj.values() for s in _string_leaves(v, depth + 1, budget)]
+    if isinstance(obj, list):
+        return [s for v in obj for s in _string_leaves(v, depth + 1, budget)]
+    return []
 
 
 def _content_to_text(content: Any) -> str:
@@ -212,10 +285,20 @@ def _content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        return "\n".join(
-            str(p.get("text", "")) if isinstance(p, dict) and p.get("type") == "text" else (p if isinstance(p, str) else "")
-            for p in content
-        )
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict):
+                for k in ("text", "input_text", "content", "refusal"):
+                    v = p.get(k)
+                    if isinstance(v, str):
+                        parts.append(v)
+                    elif isinstance(v, list):
+                        parts.append(_content_to_text(v))
+        return "\n".join(x for x in parts if x)
+    if isinstance(content, dict):
+        return "\n".join(_string_leaves(content, 0))
     return str(content)
 
 
@@ -223,99 +306,88 @@ def _tool_calls_text(tcs: Any) -> str:
     parts = []
     for tc in tcs or []:
         fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", None)
-        name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
-        args = fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")
-        parts.append(f"{name} {args}")
+        name = (fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")) or ""
+        args = (fn.get("arguments", "") if isinstance(fn, dict) else getattr(fn, "arguments", "")) or ""
+        parts.append(f"{name} {_unescape_json_string(args) if isinstance(args, str) else _content_to_text(args)}")
     return "\n".join(parts)
 
 
-def _schema_text(obj: Any, depth: int = 0) -> str:
-    """All string leaves of tool/function schemas (descriptions, enums, defaults)."""
-    if depth > 8:
-        return ""
-    if isinstance(obj, str):
-        return obj
-    if isinstance(obj, dict):
-        return "\n".join(_schema_text(v, depth + 1) for v in obj.values())
-    if isinstance(obj, list):
-        return "\n".join(_schema_text(v, depth + 1) for v in obj)
-    return ""
+class SchemaBudgetExceeded(Exception):
+    pass
 
 
-def collect_request_text(data: dict) -> list[str]:
-    """Everything the caller supplied that steers this request.
+class RequestView:
+    """Everything scannable in a request, plus the conversation window for multi-turn classification."""
 
-    Latest user turn and every message after it (assistant prefill, tool results, assistant tool_calls),
-    top-level `system`, `prompt`, `input`, and tool/function schema text. If there is no user message
-    at all, every message is scanned.
-    """
-    msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
-    last_user = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=None)
-    scope = msgs[last_user:] if last_user is not None else msgs
-    texts: list[str] = []
-    for m in scope:
-        texts.append(_content_to_text(m.get("content")))
-        if m.get("tool_calls"):
-            texts.append(_tool_calls_text(m.get("tool_calls")))
-    # system prompts from the caller (OpenAI-style role or provider-style top-level key)
-    for m in msgs:
-        if m.get("role") in ("system", "developer") and m is not scope[0] if scope else True:
-            texts.append(_content_to_text(m.get("content")))
-    if data.get("system"):
-        texts.append(_content_to_text(data.get("system")))
-    for key in ("prompt", "input"):
-        v = data.get(key)
-        if isinstance(v, list):
-            texts.extend(str(x) for x in v)
-        elif v:
-            texts.append(str(v))
-    for key in ("tools", "functions"):
-        if data.get(key):
-            texts.append(_schema_text(data.get(key)))
-    return [t for t in texts if t and t.strip()]
-
-
-def _candidates(t: str) -> list[str]:
-    n = normalise(t)
-    return [n, *(normalise(f) for f in _decoded_b64_fragments(t))]
+    def __init__(self, data: dict):
+        msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
+        self.has_payload = bool(msgs or data.get("prompt") or data.get("input") or data.get("system"))
+        texts: list[str] = []
+        self.turns: list[dict] = []
+        for m in msgs:
+            t = _content_to_text(m.get("content"))
+            if m.get("tool_calls"):
+                t = (t + "\n" + _tool_calls_text(m.get("tool_calls"))).strip()
+            if t:
+                texts.append(t)
+                role = m.get("role", "user")
+                if role == "tool":
+                    t = "Tool result: " + t
+                self.turns.append({"role": "assistant" if role == "assistant" else "user", "content": t})
+        self.last_user = next((_content_to_text(m.get("content")) for m in reversed(msgs) if m.get("role") == "user"), "")
+        last_user_idx = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=0)
+        self.new_segment = [t for t in (_content_to_text(m.get("content")) for m in msgs[last_user_idx:]) if t]
+        if data.get("system"):
+            sysx = _content_to_text(data.get("system"))
+            texts.append(sysx); self.new_segment.append(sysx)
+            self.turns.insert(0, {"role": "user", "content": "System instructions: " + sysx})
+        for key in ("prompt", "input"):
+            v = data.get(key)
+            if isinstance(v, list):
+                texts.extend(str(x) for x in v)
+                self.new_segment.extend(str(x) for x in v)
+            elif v:
+                texts.append(str(v)); self.new_segment.append(str(v))
+        for key in ("tools", "functions"):
+            if data.get(key):
+                sch = "\n".join(_string_leaves(data.get(key), 0))
+                texts.append(sch); self.new_segment.append(sch)
+        self.decoded = [d for t in texts for d in _decoded_b64_fragments(t)]
+        self.all_texts = [t for t in texts + self.decoded if t and t.strip()]
+        self.new_texts = [t for t in self.new_segment + self.decoded if t and t.strip()]
 
 
 def scan(texts: Iterable[str], patterns: list[re.Pattern]) -> str | None:
     if not patterns:
         return None
     for t in texts:
-        for c in _candidates(t):
-            for p in patterns:
-                if p.search(c):
-                    return p.pattern
+        n = normalise(t)
+        for p in patterns:
+            if p.search(n):
+                return p.pattern
     return None
 
 
 def scan_despaced(texts: Iterable[str]) -> str | None:
     for t in texts:
-        for c in _candidates(t):
-            d = NON_ALNUM_RE.sub("", c)
-            for p in DESPACED_RE:
-                if p.search(d):
-                    return p.pattern
+        d = NON_ALNUM_RE.sub("", normalise(t))
+        for p in DESPACED_RE:
+            if p.search(d):
+                return p.pattern
     return None
 
 
 def tripwire_check(texts: list[str], lists: tuple[str, ...]) -> tuple[str, str] | None:
-    """Run the named tripwire lists; returns (list_name, pattern) on first hit. Synchronous; run under a budget."""
     table = {"sentinel": SENTINEL_RE, "csam": CSAM_RE, "malware": MALWARE_RE, "extra": POLICY.extra_re}
     for name in lists:
         hit = scan(texts, table[name])
         if hit:
             return name, hit
     hit = scan_despaced(texts)
-    if hit:
-        return "despaced", hit
-    return None
+    return ("despaced", hit) if hit else None
 
 
-async def tripwires(texts: list[str], lists: tuple[str, ...]) -> tuple[str, str] | None | str:
-    """Returns hit tuple, None, or the string 'timeout' if the regex budget was exhausted (ReDoS guard)."""
+async def tripwires(texts: list[str], lists: tuple[str, ...]):
     try:
         return await asyncio.wait_for(asyncio.to_thread(tripwire_check, texts, lists), timeout=SCAN_BUDGET_S)
     except asyncio.TimeoutError:
@@ -323,33 +395,55 @@ async def tripwires(texts: list[str], lists: tuple[str, ...]) -> tuple[str, str]
 
 
 # ---------------------------------------------------------------------------
-# Audit (off the event loop; rotates)
+# Audit: one bounded queue, one writer thread, locked rotation
 # ---------------------------------------------------------------------------
+_AUDIT_Q: queue.Queue = queue.Queue(maxsize=10000)
+
+
+def _audit_writer() -> None:
+    while True:
+        rec = _AUDIT_Q.get()
+        try:
+            os.makedirs(os.path.dirname(AUDIT_PATH), exist_ok=True)
+            with open(AUDIT_PATH + ".lock", "a") as lk:
+                fcntl.flock(lk, fcntl.LOCK_EX)
+                try:
+                    try:
+                        if os.path.getsize(AUDIT_PATH) > AUDIT_ROTATE_BYTES:
+                            os.replace(AUDIT_PATH, AUDIT_PATH + "." + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
+                    except OSError:
+                        pass
+                    with open(AUDIT_PATH, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(rec) + "\n")
+                finally:
+                    fcntl.flock(lk, fcntl.LOCK_UN)
+        except OSError as e:
+            log.error("audit write failed: %s", e)
+        finally:
+            _AUDIT_Q.task_done()
+
+
+threading.Thread(target=_audit_writer, name="veto-audit-writer", daemon=True).start()
+
+
 def _key_alias(key_dict: Any) -> str | None:
     if isinstance(key_dict, dict):
         return key_dict.get("key_alias") or key_dict.get("user_id")
     return getattr(key_dict, "key_alias", None) or getattr(key_dict, "user_id", None)
 
 
-def _audit_write(rec: dict) -> None:
-    try:
-        os.makedirs(os.path.dirname(AUDIT_PATH), exist_ok=True)
-        try:
-            if os.path.getsize(AUDIT_PATH) > AUDIT_ROTATE_BYTES:
-                os.replace(AUDIT_PATH, AUDIT_PATH + "." + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
-        except OSError:
-            pass
-        with open(AUDIT_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec) + "\n")
-    except OSError as e:
-        log.error("audit write failed: %s", e)
+def _short_err(e: Any) -> str:
+    return f"{type(e).__name__}: {str(e).splitlines()[0][:80]}" if isinstance(e, BaseException) else str(e)[:120]
 
 
 def audit(stage: str, reason: str, detail: str, data: dict, key_dict: Any) -> None:
-    rec = {"ts": datetime.now(timezone.utc).isoformat(), "stage": stage, "reason": reason, "detail": detail[:200],
+    rec = {"ts": datetime.now(timezone.utc).isoformat(), "stage": stage, "reason": reason, "detail": detail.splitlines()[0][:120] if detail else "",
            "call_id": data.get("litellm_call_id"), "model": data.get("model"), "key_alias": _key_alias(key_dict)}
     log.warning("VETO %s", json.dumps(rec))
-    threading.Thread(target=_audit_write, args=(rec,), daemon=True).start()
+    try:
+        _AUDIT_Q.put_nowait(rec)
+    except queue.Full:
+        log.error("audit queue full; event dropped from file (still in process log)")
 
 
 def _refuse(status: int, code: str, message: str) -> None:
@@ -357,10 +451,34 @@ def _refuse(status: int, code: str, message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Classifier (Llama Guard via Ollama)
+# Classifier (Llama Guard via Ollama): shared client, process-wide concurrency, short-circuit
 # ---------------------------------------------------------------------------
 class GuardUnavailable(Exception):
     pass
+
+
+_CLIENT: httpx.AsyncClient | None = None
+_CLIENT_LOOP: asyncio.AbstractEventLoop | None = None
+_SEM: asyncio.Semaphore | None = None
+_SEM_LOOP: asyncio.AbstractEventLoop | None = None
+_SEM_N: int = 0
+
+
+def _client() -> httpx.AsyncClient:
+    global _CLIENT, _CLIENT_LOOP
+    loop = asyncio.get_running_loop()
+    if _CLIENT is None or _CLIENT_LOOP is not loop:
+        _CLIENT, _CLIENT_LOOP = httpx.AsyncClient(timeout=float(POLICY.guard.get("timeout", 60)), limits=httpx.Limits(max_connections=16)), loop
+    return _CLIENT
+
+
+def _sem() -> asyncio.Semaphore:
+    global _SEM, _SEM_LOOP, _SEM_N
+    loop = asyncio.get_running_loop()
+    n = int(POLICY.guard.get("concurrency", 2))
+    if _SEM is None or _SEM_LOOP is not loop or _SEM_N != n:
+        _SEM, _SEM_LOOP, _SEM_N = asyncio.Semaphore(n), loop, n
+    return _SEM
 
 
 async def _guard_call(messages: list[dict]) -> tuple[bool, list[str]]:
@@ -368,10 +486,10 @@ async def _guard_call(messages: list[dict]) -> tuple[bool, list[str]]:
     payload = {"model": g["model"], "messages": messages, "stream": False,
                "options": {"temperature": 0, "num_predict": 32, "num_ctx": 8192}}
     try:
-        async with httpx.AsyncClient(timeout=float(g.get("timeout", 60))) as client:
-            r = await client.post(f"{GUARD_URL}/api/chat", json=payload)
-            r.raise_for_status()
-            verdict = (r.json().get("message", {}).get("content") or "").strip().lower()
+        async with _sem():
+            r = await _client().post(f"{GUARD_URL}/api/chat", json=payload, timeout=float(g.get("timeout", 60)))
+        r.raise_for_status()
+        verdict = (r.json().get("message", {}).get("content") or "").strip().lower()
     except Exception as e:  # noqa: BLE001
         raise GuardUnavailable(str(e)) from e
     lines = [l.strip() for l in verdict.splitlines() if l.strip()]
@@ -382,7 +500,6 @@ async def _guard_call(messages: list[dict]) -> tuple[bool, list[str]]:
     if lines[0] == "unsafe":
         cats = [c.upper() for c in re.findall(r"s\d{1,2}", " ".join(lines[1:]))]
         return True, cats or ["UNSPECIFIED"]
-    # Anything else is not a verdict; treat as unsafe/unspecified (fail-closed) and log the shape.
     log.error("unexpected guard verdict shape: %r", verdict[:80])
     return True, ["UNPARSEABLE_VERDICT"]
 
@@ -399,36 +516,81 @@ def _blocked_subset(cats: list[str]) -> list[str]:
     return [c for c in cats if c in blocked or c in ("UNSPECIFIED", "UNPARSEABLE_VERDICT")]
 
 
-async def _classify_chunks(build: Any, chunks: list[str]) -> tuple[bool, list[str]]:
-    sem = asyncio.Semaphore(int(POLICY.guard.get("concurrency", 2)))
+async def _classify_many(calls: list[list[dict]]) -> tuple[bool, list[str]]:
+    """Run classifier calls; the first blocked verdict cancels the rest."""
+    tasks = [asyncio.ensure_future(_guard_call(m)) for m in calls if m]
+    try:
+        for fut in asyncio.as_completed(tasks):
+            unsafe, cats = await fut
+            if unsafe and (b := _blocked_subset(cats)):
+                return True, b
+        return False, []
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
 
-    async def one(ch: str):
-        async with sem:
-            return await _guard_call(build(ch))
 
-    results = await asyncio.gather(*(one(ch) for ch in chunks if ch.strip()))
-    for unsafe, cats in results:
-        if unsafe and (b := _blocked_subset(cats)):
-            return True, b
-    return False, []
+def _headtail(text: str, n: int) -> str:
+    return text if len(text) <= n else text[: n // 2] + "\n…\n" + text[-(n // 2):]
 
 
-async def classify_request(texts: list[str]) -> tuple[bool, list[str]]:
-    chunks = _chunks("\n".join(texts))
+def _window(turns: list[dict]) -> list[dict]:
+    n = int(POLICY.guard.get("chunk_chars", 6000))
+    w = turns[-CONVERSATION_WINDOW:]
+    return [{"role": t["role"], "content": _headtail(t["content"], n)} for t in w]
+
+
+async def classify_request(view: RequestView) -> tuple[bool, list[str]]:
+    chunks = _chunks("\n".join(view.new_texts))
     if len(chunks) > int(POLICY.guard.get("max_chunks", 100)):
         _refuse(413, "prompt_too_long_for_guard", "Input exceeds the classifier budget.")
-    return await _classify_chunks(lambda ch: [{"role": "user", "content": ch}], chunks)
+    calls = [[{"role": "user", "content": ch}] for ch in chunks if ch.strip()]
+    w = _window(view.turns)
+    if w and w[-1]["role"] == "user" and len(w) > 1:
+        calls.append(w)                                   # multi-turn context classification
+    return await _classify_many(calls)
 
 
-async def classify_output(request_text: str, output: str) -> tuple[bool, list[str]]:
-    if not output.strip():
+async def classify_output(user_turn: str, outputs: list[str]) -> tuple[bool, list[str]]:
+    text = "\n".join(o for o in outputs if o and o.strip())
+    if not text.strip():
         return False, []
-    chunks = _chunks(output)
+    chunks = _chunks(text)
     if len(chunks) > int(POLICY.guard.get("max_chunks", 100)):
         return True, ["OUTPUT_TOO_LONG_FOR_GUARD"]
     n = int(POLICY.guard.get("chunk_chars", 6000))
-    user_ctx = request_text[-n:]   # the instruction is usually at the end of a long prompt
-    return await _classify_chunks(lambda ch: [{"role": "user", "content": user_ctx}, {"role": "assistant", "content": ch}], chunks)
+    ctx = _headtail(user_turn or "", n) or "(no user text)"
+    return await _classify_many([[{"role": "user", "content": ctx}, {"role": "assistant", "content": ch}] for ch in chunks if ch.strip()])
+
+
+# ---------------------------------------------------------------------------
+# Response extraction (dict or object; content, reasoning, tool calls; every choice)
+# ---------------------------------------------------------------------------
+def _g(o: Any, k: str, default=None):
+    return o.get(k, default) if isinstance(o, dict) else getattr(o, k, default)
+
+
+REASONING_KEYS = ("reasoning_content", "reasoning", "thinking", "refusal")
+
+
+def _message_outputs(msg: Any) -> list[str]:
+    out = [_content_to_text(_g(msg, "content"))]
+    for k in REASONING_KEYS:
+        v = _g(msg, k)
+        if v:
+            out.append(_content_to_text(v))
+    out.append(_tool_calls_text(_g(msg, "tool_calls")))
+    return [o for o in out if o]
+
+
+def extract_outputs(response: Any) -> list[str]:
+    outs = []
+    for c in _g(response, "choices", None) or []:
+        msg = _g(c, "message", None) or _g(c, "delta", None)
+        if msg is not None:
+            outs.extend(_message_outputs(msg))
+    return outs
 
 
 # ---------------------------------------------------------------------------
@@ -437,11 +599,18 @@ async def classify_output(request_text: str, output: str) -> tuple[bool, list[st
 class VetoGuard(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         POLICY.reload()
-        texts = collect_request_text(data)
-        if not texts:
+        try:
+            view = RequestView(data)
+        except SchemaBudgetExceeded as e:
+            audit("pre_call", "schema_budget_exceeded", str(e), data, user_api_key_dict)
+            _refuse(413, "veto_triggered", "Request structure too large to evaluate; refused (fail-closed).")
+        if not view.all_texts:
+            if view.has_payload:
+                audit("pre_call", "no_scannable_text", call_type or "", data, user_api_key_dict)
+                _refuse(400, "veto_triggered", "Request carries content that cannot be evaluated; refused (fail-closed).")
             return data
         if POLICY.data["tripwires"].get("enabled", True):
-            hit = await tripwires(texts, ("sentinel", "csam", "malware", "extra"))
+            hit = await tripwires(view.all_texts, ("sentinel", "csam", "malware", "extra"))
             if hit == "timeout":
                 audit("pre_call", "regex_budget_exhausted", "", data, user_api_key_dict)
                 _refuse(400, "veto_triggered", "Request refused by policy.")
@@ -449,9 +618,9 @@ class VetoGuard(CustomLogger):
                 audit("pre_call", f"regex:{hit[0]}", hit[1], data, user_api_key_dict)
                 _refuse(400, "veto_triggered", "Request refused by policy.")
         try:
-            unsafe, cats = await classify_request(texts)
+            unsafe, cats = await classify_request(view)
         except GuardUnavailable as e:
-            audit("pre_call", "guard_unavailable", str(e), data, user_api_key_dict)
+            audit("pre_call", "guard_unavailable", _short_err(e), data, user_api_key_dict)
             _refuse(503, "guard_unavailable", "Safety classifier unavailable; request refused (fail-closed).")
         if unsafe:
             audit("pre_call", "classifier", ",".join(cats), data, user_api_key_dict)
@@ -459,18 +628,20 @@ class VetoGuard(CustomLogger):
         return data
 
     async def _check_output(self, stage: str, data: dict, key: Any, outputs: list[str]) -> list[str] | None:
-        """Returns None if the output may be released, else the reason list (never raises for policy hits)."""
+        outputs = [o for o in outputs if o and o.strip()]
+        outputs += [d for o in outputs for d in _decoded_b64_fragments(o)]
+        if not outputs:
+            return None
         if POLICY.data["tripwires"].get("enabled", True):
             hit = await tripwires(outputs, OUTPUT_TRIPWIRES)
             if hit == "timeout":
                 audit(stage, "regex_budget_exhausted", "", data, key); return ["REGEX_BUDGET"]
             if hit:
                 audit(stage, f"regex:{hit[0]}", hit[1], data, key); return [hit[0]]
-        req_text = "\n".join(collect_request_text(data))
         try:
-            unsafe, cats = await classify_output(req_text, "\n".join(outputs))
+            unsafe, cats = await classify_output(RequestView(data).last_user, outputs)
         except GuardUnavailable as e:
-            audit(stage, "guard_unavailable", str(e), data, key); return ["GUARD_UNAVAILABLE"]
+            audit(stage, "guard_unavailable", _short_err(e), data, key); return ["GUARD_UNAVAILABLE"]
         if unsafe:
             audit(stage, "classifier", ",".join(cats), data, key); return cats
         return None
@@ -478,15 +649,14 @@ class VetoGuard(CustomLogger):
     async def async_post_call_success_hook(self, data, user_api_key_dict, response):
         POLICY.reload()
         try:
-            outputs = []
-            for c in getattr(response, "choices", []) or []:
-                msg = getattr(c, "message", None)
-                outputs.append(_content_to_text(getattr(msg, "content", None)))
-                outputs.append(_tool_calls_text(getattr(msg, "tool_calls", None)))
+            outputs = extract_outputs(response)
         except Exception as e:  # noqa: BLE001 — fail closed
-            audit("post_call", "extraction_failure", str(e), data, user_api_key_dict)
+            audit("post_call", "extraction_failure", _short_err(e), data, user_api_key_dict)
             _refuse(500, "safety_processing_error", "Response could not be evaluated; withheld (fail-closed).")
-        reasons = await self._check_output("post_call", data, user_api_key_dict, [o for o in outputs if o])
+        if (_g(response, "choices", None) or []) and not outputs:
+            audit("post_call", "no_scannable_output", "", data, user_api_key_dict)
+            _refuse(400, "veto_triggered", "Response could not be evaluated; withheld (fail-closed).")
+        reasons = await self._check_output("post_call", data, user_api_key_dict, outputs)
         if reasons:
             if "GUARD_UNAVAILABLE" in reasons:
                 _refuse(503, "guard_unavailable", "Safety classifier unavailable; response withheld (fail-closed).")
@@ -494,49 +664,79 @@ class VetoGuard(CustomLogger):
         return response
 
     async def async_post_call_streaming_iterator_hook(self, user_api_key_dict, response, request_data: dict) -> AsyncGenerator:
-        """Buffer the whole stream, classify, then release (or withhold). Nothing unclassified is sent."""
+        """Buffer the whole stream, classify every choice, then release (or withhold). Nothing unclassified is sent."""
         POLICY.reload()
-        buffered, text_parts, tool_parts, size = [], [], {}, 0
-        withheld = None
+        buffered, per_choice, size, withheld = [], {}, 0, None
         async for chunk in response:
             buffered.append(chunk)
             try:
-                choices = getattr(chunk, "choices", None) or []
-                if choices:
-                    delta = getattr(choices[0], "delta", None)
-                    piece = getattr(delta, "content", None) or ""
-                    text_parts.append(piece); size += len(piece)
-                    for tc in getattr(delta, "tool_calls", None) or []:
-                        idx = getattr(tc, "index", 0) or 0
-                        fn = getattr(tc, "function", None)
-                        tool_parts.setdefault(idx, [getattr(fn, "name", "") or "", ""])
-                        tool_parts[idx][0] = tool_parts[idx][0] or (getattr(fn, "name", "") or "")
-                        tool_parts[idx][1] += getattr(fn, "arguments", "") or ""
-                        size += len(getattr(fn, "arguments", "") or "")
+                for ch in _g(chunk, "choices", None) or []:
+                    idx = _g(ch, "index", 0) or 0
+                    delta = _g(ch, "delta", None)
+                    if delta is None:
+                        continue
+                    slot = per_choice.setdefault(idx, {"text": [], "reason": [], "tools": {}})
+                    piece = _content_to_text(_g(delta, "content"))
+                    if piece:
+                        slot["text"].append(piece); size += len(piece)
+                    for k in REASONING_KEYS:
+                        v = _g(delta, k)
+                        if v:
+                            slot["reason"].append(_content_to_text(v)); size += len(str(v))
+                    for tc in _g(delta, "tool_calls", None) or []:
+                        ti = _g(tc, "index", 0) or 0
+                        fn = _g(tc, "function", None)
+                        t = slot["tools"].setdefault(ti, ["", ""])
+                        t[0] = t[0] or (_g(fn, "name", "") or "")
+                        args = _g(fn, "arguments", "") or ""
+                        t[1] += args; size += len(args)
             except Exception as e:  # noqa: BLE001 — fail closed
-                audit("post_call_stream", "extraction_failure", str(e), request_data, user_api_key_dict)
-                withheld = ["EXTRACTION_FAILURE"]
+                audit("post_call_stream", "extraction_failure", _short_err(e), request_data, user_api_key_dict)
+                withheld = ["EXTRACTION_FAILURE"]; break
             if size > MAX_OUTPUT_CHARS:
                 audit("post_call_stream", "output_buffer_cap", str(size), request_data, user_api_key_dict)
-                withheld = ["OUTPUT_TOO_LONG"]
-                break
+                withheld = ["OUTPUT_TOO_LONG"]; break
         if not buffered:
             return
         if withheld is None:
-            outputs = ["".join(text_parts)] + [f"{n} {a}" for n, a in tool_parts.values()]
-            withheld = await self._check_output("post_call_stream", request_data, user_api_key_dict, [o for o in outputs if o.strip()])
+            outputs = []
+            for slot in per_choice.values():
+                outputs.append("".join(slot["text"]))
+                outputs.extend(slot["reason"])
+                outputs.extend(f"{n} {_unescape_json_string(a)}" for n, a in slot["tools"].values())
+            if any(_g(c, "choices", None) for c in buffered) and not any(o and o.strip() for o in outputs):
+                audit("post_call_stream", "no_scannable_output", "", request_data, user_api_key_dict)
+                withheld = ["NO_SCANNABLE_OUTPUT"]
+            else:
+                withheld = await self._check_output("post_call_stream", request_data, user_api_key_dict, outputs)
         if withheld is None:
             for c in buffered:
                 yield c
             return
-        # Synthetic terminal chunk; never raise after headers are committed.
         try:
-            first = copy.deepcopy(buffered[0])
-            first.choices[0].delta.content = WITHHELD_MSG
-            first.choices[0].delta.tool_calls = None
-            first.choices[0].finish_reason = "content_filter"
+            src = next((c for c in buffered if _g(c, "choices", None)), None)
+            if src is None:
+                return
+            first = copy.deepcopy(src)
+            for ch in _g(first, "choices"):
+                d = _g(ch, "delta", None)
+                if d is not None:
+                    if isinstance(d, dict):
+                        d["content"], d["tool_calls"] = WITHHELD_MSG, None
+                        for k in REASONING_KEYS:
+                            d.pop(k, None)
+                    else:
+                        d.content, d.tool_calls = WITHHELD_MSG, None
+                        for k in REASONING_KEYS:
+                            if hasattr(d, k):
+                                try: setattr(d, k, None)
+                                except Exception: pass  # noqa: BLE001
+                if isinstance(ch, dict):
+                    ch["finish_reason"] = "content_filter"
+                else:
+                    ch.finish_reason = "content_filter"
             yield first
-        except Exception:  # noqa: BLE001 — if even that fails, end the stream with nothing released
+        except Exception:  # noqa: BLE001
             return
 
 

@@ -90,6 +90,8 @@ NAV = [
 
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
+REQ = threading.local()          # per-request: REQ.q (query dict), REQ.path
+PAGE_SIZES = (10, 25, 50, 100)
 
 
 # ---------------------------------------------------------------- utilities ----------------
@@ -113,6 +115,7 @@ def save_json(path, data) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=1)
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)
 
 
@@ -176,6 +179,31 @@ def tail_jsonl(path, n=200):
         except ValueError:
             continue
     return out
+
+
+
+def q(key, default=""):
+    return getattr(REQ, "q", {}).get(key, [default])[0]
+
+
+def paginate(rows, key, default_per=25):
+    """Slice rows for table `key` using ?<key>_per=&<key>_page=; returns (page_rows, controls_html)."""
+    try: per = int(q(f"{key}_per", default_per))
+    except ValueError: per = default_per
+    per = per if per in PAGE_SIZES else default_per
+    total = len(rows); pages = max(1, (total + per - 1) // per)
+    try: pg = min(max(1, int(q(f"{key}_page", 1))), pages)
+    except ValueError: pg = 1
+    path = getattr(REQ, "path", "/hub")
+    other = {k: v[0] for k, v in getattr(REQ, "q", {}).items() if not k.startswith(key + "_")}
+    def link(p, n):
+        params = {**other, f"{key}_per": str(n), f"{key}_page": str(p)}
+        return path + "?" + urllib.parse.urlencode(params)
+    sizes = " ".join(f'<a href="{link(1, n)}"{" class=on" if n == per else ""}>{n}</a>' for n in PAGE_SIZES)
+    prev = f'<a href="{link(pg - 1, per)}">&larr; prev</a>' if pg > 1 else '<span class="mut">&larr; prev</span>'
+    nxt = f'<a href="{link(pg + 1, per)}">next &rarr;</a>' if pg < pages else '<span class="mut">next &rarr;</span>'
+    ctl = f'<div class="pager"><span>per page: {sizes}</span><span>{prev} &nbsp; page {pg} / {pages} &nbsp; {nxt}</span><span class="mut">{total} entries</span></div>'
+    return rows[(pg - 1) * per: pg * per], ctl
 
 
 # ---------------------------------------------------------------- domain objects ----------
@@ -309,17 +337,21 @@ def pull_job(model: str) -> str:
 # ---------------------------------------------------------------- HTML ---------------------
 CSS = """
 :root{--bg:#171717;--side:#0d0d0d;--card:#1f1f1f;--line:#2e2e2e;--fg:#ececec;--mut:#9a9a9a;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;--acc:#ececec}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,Inter,"Segoe UI",system-ui,sans-serif}
-a{color:inherit}.wrap{display:flex;min-height:100vh}
-nav{width:232px;flex:none;background:var(--side);border-right:1px solid var(--line);padding:18px 12px}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,Inter,"Segoe UI",system-ui,sans-serif}
+a{color:inherit}.wrap{display:flex;height:100vh;height:100dvh;overflow:hidden}
+nav{width:232px;flex:none;background:var(--side);border-right:1px solid var(--line);padding:18px 12px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:none;-ms-overflow-style:none;-webkit-overflow-scrolling:touch}nav::-webkit-scrollbar{display:none}
 nav .brand{font-weight:600;font-size:16px;padding:6px 10px 16px;letter-spacing:.2px}
-nav .cat{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.08em;padding:12px 10px 4px}
-nav a{display:block;padding:7px 10px;border-radius:8px;text-decoration:none;color:#cfcfcf}
+nav details{margin:2px 0}nav summary{list-style:none;cursor:pointer;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.08em;padding:10px 10px 4px;user-select:none;display:flex;justify-content:space-between;align-items:center}
+nav summary::-webkit-details-marker{display:none}nav summary::after{content:"+";font-size:13px;color:#666}nav details[open] summary::after{content:"–"}
+nav details[open] summary{color:#ddd}
+nav a{display:block;padding:7px 10px 7px 14px;border-radius:8px;text-decoration:none;color:#cfcfcf}
 nav a:hover{background:#1a1a1a}nav a.on{background:#262626;color:#fff}
-main{flex:1;padding:26px 34px;max-width:1180px}h1{font-size:20px;font-weight:600;margin:0 0 4px}h2{font-size:15px;font-weight:600;margin:22px 0 8px}
+main{flex:1;min-width:0;overflow-y:auto;padding:26px 34px}main>.inner{max-width:1180px}
+h1{font-size:20px;font-weight:600;margin:0 0 4px}h2{font-size:15px;font-weight:600;margin:22px 0 8px}
 .sub{color:var(--mut);margin:0 0 18px}.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:12px 0}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
 table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--mut);font-weight:500;font-size:12px}
+.card table{display:block;overflow-x:auto}
 .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;background:#2a2a2a;color:#ddd}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
 input,select,textarea{background:#111;color:var(--fg);border:1px solid #3a3a3a;border-radius:8px;padding:8px 10px;font:inherit;width:100%;max-width:520px}
 textarea{min-height:90px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
@@ -328,23 +360,23 @@ button.ghost{background:#2a2a2a;color:#eee}button.danger{background:var(--bad);c
 form.inline{display:inline}label{display:block;margin:10px 0 4px;color:#ccc}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
 pre{background:#0d0d0d;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12px;max-height:520px}
 .msg{padding:10px 14px;border-radius:10px;margin:0 0 14px;background:#1c2a1c;border:1px solid #2f5a2f}.msg.bad{background:#2a1c1c;border-color:#5a2f2f}
-.lock{opacity:.6}.key{font-family:ui-monospace,monospace;background:#0d0d0d;padding:6px 10px;border-radius:8px;display:inline-block;user-select:all}
-@media (max-width:760px){.wrap{flex-direction:column}nav{width:auto;border-right:0;border-bottom:1px solid var(--line)}main{padding:18px}}
+.pager{display:flex;gap:18px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin:8px 0 2px;font-size:12px;color:#bbb}.pager a{padding:2px 7px;border-radius:6px;background:#2a2a2a;text-decoration:none;margin:0 1px}.pager a.on{background:#3a3a3a;color:#fff}
+.lock{opacity:.6}.key{font-family:ui-monospace,monospace;background:#0d0d0d;padding:6px 10px;border-radius:8px;display:inline-block;user-select:all;word-break:break-all}
+@media (max-width:760px){.wrap{flex-direction:column;height:auto;overflow:visible}nav{width:auto;border-right:0;border-bottom:1px solid var(--line);overflow:visible}main{overflow:visible;padding:18px 16px}}
 """
 
 
 def page(section, sub, title, subtitle, body, msg="", ok=True):
     nav = ['<div class="brand">Aegis</div>']
     for sid, sname, subs in NAV:
-        nav.append(f'<div class="cat">{esc(sname)}</div>')
-        for ssid, ssname in subs:
-            on = "on" if (sid, ssid) == (section, sub) else ""
-            nav.append(f'<a class="{on}" href="/hub/{sid}/{ssid}">{esc(ssname)}</a>')
-    nav.append('<div class="cat">Apps</div><a href="/">Open WebUI ↗</a>' + ('<a href="/grafana/">Grafana ↗</a>' if GRAFANA_ENABLED else ''))
+        links = "".join(f'<a class="{"on" if (sid, ssid) == (section, sub) else ""}" href="/hub/{sid}/{ssid}">{esc(ssname)}</a>' for ssid, ssname in subs)
+        nav.append(f'<details{" open" if sid == section else ""}><summary>{esc(sname)}</summary>{links}</details>')
+    apps = '<a href="/">Open WebUI ↗</a>' + ('<a href="/grafana/">Grafana ↗</a>' if GRAFANA_ENABLED else '')
+    nav.append(f'<details><summary>Apps</summary>{apps}</details>')
     m = f'<div class="msg{"" if ok else " bad"}">{esc(msg)}</div>' if msg else ""
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Aegis Hub — {esc(title)}</title><style>{CSS}</style></head><body><div class="wrap"><nav>{''.join(nav)}</nav>
-<main><h1>{esc(title)}</h1><p class="sub">{esc(subtitle)}</p>{m}{body}</main></div></body></html>"""
+<main><div class="inner"><h1>{esc(title)}</h1><p class="sub">{esc(subtitle)}</p>{m}{body}</div></main></div></body></html>"""
 
 
 def csrf_field():
@@ -360,6 +392,10 @@ def p_dashboard(msg="", ok=True):
         f'{"up" if s["up"] else ("—" if s["up"] is None else "DOWN")} <span class="mut">{esc(s["code"])}</span></div></div>' for s in svc)
     models = installed_models(); loaded = [m for m in models if m["loaded"]]
     vram = ", ".join(f'{esc(m["name"])} ({m["vram"] / 2**30:.1f} GiB VRAM)' for m in loaded) or "nothing resident"
+    if loaded and all(m["vram"] == 0 for m in loaded):
+        vram += ' <span class="bad">— resident models have 0 VRAM: the inference container has lost its GPUs (NVML error). Console: <code>docker compose restart ollama</code>.</span>'
+        if msg == "":
+            msg, ok = "GPU residency lost — see Safety posture. Inference is running on CPU.", False
     certs = [probe_cert(LAN_IP)] + ([probe_cert(LAN_IP, current_domain())] if current_domain() else [])
     certrows = "".join(f'<tr><td>{esc(c["host"])}</td><td>{esc(c.get("issuer", c.get("error")))}</td><td class="{"warn" if c.get("days", 99) < 14 else "ok"}">{c.get("days", "—")}</td></tr>' for c in certs)
     events = tail_jsonl(VETO_AUDIT, 8)
@@ -373,8 +409,9 @@ def p_dashboard(msg="", ok=True):
 
 
 def p_services():
-    rows = "".join(f'<tr><td>{esc(s["name"])}</td><td><span class="tag">{esc(s["net"])}</span></td><td class="{"ok" if s["up"] else ("mut" if s["up"] is None else "bad")}">{"up" if s["up"] else ("not started" if s["up"] is None else "DOWN")}</td><td class="mut">{esc(s["code"])}</td></tr>' for s in service_status())
-    body = f'<div class="card"><table><tr><th>Service</th><th>Network</th><th>State</th><th>Detail</th></tr>{rows}</table></div><p class="mut">Starting/stopping services and changing what they may talk to is an isolation-layer change: console only.</p>'
+    svc, sctl = paginate(service_status(), "s")
+    rows = "".join(f'<tr><td>{esc(s["name"])}</td><td><span class="tag">{esc(s["net"])}</span></td><td class="{"ok" if s["up"] else ("mut" if s["up"] is None else "bad")}">{"up" if s["up"] else ("not started" if s["up"] is None else "DOWN")}</td><td class="mut">{esc(s["code"])}</td></tr>' for s in svc)
+    body = f'<div class="card">{sctl}<table><tr><th>Service</th><th>Network</th><th>State</th><th>Detail</th></tr>{rows}</table></div><p class="mut">Starting/stopping services and changing what they may talk to is an isolation-layer change: console only.</p>'
     return page("overview", "services", "Services", "Health of every container, by network.", body)
 
 
@@ -402,10 +439,11 @@ def p_policy(msg="", ok=True):
 
 
 def p_audit():
-    veto = tail_jsonl(VETO_AUDIT, 150); hub = tail_jsonl(HUB_AUDIT, 100)
+    veto, vctl = paginate(tail_jsonl(VETO_AUDIT, 5000), "v")
+    hub, hctl = paginate(tail_jsonl(HUB_AUDIT, 5000), "h")
     vrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))}</td><td>{esc(e.get("detail", ""))[:80]}</td><td>{esc(e.get("model"))}</td><td>{esc(e.get("key_alias"))}</td></tr>' for e in veto) or '<tr><td colspan="6" class="mut">none</td></tr>'
     hrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("event"))}</td><td>{esc(", ".join(f"{k}={v}" for k, v in e.items() if k not in ("ts", "event", "actor")))[:120]}</td></tr>' for e in hub) or '<tr><td colspan="3" class="mut">none</td></tr>'
-    body = f'<div class="card"><h2 style="margin-top:0">Vetoes (latest 150)</h2><table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Detail</th><th>Model</th><th>Key</th></tr>{vrows}</table></div><div class="card"><h2 style="margin-top:0">Admin actions (latest 100)</h2><table><tr><th>Time</th><th>Event</th><th>Fields</th></tr>{hrows}</table></div><p class="mut">Logs never contain message content. Files: proxy/audit/veto-audit.jsonl, proxy/audit/hub-audit.jsonl (root-only on the host).</p>'
+    body = f'<div class="card"><h2 style="margin-top:0">Vetoes</h2>{vctl}<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Detail</th><th>Model</th><th>Key</th></tr>{vrows}</table>{vctl}</div><div class="card"><h2 style="margin-top:0">Admin actions</h2>{hctl}<table><tr><th>Time</th><th>Event</th><th>Fields</th></tr>{hrows}</table>{hctl}</div><p class="mut">Logs never contain message content. Files: proxy/audit/veto-audit.jsonl, proxy/audit/hub-audit.jsonl (root-only on the host).</p>'
     return page("safety", "audit", "Audit log", "Every veto and every administrative action.", body)
 
 
@@ -419,7 +457,8 @@ def p_alerts(msg="", ok=True):
 def p_installed(msg="", ok=True):
     exposed = {m.get("litellm_params", {}).get("model", "").replace("ollama/", ""): m.get("model_name") for m in exposed_models()}
     rows = ""
-    for m in installed_models():
+    models, mctl = paginate(installed_models(), "m")
+    for m in models:
         n = m["name"]; size = m.get("size", 0) / 2**30
         exp = exposed.get(n) or exposed.get(n.replace(":latest", ""))
         act = '<span class="tag">guard model</span>' if m["is_guard"] else (
@@ -427,39 +466,42 @@ def p_installed(msg="", ok=True):
             f'<form class="inline" method="post" action="/hub/api/models/expose">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input name="public" placeholder="public name" style="width:150px" value="{esc(n.split(":")[0].split("/")[-1])}"> <button class="ghost">Expose</button></form>')
         rm = "" if exp or m["loaded"] else f'<form class="inline" method="post" action="/hub/api/models/remove">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input type="hidden" name="confirm" value="{esc(n)}"><button class="danger">Remove</button></form>'
         rows += f'<tr><td>{esc(n)}</td><td>{size:.1f} GiB</td><td>{"<span class=ok>resident</span>" if m["loaded"] else "<span class=mut>on disk</span>"}</td><td>{act}</td><td>{rm}</td></tr>'
-    body = f'<div class="card"><table><tr><th>Model</th><th>Size</th><th>State</th><th>Exposure</th><th></th></tr>{rows or "<tr><td colspan=5 class=mut>none</td></tr>"}</table></div><p class="mut">"Expose" registers the model in LiteLLM under a public name so Open WebUI and API keys can use it — through VetoGuard. Guard models are never exposable. A model that is exposed or resident cannot be removed.</p>'
+    body = f'<div class="card">{mctl}<table><tr><th>Model</th><th>Size</th><th>State</th><th>Exposure</th><th></th></tr>{rows or "<tr><td colspan=5 class=mut>none</td></tr>"}</table></div><p class="mut">"Expose" registers the model in LiteLLM under a public name so Open WebUI and API keys can use it — through VetoGuard. Guard models are never exposable. A model that is exposed or resident cannot be removed.</p>'
     return page("models", "installed", "Installed models", "What is in the shared model store, and what apps can see.", body, msg, ok)
 
 
 def p_pull(msg="", ok=True):
     with JOBS_LOCK:
-        jobs = sorted(JOBS.items(), key=lambda kv: kv[1]["started"], reverse=True)[:10]
+        jobs = sorted(JOBS.items(), key=lambda kv: kv[1]["started"], reverse=True)
+    jobs, jctl = paginate(jobs, "j", 10)
     rows = "".join(f'<tr><td>{esc(j["model"])}</td><td>{esc(j["status"])}</td><td>{(j["completed"] / j["total"] * 100) if j["total"] else 0:.0f}%</td><td class="mut">{esc(j["started"][:19])}</td></tr>' for _, j in jobs) or '<tr><td colspan="4" class="mut">no pulls yet</td></tr>'
     body = f"""<form method="post" action="/hub/api/models/pull">{csrf_field()}<div class="card"><label>Model to pull (Ollama library name, e.g. <code>qwen2.5:14b</code>, <code>llama-guard3:8b</code>)</label><div class="row"><input name="model" placeholder="name:tag" required pattern="[a-z0-9][a-z0-9._/:-]*"><button>Pull</button></div>
 <div class="mut" style="margin-top:6px">Pulls run through <b>modeld</b>, the only container with both internet access and the model store. The inference engine never fetches anything itself.</div></div></form>
-<div class="card"><h2 style="margin-top:0">Jobs</h2><table><tr><th>Model</th><th>Status</th><th>Progress</th><th>Started</th></tr>{rows}</table><p class="mut">Refresh the page for progress.</p></div>"""
+<div class="card"><h2 style="margin-top:0">Jobs</h2>{jctl}<table><tr><th>Model</th><th>Status</th><th>Progress</th><th>Started</th></tr>{rows}</table><p class="mut">Refresh the page for progress.</p></div>"""
     return page("models", "pull", "Pull a model", "Download into the shared store, behind the scenes, for every app on the box.", body, msg, ok)
 
 
 def p_exposed(msg="", ok=True):
     rows = ""
-    for m in exposed_models():
+    ex, ectl = paginate(exposed_models(), "e")
+    for m in ex:
         mid = str(m.get("model_info", {}).get("id", "")); pub = m.get("model_name"); up = m.get("litellm_params", {}).get("model")
         src = "hub" if len(mid) >= 8 and "-" in mid else "config.yaml (console)"
         rm = f'<form class="inline" method="post" action="/hub/api/models/unexpose">{csrf_field()}<input type="hidden" name="id" value="{esc(mid)}"><input type="hidden" name="public" value="{esc(pub)}"><button class="danger">Unexpose</button></form>' if src == "hub" else '<span class="mut">console</span>'
         rows += f'<tr><td>{esc(pub)}</td><td>{esc(up)}</td><td>{esc(src)}</td><td>{rm}</td></tr>'
-    body = f'<div class="card"><table><tr><th>Public name</th><th>Upstream</th><th>Defined in</th><th></th></tr>{rows or "<tr><td colspan=4 class=mut>none</td></tr>"}</table></div><p class="mut">Public names are what API keys and Open WebUI address. Everything listed routes through VetoGuard.</p>'
+    body = f'<div class="card">{ectl}<table><tr><th>Public name</th><th>Upstream</th><th>Defined in</th><th></th></tr>{rows or "<tr><td colspan=4 class=mut>none</td></tr>"}</table></div><p class="mut">Public names are what API keys and Open WebUI address. Everything listed routes through VetoGuard.</p>'
     return page("models", "exposed", "Exposed to apps", "Models LiteLLM currently serves.", body, msg, ok)
 
 
 def p_keys(msg="", ok=True, newkey=None):
     st, j = litellm("GET", "/key/list?return_full_object=true&page=1&size=100")
-    keys = j.get("keys", []) if isinstance(j, dict) else []
+    keys = [k for k in (j.get("keys", []) if isinstance(j, dict) else []) if k.get("key_alias")]
+    keys, kctl = paginate(keys, "k")
     rows = "".join(f'<tr><td>{esc(k.get("key_alias"))}</td><td>{esc(", ".join(k.get("models") or []) or "all exposed")}</td><td>{esc(k.get("rpm_limit"))}/{esc(k.get("tpm_limit"))}</td><td class="mut">{esc((k.get("created_at") or "")[:19])}</td><td><form class="inline" method="post" action="/hub/api/keys/revoke">{csrf_field()}<input type="hidden" name="alias" value="{esc(k.get("key_alias"))}"><button class="danger">Revoke</button></form></td></tr>' for k in keys if k.get("key_alias")) or '<tr><td colspan="5" class="mut">none</td></tr>'
     pubs = [m.get("model_name") for m in exposed_models()]
     opts = "".join(f'<option value="{esc(p)}">{esc(p)}</option>' for p in pubs)
     banner = f'<div class="card"><b>New key — shown once, store it now:</b><br><span class="key">{esc(newkey)}</span></div>' if newkey else ""
-    body = f"""{banner}<div class="card"><table><tr><th>Alias</th><th>Models</th><th>rpm/tpm</th><th>Created</th><th></th></tr>{rows}</table></div>
+    body = f"""{banner}<div class="card">{kctl}<table><tr><th>Alias</th><th>Models</th><th>rpm/tpm</th><th>Created</th><th></th></tr>{rows}</table></div>
 <form method="post" action="/hub/api/keys/mint">{csrf_field()}<div class="card"><h2 style="margin-top:0">Mint a key</h2>
 <div class="row"><div><label>Alias (client name)</label><input name="alias" required pattern="[a-z0-9][a-z0-9._-]+" placeholder="home-assistant"></div>
 <div><label>Models</label><select name="models" multiple size="3">{opts}</select></div>
@@ -717,7 +759,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(data)
 
     def do_GET(self):
-        p = urllib.parse.urlparse(self.path).path.rstrip("/")
+        u = urllib.parse.urlparse(self.path)
+        REQ.q, REQ.path = urllib.parse.parse_qs(u.query), u.path
+        p = u.path.rstrip("/")
         if p == "/hub":
             return self._send(200, p_dashboard())
         if p == "/hub/api/status":
@@ -733,6 +777,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, "not found", "text/plain")
 
     def do_POST(self):
+        REQ.q, REQ.path = {}, urllib.parse.urlparse(self.path).path
         p = urllib.parse.urlparse(self.path).path
         n = int(self.headers.get("Content-Length", "0"))
         form = Form(self.rfile.read(min(n, 65536)).decode())

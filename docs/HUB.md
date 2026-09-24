@@ -1,7 +1,7 @@
 # Aegis Hub — admin control centre
 
 `https://<LAN_IP>/hub` · user `admin` · password: `HUB_ADMIN_PASSWORD` in `.env` (basic-auth enforced by Caddy).
-Dark theme, left navigation: five categories, one level of sub-pages.
+Dark theme. Fixed left navigation with collapsible categories (the active one open), one level of sub-pages; the right pane scrolls independently. Every table paginates (10/25/50/100 per page, prev/next) via URL query parameters.
 
 | Category | Page | Can change | Notes |
 |---|---|---|---|
@@ -45,9 +45,10 @@ after classification). If the guard model is unreachable the request is refused 
 | Guard | Placement | 6000-char classification | Mixtral gen | Notes |
 |---|---|---|---|---|
 | llama-guard3:1b | mostly CPU (0.1 GiB VRAM) | **0.12 s** warm | 12.5 tok/s | current setting |
+| llama-guard3:8b + Mixtral (observed 15:02–15:12) | thrash → CPU fallback | — | — | Ollama lost its GPU runner; dashboard now warns; restart ollama |
 | llama-guard3:8b | GPU | 0.07 s warm | 8.6 tok/s | **evicts Mixtral** — 10 s + 26 s reload per request; unusable on this VRAM |
 | llama-guard3:8b | CPU only | 14–21 s | 12.5 tok/s | unusable latency |
 
-8B is the better classifier (Meta reports the 1B distillation loses recall on paraphrased and
+**Pairing 8B safely:** pull a ≤ 20 GB main model (e.g. `gemma3:27b` ≈ 17 GB, pulled 2026-09-24), expose it, make it the default in Open WebUI, then select 8B here. 8B is the better classifier (Meta reports the 1B distillation loses recall on paraphrased and
 multilingual content). It becomes viable when either the main model is ≤ ~20 GB or the guard moves
 to the Intel Arc cards. Both are one setting away in this page once the hardware allows.

@@ -4,7 +4,7 @@ Ordered by dependency, not by desire. Each item names its safety precondition.
 
 | # | Item | Precondition |
 |---|---|---|
-| 1 | Host hardening (scoped sudo, SSH key-only, firewall auto-update) | Supervised session; console access verified from a second device |
+| 1 | Host hardening (scoped sudo, SSH key-only, firewall auto-update, NVIDIA runtime CDI mode so containers cannot silently lose GPUs) | Supervised session; console access verified from a second device |
 | 2 | Public hostname + Let's Encrypt via `/hub` | **Done (framework):** Cloudflare DNS-01 build shipped; operator applies hostname + token in Gateway → Public hostname |
 | 3 | Monitoring (Prometheus, node-exporter, DCGM exporter, Grafana at `/grafana`) | **Done (profile `monitoring`)**; set `GRAFANA_ENABLED=1` to surface it in the hub |
 | 4 | Llama Guard 8B — needs a ≤ 20 GB main model **or** the guard on the Intel Arc cards (SYCL/IPEX runtime) | Measured: 8B cannot co-reside with Mixtral on 2× T4 (see docs/HUB.md) |
