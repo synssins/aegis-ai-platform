@@ -1,7 +1,7 @@
 # Aegis AI Platform
 
 A self-hosted LLM inference stack — Caddy → Open WebUI / OpenAI-compatible API → LiteLLM → Ollama — built on the
-assumption that your network perimeter will eventually fail without telling you, and that content safety is
+assumption that the hosting environment is never truly secure, and that content safety is
 mandatory rather than optional.
 
 **What makes it different**
