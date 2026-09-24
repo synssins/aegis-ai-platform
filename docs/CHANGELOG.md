@@ -2,6 +2,14 @@
 
 All significant changes to the platform are recorded here. Every entry must name the files touched, the reason, who/what made the change, and how it was verified. Security-relevant changes must link an audit record in `docs/audits/`.
 
+## 2026-09-24 (afternoon) — VetoGuard 2.3 from Agy adversarial review; hub admin password rotation
+
+- **Adversarial loop, round 1:** `docs/tests/agy-vetoguard-review-2026-09-24.md` — Agy (Gemini) reviewed VetoGuard 2.2 in permission-gated print mode; 20 findings, 7 High. All addressed in `proxy/veto_filter.py` rev 2.3: request scope now covers the latest user turn **and everything after it** (assistant prefill, tool results, tool_calls args), `system`, `prompt`, `input`, tool/function schemas; normalisation strips combining marks/format chars and maps confusables; standard + URL-safe base64 decoded and fed to the classifier; despacing removes all non-alphanumerics; streaming classifies tool-call deltas, runs tripwires on output, caps the buffer (400k chars), tolerates empty `choices`, never raises mid-stream; extraction failure is fail-closed; overlapping chunk windows (600) with bounded concurrency and `max_chunks` 100; policy reload keeps the last good policy; admin regexes are probed for catastrophic backtracking and every scan runs under a 5 s budget (timeout ⇒ refuse); exact verdict parsing; dict-shaped key attribution; audit writes off the event loop with 50 MB rotation.
+- **Round 2** launched against 2.3 (results appended when available).
+- **Hub: Access → Admin password.** Caddy now imports the hub credential from `caddy/sites-enabled/hub-auth.conf` (fail-closed if missing) instead of an env var; the hub rotates it (current password required, complexity policy, bcrypt cost 14, Caddy reload, audit + alert). New image `aegis/hub:2` (python:3.12-alpine + bcrypt 4.2.1). `scripts/seed-hub-auth.sh` for first install. Round-trip rotation tested.
+- **Fixes:** hub → Caddy admin `Origin` must be scheme-qualified (`http://127.0.0.1:2019`); files edited via `sed -i` must be re-owned `root:<operator>` 640 or cap-dropped containers cannot read them.
+- **Tests:** phase 6 (Agy round-1 bypass classes): prefill, system message, tool schema, URL-safe base64, arbitrary-delimiter despacing, combining marks, Cyrillic confusable, tool_calls-in-history, chunk budget. Suite total 61.
+
 ## 2026-09-24 (day session)
 
 ### Hub v2 admin plane, VetoGuard 2.2 policy, model pipeline, DNS-01, monitoring + apps frameworks — APPLIED. Acceptance: 52/52 (`docs/tests/…-post-v3.json`).

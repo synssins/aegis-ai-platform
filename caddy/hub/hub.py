@@ -42,6 +42,7 @@ CADDYFILE = "/etc/caddy/Caddyfile"
 COMPOSE_VIEW = "/app/view/docker-compose.yml"
 SITES_DIR = "/etc/caddy/sites-enabled"
 DOMAIN_FILE = os.path.join(SITES_DIR, "domain.caddy")
+HUB_AUTH_FILE = os.path.join(SITES_DIR, "hub-auth.conf")
 POLICY_FILE = "/app/policy/veto-policy.json"
 STATE_FILE = "/app/state/hub.json"
 AUDIT_DIR = "/app/audit"
@@ -83,7 +84,7 @@ NAV = [
     ("overview", "Overview", [("dashboard", "Dashboard"), ("services", "Services")]),
     ("safety", "Safety", [("policy", "VetoGuard policy"), ("audit", "Audit log"), ("alerts", "Alerts")]),
     ("models", "Models", [("installed", "Installed"), ("pull", "Pull"), ("exposed", "Exposed to apps")]),
-    ("access", "Access", [("keys", "API keys")]),
+    ("access", "Access", [("keys", "API keys"), ("password", "Admin password")]),
     ("gateway", "Gateway", [("certs", "Certificates"), ("hostname", "Public hostname"), ("isolation", "Isolation (read-only)")]),
 ]
 
@@ -624,12 +625,72 @@ def act_hostname(form):
     return p_hostname(f"Applied {host}. Caddy will obtain the certificate via DNS-01 within a minute or two; check Certificates. {m}" if ok else f"Failed and rolled back: {m}", ok)
 
 
+
+def p_password(msg="", ok=True):
+    body = f"""<form method="post" action="/hub/api/password">{csrf_field()}<div class="card"><h2 style="margin-top:0">Change the administrator password</h2>
+<p class="mut">This is the credential Caddy checks before anything reaches the hub. Rotating it writes a new bcrypt hash to the root-only auth file and reloads Caddy; your browser will prompt again.</p>
+<label>Current password</label><input name="current" type="password" autocomplete="current-password" required>
+<label>New password</label><input name="new" type="password" autocomplete="new-password" required minlength="14">
+<label>Confirm new password</label><input name="confirm" type="password" autocomplete="new-password" required minlength="14">
+<div class="mut" style="margin-top:8px">Policy: at least 14 characters; at least three of: lowercase, uppercase, digit, symbol; no spaces; must not contain "admin", "aegis" or "password". bcrypt cost 14.</div>
+<div class="row" style="margin-top:12px"><button>Change password</button></div></div></form>"""
+    return page("access", "password", "Admin password", "Rotate the hub administrator credential without the console.", body, msg, ok)
+
+
+def _password_policy(pw: str) -> str | None:
+    if len(pw) < 14: return "too short (minimum 14 characters)"
+    if len(pw) > 128: return "too long (maximum 128)"
+    if any(ch.isspace() for ch in pw): return "must not contain spaces"
+    classes = sum([any(c.islower() for c in pw), any(c.isupper() for c in pw), any(c.isdigit() for c in pw), any(not c.isalnum() for c in pw)])
+    if classes < 3: return "needs at least three of: lowercase, uppercase, digit, symbol"
+    low = pw.lower()
+    if any(w in low for w in ("admin", "aegis", "password", "qwerty", "123456")): return "contains a forbidden word"
+    return None
+
+
+def _current_hash() -> str | None:
+    try:
+        m = re.search(r"^\s*admin\s+(\S+)\s*$", open(HUB_AUTH_FILE, encoding="utf-8").read(), re.M)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def act_password(form):
+    import bcrypt
+    cur, new, conf = form.get("current", ""), form.get("new", ""), form.get("confirm", "")
+    h = _current_hash()
+    if not h or not bcrypt.checkpw(cur.encode(), h.encode()):
+        audit("admin_password_change_rejected", reason="current password incorrect")
+        return p_password("Current password is incorrect.", False)
+    if new != conf:
+        return p_password("New password and confirmation do not match.", False)
+    why = _password_policy(new)
+    if why:
+        return p_password(f"Rejected: {why}.", False)
+    if bcrypt.checkpw(new.encode(), h.encode()):
+        return p_password("New password must differ from the current one.", False)
+    newh = bcrypt.hashpw(new.encode(), bcrypt.gensalt(rounds=14)).decode()
+    prev = open(HUB_AUTH_FILE, encoding="utf-8").read()
+    tmp = HUB_AUTH_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(f"# Hub administrator credential. Managed from /hub (Access -> Admin password). bcrypt. Rotated {now()}\nbasic_auth {{\n    admin {newh}\n}}\n")
+    os.chmod(tmp, 0o600); os.replace(tmp, HUB_AUTH_FILE)
+    ok, m = caddy_reload()
+    if not ok:
+        open(HUB_AUTH_FILE, "w", encoding="utf-8").write(prev); caddy_reload()
+        audit("admin_password_change_failed", detail=m)
+        return p_password(f"Caddy refused the new credential; previous password kept. {m}", False)
+    audit("admin_password_changed", detail=m)
+    return p_password("Password changed. Caddy reloaded — your browser will ask for the new password on the next request. HUB_ADMIN_PASSWORD in .env is now stale; this file is the source of truth.")
+
+
 ACTIONS = {"/hub/api/policy": act_policy, "/hub/api/alerts": act_alerts, "/hub/api/models/pull": act_pull,
            "/hub/api/models/expose": act_expose, "/hub/api/models/unexpose": act_unexpose, "/hub/api/models/remove": act_remove,
-           "/hub/api/keys/mint": act_mint, "/hub/api/keys/revoke": act_revoke, "/hub/api/hostname": act_hostname}
+           "/hub/api/keys/mint": act_mint, "/hub/api/keys/revoke": act_revoke, "/hub/api/password": act_password, "/hub/api/hostname": act_hostname}
 PAGES = {("overview", "dashboard"): p_dashboard, ("overview", "services"): p_services, ("safety", "policy"): p_policy,
          ("safety", "audit"): p_audit, ("safety", "alerts"): p_alerts, ("models", "installed"): p_installed,
-         ("models", "pull"): p_pull, ("models", "exposed"): p_exposed, ("access", "keys"): p_keys,
+         ("models", "pull"): p_pull, ("models", "exposed"): p_exposed, ("access", "keys"): p_keys, ("access", "password"): p_password,
          ("gateway", "certs"): p_certs, ("gateway", "hostname"): p_hostname, ("gateway", "isolation"): p_isolation}
 
 

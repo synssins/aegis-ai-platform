@@ -24,7 +24,6 @@ services:
     environment:
       - AEGIS_LAN_IP=${AEGIS_LAN_IP}
       - ACME_EMAIL=${ACME_EMAIL}
-      - HUB_ADMIN_PASSWORD_HASH=${HUB_ADMIN_PASSWORD_HASH}
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/sites-enabled:/etc/caddy/sites-enabled:ro
@@ -40,7 +39,7 @@ services:
     # LiteLLM, ollama (backend, read/delete), modeld (mgmt, pulls). Reachable only via caddy at /hub
     # behind basic-auth. Holds the LiteLLM master key (key/model management) — every action audited.
     <<: *hardened
-    image: python:3.12-alpine
+    image: aegis/hub:2                             # caddy/hub/build/Dockerfile — python:3.12-alpine + bcrypt
     container_name: hub
     command: ["python3", "-u", "/app/hub.py"]
     environment:

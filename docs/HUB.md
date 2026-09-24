@@ -14,12 +14,13 @@ Dark theme, left navigation: five categories, one level of sub-pages.
 | | Pull | pull | via `modeld` — the only container with both internet and the model store. Apps never fetch their own |
 | | Exposed to apps | unexpose (hub-created only) | models from `config.yaml` are console-managed |
 | Access | API keys | mint / revoke | per-client, model-scoped, rate-limited; key shown once |
+| | Admin password | rotate | requires current password; ≥ 14 chars, 3 of 4 classes, no spaces, no "admin"/"aegis"/"password"; bcrypt cost 14 written to `caddy/sites-enabled/hub-auth.conf`, Caddy reloaded; audited + alerted. `.env` `HUB_ADMIN_PASSWORD` becomes stale after the first rotation — the file is the source of truth |
 | Gateway | Certificates | — | live TLS probe of every served host |
 | | Public hostname | hostname + Cloudflare token | writes exactly one templated site file; Let's Encrypt via DNS-01, no inbound ports |
 | | Isolation | — | **read-only** view of the Caddyfile and compose network wiring |
 
 ## Privilege model
-- Caddy basic-auth is the administrator boundary. There is one admin identity by design.
+- Caddy basic-auth is the administrator boundary. There is one admin identity by design. The credential is a bcrypt hash in `caddy/sites-enabled/hub-auth.conf`, imported by the Caddyfile; a missing file makes Caddy refuse to start (fail-closed). First install seeds it with `scripts/seed-hub-auth.sh`; afterwards it is rotated only from the hub.
 - The hub shares Caddy's network namespace: it can reach the Caddy admin API, LiteLLM (with the master
   key), Ollama (read + delete) and `modeld` (pulls). No other container can reach any of those admin surfaces.
 - The hub's filesystem is read-only except: `proxy/policy/` (policy JSON), `caddy/sites-enabled/`
