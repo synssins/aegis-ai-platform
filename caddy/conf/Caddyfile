@@ -1,4 +1,4 @@
-# Aegis gateway — rev 3 (2026-09-24). CONSOLE-ONLY. Root-owned, read-only in containers.
+# Aegis gateway — rev 4. CONSOLE-ONLY. Lives in caddy/conf/ (directory-mounted). Root-owned, read-only in containers.
 # This file is the isolation layer: interconnects, routes, auth at the edge. The hub shows it
 # read-only. The only web-modifiable Caddy config is /etc/caddy/sites-enabled/domain.caddy,
 # written by the hub from a fixed template (public hostname + Cloudflare DNS-01).
@@ -18,7 +18,7 @@
     }
 }
 
-(site) {
+(common) {
     # Device identity: these headers are set ONLY from the TLS client certificate below. Anything a client
     # sends under these names is discarded before routing, so they cannot be forged.
     request_header -X-Device-Fingerprint
@@ -32,7 +32,8 @@
         -Server
         Strict-Transport-Security "max-age=31536000"
         X-Content-Type-Options "nosniff"
-        X-Frame-Options "DENY"
+        -X-Frame-Options
+        Content-Security-Policy "frame-ancestors 'self'"
         Referrer-Policy "no-referrer"
         Permissions-Policy "camera=(), geolocation=(), microphone=(self)"
     }
@@ -81,13 +82,17 @@
         respond "ComfyUI is disabled until its two-stage safety gate exists." 503
     }
 
-    handle {
-        reverse_proxy openwebui:8080
-    }
-
     log {
         output stdout
         format json
+    }
+}
+
+# Default handlers differ per site: the LAN address keeps Open WebUI at /; the public hostname serves the portal.
+(site) {
+    import common
+    handle {
+        reverse_proxy openwebui:8080
     }
 }
 

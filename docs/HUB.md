@@ -33,7 +33,7 @@ IP addresses and user agents are claims; a certificate is proof of possession of
   key), Ollama (read + delete) and `modeld` (pulls). No other container can reach any of those admin surfaces.
 - The hub's filesystem is read-only except: `proxy/policy/` (policy JSON), `caddy/sites-enabled/`
   (hostname site file), `caddy/hub/state/` (webhook, hostname), `proxy/audit/` (append-only logs).
-- The isolation layer — `caddy/Caddyfile`, `docker-compose.yml`, networks, mounts, capabilities — is
+- The isolation layer — `caddy/conf/Caddyfile`, `docker-compose.yml`, networks, mounts, capabilities — is
   mounted read-only into the hub and is **console-only** to change.
 - Every POST requires a CSRF token bound to the hub process; every state change writes to
   `proxy/audit/hub-audit.jsonl` and, if configured, the alert webhook.

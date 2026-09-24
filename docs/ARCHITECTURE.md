@@ -53,7 +53,7 @@ obeys file permissions, so container data directories are **root-owned, mode 700
 4. **Audit** — `proxy/audit/veto-audit.jsonl` and `proxy/audit/hub-audit.jsonl`; never content. Immutable entries expire by time only. Serious-class vetoes produce sealed evidence (`docs/EVIDENCE.md`). Admin actions and serious vetoes go to an optional webhook.
 
 ## Privilege boundaries
-- **Isolation layer is console-only:** `caddy/Caddyfile` (root 640, read-only in containers) and
+- **Isolation layer is console-only:** `caddy/conf/Caddyfile` (root 640, read-only in containers) and
   `docker-compose.yml`. The hub shows both read-only.
 - **The hub** may change: VetoGuard policy, models (pull/remove/expose), API keys, public hostname
   (one templated site file with the Cloudflare token), alert webhook. Nothing else.

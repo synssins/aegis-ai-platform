@@ -24,7 +24,7 @@ sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml # GPUs via CDI; repea
 sudo install -m755 ops/aegis-watchdog.py /usr/local/sbin/ && sudo install -m644 ops/aegis-watchdog.service /etc/systemd/system/
 sudo install -d -m700 ops/requests ops/responses ops/archive proxy/audit proxy/evidence proxy/policy caddy/hub/state caddy/sites-enabled caddy/config caddy/data
 sudo systemctl enable --now aegis-watchdog
-sudo chown root:$USER caddy/Caddyfile proxy/config.yaml proxy/veto_filter.py caddy/hub/hub.py && sudo chmod 640 caddy/Caddyfile proxy/config.yaml proxy/veto_filter.py caddy/hub/hub.py
+sudo chown root:$USER caddy/conf/Caddyfile proxy/config.yaml proxy/veto_filter.py caddy/hub/hub.py && sudo chmod 640 caddy/conf/Caddyfile proxy/config.yaml proxy/veto_filter.py caddy/hub/hub.py
 ```
 Why root-owned 700/640: every container drops all capabilities, so root inside a container obeys ordinary
 file permissions; data directories must belong to root, and the gateway config must be writable only by root.
@@ -64,4 +64,4 @@ Pull the repo, read `docs/CHANGELOG.md`, `docker compose config --quiet`, then `
 sentinel suite. Model store, databases, audit and evidence directories are untouched by upgrades.
 
 ## Rollback
-`git checkout <previous tag> -- docker-compose.yml caddy/Caddyfile proxy/ caddy/hub/hub.py && docker compose up -d`.
+`git checkout <previous tag> -- docker-compose.yml caddy/conf/Caddyfile proxy/ caddy/hub/hub.py && docker compose up -d`.

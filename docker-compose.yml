@@ -20,12 +20,13 @@ services:
     <<: *hardened
     image: caddybuilds/caddy-cloudflare:2.11.4     # upstream community build of caddy:2.11.4 + caddy-dns/cloudflare (no local fork)
     container_name: caddy
+    command: ["caddy", "run", "--config", "/etc/caddy/conf/Caddyfile", "--adapter", "caddyfile"]
     ports: ["80:80", "443:443"]
     environment:
       - AEGIS_LAN_IP=${AEGIS_LAN_IP}
       - ACME_EMAIL=${ACME_EMAIL}
     volumes:
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/conf:/etc/caddy/conf:ro               # directory mount: follows file replacement (a file mount pins the inode)
       - ./caddy/sites-enabled:/etc/caddy/sites-enabled:ro
       - ./caddy/data:/data
       - ./caddy/config:/config
@@ -50,7 +51,7 @@ services:
       - GRAFANA_ENABLED=${GRAFANA_ENABLED:-0}
     volumes:
       - ./caddy/hub/hub.py:/app/hub.py:ro
-      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/conf:/etc/caddy/conf:ro
       - ./docker-compose.yml:/app/view/docker-compose.yml:ro
       - ./caddy/sites-enabled:/etc/caddy/sites-enabled
       - ./caddy/hub/state:/app/state
@@ -84,7 +85,7 @@ services:
       - OPENAI_API_KEY=${OPENWEBUI_UPSTREAM_KEY}
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
       - WEBUI_URL=https://${AEGIS_LAN_IP}
-      - CORS_ALLOW_ORIGIN=https://${AEGIS_LAN_IP}
+      - CORS_ALLOW_ORIGIN=https://${AEGIS_LAN_IP};https://chat.${AEGIS_PUBLIC_HOSTNAME:-localhost};https://${AEGIS_PUBLIC_HOSTNAME:-localhost}
       - ENABLE_SIGNUP=false
       - DEFAULT_MODELS=${OPENWEBUI_DEFAULT_MODEL:-gemma3}
       - DEFAULT_USER_ROLE=pending
@@ -203,8 +204,10 @@ services:
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
-      - GF_SERVER_ROOT_URL=https://${AEGIS_LAN_IP}/grafana/
-      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - GF_SERVER_ROOT_URL=https://grafana.${AEGIS_PUBLIC_HOSTNAME:-localhost}/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=false
+      - GF_SECURITY_ALLOW_EMBEDDING=true          # framed by the portal (same site)
+      - GF_SECURITY_COOKIE_SAMESITE=lax
       - GF_AUTH_ANONYMOUS_ENABLED=false
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_ANALYTICS_REPORTING_ENABLED=false

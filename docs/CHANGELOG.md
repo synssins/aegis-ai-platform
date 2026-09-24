@@ -2,6 +2,13 @@
 
 All significant changes to the platform are recorded here. Every entry must name the files touched, the reason, who/what made the change, and how it was verified. Security-relevant changes must link an audit record in `docs/audits/`.
 
+## 2026-09-24 (late) — Portal, accounts with grants, subdomain routing
+
+- **Accounts and grants (single source of truth in the admin console):** every account carries `admin`, `chat`, `images`, `images_nsfw`, `speech`, `grafana`; Access → Users (create with a one-time invite code, edit grants, re-invite, delete). Invited users set their own password and enrol MFA at first sign-in. Sessions are site-wide; `/hub` ("Admin") is refused without the `admin` flag; legacy wizard admin is an administrator.
+- **Portal at `/` on the public hostname:** left menu from grants (Chat · Images · Gallery · Speech · Status · Grafana · Admin · Settings), target loads in the right frame; Images/Gallery/Speech are placeholders. `chat.<host>` → Open WebUI, `grafana.<host>` → Grafana (both need A records); apex keeps `/hub`, `/status`, `/v1`. **The LAN IP still serves Open WebUI at `/`** — nothing existing breaks. Framing via CSP `frame-ancestors` (same site).
+- **Caddyfile moved to `caddy/conf/` (directory mount):** a single-file bind mount pinned the old inode after an in-place edit and the running Caddy silently kept stale config — found while a reload was refused. Recreating fixed it; the directory mount prevents recurrence.
+- Intel Arc cards shown on Metrics/status as installed with no runtime yet.
+
 ## 2026-09-24 (late) — Documentation set for publication; original GitHub history merged
 
 - Sanitisation sweep of the tracked tree (one public-hostname reference in a report fixed); the pre-commit hook now also derives the public hostname/domain from hub state.

@@ -40,7 +40,7 @@ The same pages are published to the repository wiki with `scripts/publish-wiki.s
 ## Layout
 ```
 docker-compose.yml        the stack (edge / backend / mgmt / monitoring / apps networks, profiles)
-caddy/Caddyfile           gateway — root-owned, read-only in containers, console-only to change
+caddy/conf/Caddyfile      gateway — root-owned, read-only in containers, console-only to change
 caddy/hub/hub.py          admin hub (Python stdlib + argon2, cryptography, qrcode)
 proxy/veto_filter.py      VetoGuard (tripwire + classifier adapters + policy + audit + evidence)
 proxy/config.yaml         LiteLLM models + settings

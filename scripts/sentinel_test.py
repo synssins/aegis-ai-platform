@@ -268,7 +268,7 @@ class Suite:
         rc, out = docker("inspect openwebui --format '{{range .Config.Env}}{{println .}}{{end}}'")
         master = self.env.get("LITELLM_MASTER_KEY", "\x00")
         self.rec("4.1", "hygiene", "OpenWebUI does not hold the master key", "virtual key", "masked", master not in out and "OPENAI_API_KEY=" in out)
-        rc, out = sh(f"stat -c '%U %a' {ROOT}/caddy/Caddyfile {ROOT}/.env")
+        rc, out = sh(f"stat -c '%U %a' {ROOT}/caddy/conf/Caddyfile {ROOT}/.env")
         lines = [l.split() for l in out.splitlines() if l]
         self.rec("4.2", "hygiene", "Caddyfile root-owned 640; .env 600", "root 640 / <owner> 600", out,
                  len(lines) == 2 and lines[0][0] == "root" and lines[0][1] == "640" and lines[1][1] == "600")
@@ -333,7 +333,7 @@ class Suite:
         try: forged = json.loads(b).get("device_certificate_presented")
         except Exception: forged = "?"  # noqa: BLE001
         self.rec("5.19", "edge", "client-supplied device-fingerprint headers are stripped at the edge (no spoofing)", "False", forged, forged is False)
-        rc, out = sh(f"sudo -n grep -c 'trusted_ca_cert_file' {ROOT}/caddy/Caddyfile")
+        rc, out = sh(f"sudo -n grep -c 'trusted_ca_cert_file' {ROOT}/caddy/conf/Caddyfile")
         self.rec("5.20", "edge", "Caddy requests client certificates against the device CA", ">=1", out.strip(), out.strip().isdigit() and int(out) >= 1)
         rc, out = sh(f"sudo -n stat -c '%a' {ROOT}/caddy/hub/state/device-ca.key.enc")
         self.rec("5.21", "hygiene", "device CA private key is encrypted at rest and root-only", "600", out.strip(), out.strip() == "600")

@@ -2,7 +2,7 @@
 
 `.env` is `chmod 600`, never committed, and is the only place site-specific values and secrets live. Everything
 the administrator changes after installation is changed in the hub, not in files — except the isolation layer
-(`docker-compose.yml`, `caddy/Caddyfile`), which is console-only by design.
+(`docker-compose.yml`, `caddy/conf/Caddyfile`), which is console-only by design.
 
 | Variable | Purpose |
 |---|---|
@@ -29,5 +29,5 @@ only by the hub; all changes audited.
 
 ## Isolation layer (console only)
 `docker-compose.yml`: networks (`edge`, `backend` internal, `mgmt`, `monitoring` internal, `apps` internal),
-mounts, capabilities, profiles. `caddy/Caddyfile`: routes, `/v1` allow-list, headers, `/hub`, `/status`,
+mounts, capabilities, profiles. `caddy/conf/Caddyfile`: routes, `/v1` allow-list, headers, `/hub`, `/status`,
 `/comfy` hard gate. Shown read-only in Hub → Gateway → Isolation.
