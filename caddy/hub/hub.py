@@ -64,6 +64,10 @@ AUDIT_DIR = "/app/audit"
 HUB_AUDIT = os.path.join(AUDIT_DIR, "hub-audit.jsonl")
 VETO_AUDIT = os.path.join(AUDIT_DIR, "veto-audit.jsonl")
 SNIPPETS = os.path.join(AUDIT_DIR, "veto-snippets.jsonl")
+EVIDENCE_DIR = "/app/evidence"
+EVIDENCE_INDEX = os.path.join(EVIDENCE_DIR, "index.jsonl")
+DEFAULT_RETENTION = {"immutable_categories": ["S4", "S3", "S10", "S11"], "immutable_tripwires": ["csam", "despaced"], "immutable_days": 730,
+                     "evidence": {"enabled": True, "categories": ["S4"], "tripwires": ["csam", "despaced"], "days": 730}}
 OPS_REQ = "/app/ops/requests/request.json"
 OPS_RESP = "/app/ops/responses"
 OPS_STATUS = os.path.join(OPS_RESP, "status.json")
@@ -344,7 +348,53 @@ def policy() -> dict:
         p.setdefault("categories", {}).setdefault(c, {"block": c in DEFAULT_BLOCK})
     p["categories"]["S4"]["block"] = True
     p.setdefault("guard", DEFAULT_POLICY["guard"].copy()); p.setdefault("tripwires", {"enabled": True, "extra_patterns": []}); p.setdefault("audit", {"store_snippet": False})
+    r = p.setdefault("retention", json.loads(json.dumps(DEFAULT_RETENTION)))
+    r.setdefault("evidence", json.loads(json.dumps(DEFAULT_RETENTION["evidence"])))
+    r["immutable_categories"] = sorted(set(r.get("immutable_categories", [])) | {"S4"}); r["evidence"]["categories"] = sorted(set(r["evidence"].get("categories", [])) | {"S4"}); r["evidence"]["enabled"] = True
     return p
+
+
+def evidence_index() -> list[dict]:
+    return tail_jsonl(EVIDENCE_INDEX, 5000)
+
+
+def _expire_evidence(days: int) -> int:
+    """Delete sealed records older than `days`; rewrite the index. Returns count removed."""
+    cutoff = time.time() - days * 86400; removed = 0
+    try:
+        keep = []
+        for e in reversed(evidence_index()):
+            path = os.path.join(EVIDENCE_DIR, e["id"] + ".json.enc")
+            try:
+                ts = datetime.fromisoformat(e["ts"]).timestamp()
+            except ValueError:
+                ts = time.time()
+            if ts < cutoff:
+                try: os.unlink(path)
+                except FileNotFoundError: pass
+                removed += 1
+            else:
+                keep.append(e)
+        if removed:
+            tmp = EVIDENCE_INDEX + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(json.dumps(e) + "\n" for e in keep)
+            os.replace(tmp, EVIDENCE_INDEX)
+    except OSError:
+        pass
+    return removed
+
+
+def _retention_sweeper():
+    while True:
+        try:
+            r = policy()["retention"]
+            n = _expire_evidence(int(r["evidence"].get("days", 730)))
+            if n:
+                audit("evidence_expired", removed=n, days=r["evidence"].get("days"))
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(6 * 3600)
 
 
 _CAPS: dict[str, list[str]] = {}
@@ -704,6 +754,12 @@ def p_policy(msg="", ok=True):
 <div class="mut" style="margin-top:6px">This is the only place the classifier is chosen. Saving loads it into memory and unloads any other guard model. It runs on every request and every response (streaming buffered), cannot be disabled, and if it is missing or unreachable every request is refused. Load your main model <b>before</b> choosing a larger guard so both fit in VRAM. Verdict adapters decide how a family is asked and how its answer is read; today: Llama Guard (expects "safe" or "unsafe" + S-codes). Recognised families without an adapter (ShieldGemma, Granite Guardian, WildGuard) are listed but cannot be selected. If an answer ever fails to parse, the request is refused and the audit log records what came back and what was expected.</div></div>
 <div class="card"><h2 style="margin-top:0">Blocked categories</h2><table><tr><th>Block</th><th>Code</th><th>Category</th><th>Class</th><th></th></tr>{rows}</table><div class="mut">Illegal and protected-class content never passes; adult content may. Unchecking an "illegal" class is allowed but audited and alerted.</div></div>
 <div class="card"><h2 style="margin-top:0">Lexical tripwires</h2><label><input type="checkbox" name="tripwires" {"checked" if pol["tripwires"].get("enabled", True) else ""}> Enabled (built-in lists for sentinel / CSAM terms / malware intent)</label><label>Extra patterns — one Python regex per line</label><textarea name="extra">{esc(extra)}</textarea></div>
+<div class="card"><h2 style="margin-top:0">Retention &amp; evidence</h2>
+<label>Immutable categories (entries cannot be cleared; they expire by time). S4 is always immutable.</label>{"".join(f'<label style="display:inline-block;margin:4px 14px 4px 0"><input type="checkbox" name="imm_{c}" {"checked" if c in pol["retention"].get("immutable_categories", []) else ""} {"disabled" if c == "S4" else ""}> {c} {esc(CATEGORIES[c][0])}</label>' for c in CATEGORIES)}
+<label>Immutable entries expire after (days, minimum 90)</label><input name="imm_days" type="number" min="90" value="{esc(pol["retention"].get("immutable_days", 730))}" style="width:120px">
+<label>Sealed evidence for categories (S4 always). Full request/output, client IP, matched spans — encrypted, hash-chained, console-only export.</label>{"".join(f'<label style="display:inline-block;margin:4px 14px 4px 0"><input type="checkbox" name="ev_{c}" {"checked" if c in pol["retention"]["evidence"].get("categories", []) else ""} {"disabled" if c == "S4" else ""}> {c} {esc(CATEGORIES[c][0])}</label>' for c in CATEGORIES)}
+<label>Evidence retention (days, minimum 90)</label><input name="ev_days" type="number" min="90" value="{esc(pol["retention"]["evidence"].get("days", 730))}" style="width:120px">
+<div class="mut">CSAM tripwire hits are always immutable and always sealed. Changing retention is audited and alerted.</div></div>
 <div class="card"><h2 style="margin-top:0">Diagnostics</h2><label><input type="checkbox" name="store_snippet" {"checked" if pol.get("audit", {}).get("store_snippet") else ""}> Store a 160-character snippet of <b>flagged output</b> (root-only file)</label><div class="mut">Off by default: logs never contain content. Never applies to S4 or CSAM-tripwire vetoes. Toggling is audited and alerted.</div></div>
 <p class="mut">Last change: {esc(pol.get("updated") or "never")} by {esc(pol.get("updated_by") or "—")}.</p><button type="submit">Save policy</button></form>"""
     return page("safety", "policy", "VetoGuard policy", "What the safety gate blocks. Administrator only; every change is audited.", body, msg, ok)
@@ -714,10 +770,16 @@ def p_audit():
     if snips:
         sp, sctl = paginate(snips, "n")
         srows = '<div class="card"><h2 style="margin-top:0">Flagged-output snippets (diagnostics)</h2>' + sctl + '<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Key</th><th>Snippet</th></tr>' + "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))} {esc(e.get("detail", ""))}</td><td>{esc(e.get("key_alias"))}</td><td><code>{esc(e.get("snippet", ""))}</code></td></tr>' for e in sp) + '</table></div>'
-    veto, vctl = paginate(tail_jsonl(VETO_AUDIT, 5000), "v"); hub, hctl = paginate(tail_jsonl(HUB_AUDIT, 5000), "h")
-    vrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))}</td><td>{esc(e.get("detail", ""))[:90]}</td><td>{esc(e.get("model"))}</td><td>{esc(e.get("key_alias"))}</td></tr>' for e in veto) or '<tr><td colspan="6" class="mut">none</td></tr>'
+    allv = tail_jsonl(VETO_AUDIT, 5000); veto, vctl = paginate(allv, "v"); hub, hctl = paginate(tail_jsonl(HUB_AUDIT, 5000), "h")
+    r = policy()["retention"]
+    vrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))}</td><td>{esc(e.get("detail", ""))[:90]}</td><td>{esc(e.get("model"))}</td><td>{esc(e.get("key_alias"))}</td><td>{"<span class=tag title=\"cannot be cleared; expires by time\">&#128274; immutable</span>" if e.get("immutable") else ""} {("<span class=\"tag warn\" title=\"sealed evidence record\">evidence " + esc(str(e.get("evidence_id"))[:15]) + "…</span>") if e.get("evidence_id") else ""}</td></tr>' for e in veto) or '<tr><td colspan="7" class="mut">none</td></tr>'
+    n_imm = sum(1 for e in allv if e.get("immutable")); n_clr = len(allv) - n_imm
+    clear = f'<form method="post" action="/hub/api/audit/clear" class="inline">{csrf_field()}<input type="hidden" name="confirm" value="clear"><button class="danger">Clear log ({n_clr} clearable)</button></form> <span class="mut">{n_imm} immutable entries stay until {r.get("immutable_days")} days old ({esc(", ".join(r.get("immutable_categories", [])))} · tripwires {esc(", ".join(r.get("immutable_tripwires", [])))}).</span>'
+    ev, ectl = paginate(evidence_index(), "ev", 10)
+    evrows = "".join(f'<tr><td><code>{esc(e.get("id"))}</code></td><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))} {esc(e.get("reason"))}</td><td>{esc(", ".join(e.get("categories") or []))}</td><td>{esc(e.get("key_alias"))}</td><td class="mut"><code>{esc(str(e.get("hash"))[:16])}…</code></td></tr>' for e in ev) or '<tr><td colspan="6" class="mut">no sealed records</td></tr>'
     hrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("actor"))}</td><td>{esc(e.get("event"))}</td><td>{esc(", ".join(f"{k}={v}" for k, v in e.items() if k not in ("ts", "event", "actor")))[:120]}</td></tr>' for e in hub) or '<tr><td colspan="4" class="mut">none</td></tr>'
-    body = srows + f'<div class="card"><h2 style="margin-top:0">Vetoes</h2>{vctl}<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Category / detail</th><th>Model</th><th>Key</th></tr>{vrows}</table>{vctl}</div><div class="card"><h2 style="margin-top:0">Admin actions</h2>{hctl}<table><tr><th>Time</th><th>Actor</th><th>Event</th><th>Fields</th></tr>{hrows}</table>{hctl}</div><p class="mut">Logs never contain message content. Files: proxy/audit/veto-audit.jsonl, proxy/audit/hub-audit.jsonl (root-only on the host).</p>'
+    evcard = f'<div class="card"><h2 style="margin-top:0">Sealed evidence records</h2><p class="mut">Captured for {esc(", ".join(r["evidence"].get("categories", [])))} and tripwires {esc(", ".join(r["evidence"].get("tripwires", [])))}: full request/output, timestamp, key, client IP, matched spans — encrypted at rest, hash-chained, never displayed here. Kept {r["evidence"].get("days")} days. Export for law enforcement is console-only: <code>scripts/evidence-export.sh &lt;id|all&gt; &lt;outdir&gt;</code> (verifies the chain).</p>{ectl}<table><tr><th>Record</th><th>Time</th><th>Trigger</th><th>Categories</th><th>Key</th><th>Hash</th></tr>{evrows}</table></div>'
+    body = srows + f'<div class="card"><h2 style="margin-top:0">Vetoes</h2><div style="margin:0 0 8px">{clear}</div>{vctl}<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Category / detail</th><th>Model</th><th>Key</th><th></th></tr>{vrows}</table>{vctl}</div>' + evcard + f'<div class="card"><h2 style="margin-top:0">Admin actions</h2>{hctl}<table><tr><th>Time</th><th>Actor</th><th>Event</th><th>Fields</th></tr>{hrows}</table>{hctl}</div><p class="mut">Logs never contain message content. Files: proxy/audit/veto-audit.jsonl, proxy/audit/hub-audit.jsonl (root-only on the host).</p>'
     return page("safety", "audit", "Audit log", "Every veto (what tripped, who, when) and every administrative action.", body)
 
 
@@ -858,7 +920,18 @@ def act_policy(form):
     snip = "store_snippet" in form
     if snip != bool(pol.get("audit", {}).get("store_snippet")):
         audit("snippet_logging_" + ("enabled" if snip else "disabled"))
-    pol["audit"] = {"store_snippet": snip}; pol["updated"], pol["updated_by"] = now(), getattr(REQ, "user", "admin")
+    pol["audit"] = {"store_snippet": snip}
+    r = pol.setdefault("retention", json.loads(json.dumps(DEFAULT_RETENTION)))
+    try:
+        imm_days, ev_days = max(90, int(form.get("imm_days", 730))), max(90, int(form.get("ev_days", 730)))
+    except ValueError:
+        return p_policy("Retention days must be integers.", False)
+    new_r = {"immutable_categories": sorted({c for c in CATEGORIES if f"imm_{c}" in form} | {"S4"}), "immutable_tripwires": ["csam", "despaced"], "immutable_days": imm_days,
+             "evidence": {"enabled": True, "categories": sorted({c for c in CATEGORIES if f"ev_{c}" in form} | {"S4"}), "tripwires": ["csam", "despaced"], "days": ev_days}}
+    if new_r != r:
+        audit("retention_changed", immutable=",".join(new_r["immutable_categories"]), immutable_days=imm_days, evidence=",".join(new_r["evidence"]["categories"]), evidence_days=ev_days)
+    pol["retention"] = new_r
+    pol["updated"], pol["updated_by"] = now(), getattr(REQ, "user", "admin")
     save_json(POLICY_FILE, pol)
     changed = [f"{c}:{'block' if pol['categories'][c]['block'] else 'allow'}" for c in CATEGORIES if before[c] != pol["categories"][c]["block"]]
     audit("policy_saved", guard_model=gm, changed=",".join(changed) or "none", tripwires=pol["tripwires"]["enabled"], extra_patterns=len(extra))
@@ -866,6 +939,39 @@ def act_policy(form):
         activate_guard(gm)
         return p_policy(f"Policy saved. Loading {gm} into memory now (other guard models are being unloaded); refresh in ~20 s to see it resident.")
     return p_policy("Policy saved. LiteLLM picks it up within seconds (no restart).")
+
+
+def act_clear_log(form):
+    if form.get("confirm") != "clear":
+        return p_audit()
+    r = policy()["retention"]; cutoff = time.time() - int(r.get("immutable_days", 730)) * 86400
+    kept, cleared, expired = [], 0, 0
+    try:
+        import fcntl
+        with open(VETO_AUDIT + ".lock", "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                with open(VETO_AUDIT, encoding="utf-8") as f:
+                    for line in f:
+                        try: e = json.loads(line)
+                        except ValueError: continue
+                        if e.get("immutable"):
+                            try: ts = datetime.fromisoformat(e["ts"]).timestamp()
+                            except (ValueError, KeyError): ts = time.time()
+                            if ts < cutoff: expired += 1
+                            else: kept.append(line)
+                        else:
+                            cleared += 1
+                tmp = VETO_AUDIT + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(kept)
+                os.chmod(tmp, 0o644); os.replace(tmp, VETO_AUDIT)
+            finally:
+                fcntl.flock(lk, fcntl.LOCK_UN)
+    except OSError as e:
+        return p_audit() if False else page("safety", "audit", "Audit log", "Every veto and every administrative action.", f'<div class="msg bad">Clear failed: {esc(e)}</div>')
+    audit("veto_log_cleared", cleared=cleared, immutable_kept=len(kept), immutable_expired=expired)
+    return p_audit()
 
 
 def act_alerts(form):
@@ -1042,7 +1148,7 @@ def act_hostname(form):
     return p_hostname(f"Applied {host}. Caddy will obtain the certificate via DNS-01 within a minute or two. {m}" if ok else f"Failed and rolled back: {m}", ok)
 
 
-ACTIONS = {"/hub/api/ops": act_ops, "/hub/api/policy": act_policy, "/hub/api/alerts": act_alerts, "/hub/api/models/pull": act_pull,
+ACTIONS = {"/hub/api/ops": act_ops, "/hub/api/audit/clear": act_clear_log, "/hub/api/policy": act_policy, "/hub/api/alerts": act_alerts, "/hub/api/models/pull": act_pull,
            "/hub/api/models/expose": act_expose, "/hub/api/models/unexpose": act_unexpose, "/hub/api/models/remove": act_remove,
            "/hub/api/models/unload": act_unload, "/hub/api/models/load": act_load, "/hub/api/models/setguard": act_setguard,
            "/hub/api/keys/mint": act_mint, "/hub/api/keys/revoke": act_revoke, "/hub/api/keys/update": act_keys_update, "/hub/api/hostname": act_hostname}
@@ -1250,4 +1356,5 @@ if __name__ == "__main__":
     if not os.path.exists(POLICY_FILE):
         save_json(POLICY_FILE, DEFAULT_POLICY)
     threading.Thread(target=_veto_watcher, name="veto-watcher", daemon=True).start()
+    threading.Thread(target=_retention_sweeper, name="retention-sweeper", daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", 9000), Handler).serve_forever()

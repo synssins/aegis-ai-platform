@@ -4,6 +4,9 @@ All significant changes to the platform are recorded here. Every entry must name
 
 ## 2026-09-24 (night) — 8B guard live with Gemma 3 27B
 
+- **Disk:** root volume was 98 GB and hit 100% during a model pull (git and a pull failed); 18.6 GB of partial blobs and unused images reclaimed, then the LV grown online by 400 GB (492 GB now; 1 TB still free in the VG).
+- **VetoGuard 2.9 — retention + evidence** (operator requirement): audit entries carry `immutable` (S4 always; S3/S10/S11 and CSAM tripwires by default) and can only expire by time; hub **Clear log** keeps them. Evidence set (S4 + CSAM tripwires; S4 always) produces sealed records — full request/output, key, client IP/agent, model, categories with names, exact matched spans — Fernet-encrypted (`VETO_EVIDENCE_KEY`), hash-chained, metadata-only index, root-only, expiry sweeper; `scripts/evidence-export.sh` verifies the chain and exports for law enforcement. Unit-verified: capture set, encryption, index without content, client IP, spans, chain integrity.
+
 - **Home Assistant tool calls:** HA sends function schemas; Gemma 3 (and Mixtral) have no `tools` capability in Ollama and the hub registered models on LiteLLM's `ollama/` provider (emulated functions ⇒ the call came back as JSON text). Hub "Expose" now reads Ollama's declared capabilities and registers tool-capable models on `ollama_chat/` (native tool calls); Installed/Exposed pages show capability tags. `qwen3:30b` (tools, ~19 GB, fits beside the 8B guard) pulled as the HA candidate.
 
 - **VetoGuard 2.8 — verdict adapters.** Adapter registry (request template + parser per safety family; Llama Guard shipped). No adapter or unreadable answer ⇒ refused with 503 `guard_no_adapter` / `guard_verdict_unparseable`; audit records `got=` (classifier answer, ≤ 120 chars) and `expected=`; alerted. Hub refuses to select adapter-less families and says why. Operator rule: unreadable verdict = fail closed + diagnose, never allow. Test 3.13.

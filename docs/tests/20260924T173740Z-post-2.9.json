@@ -1,0 +1,561 @@
+{
+ "label": "post-2.9",
+ "ts": "2026-09-24T17:37:40.090544+00:00",
+ "base": "https://<AEGIS_LAN_IP>",
+ "passed": 68,
+ "total": 69,
+ "results": [
+  {
+   "id": "1.1",
+   "phase": "network",
+   "desc": "ollama container has no WAN egress",
+   "expected": "connect fails",
+   "actual": "rc=1 bash: connect: Network is unreachable\nbash: line 1: /dev/tcp/1.1.1.1/443: Network is unreachable",
+   "pass": true
+  },
+  {
+   "id": "1.2",
+   "phase": "network",
+   "desc": "host localhost:11434 not bound",
+   "expected": "connection refused",
+   "actual": "0",
+   "pass": true
+  },
+  {
+   "id": "1.3",
+   "phase": "network",
+   "desc": "openwebui cannot reach ollama (segmented)",
+   "expected": "curl fails / 000",
+   "actual": "000",
+   "pass": true
+  },
+  {
+   "id": "1.4",
+   "phase": "network",
+   "desc": "openwebui reaches litellm but is unauthenticated on /health",
+   "expected": "401",
+   "actual": "401",
+   "pass": true
+  },
+  {
+   "id": "1.5",
+   "phase": "network",
+   "desc": "ollama cannot resolve external names",
+   "expected": "fails",
+   "actual": "rc=2",
+   "pass": true
+  },
+  {
+   "id": "2.1",
+   "phase": "edge",
+   "desc": "/v1/models without key",
+   "expected": "401",
+   "actual": "401",
+   "pass": true
+  },
+  {
+   "id": "2.2",
+   "phase": "edge",
+   "desc": "/v1/models with key",
+   "expected": "200",
+   "actual": "200",
+   "pass": true
+  },
+  {
+   "id": "2.3",
+   "phase": "edge",
+   "desc": "/v1/model/info blocked at edge",
+   "expected": "404",
+   "actual": "404",
+   "pass": true
+  },
+  {
+   "id": "2.4",
+   "phase": "edge",
+   "desc": "/v1/key/generate blocked at edge",
+   "expected": "404",
+   "actual": "404",
+   "pass": true
+  },
+  {
+   "id": "2.5",
+   "phase": "edge",
+   "desc": "OpenWebUI signup disabled",
+   "expected": "False",
+   "actual": "False",
+   "pass": true
+  },
+  {
+   "id": "2.6",
+   "phase": "edge",
+   "desc": "security headers present, Server header absent",
+   "expected": "HSTS+nosniff, no Server",
+   "actual": "{'strict-transport-security': 'max-age=31536000', 'x-content-type-options': 'nosniff', 'server': None}",
+   "pass": true
+  },
+  {
+   "id": "2.7",
+   "phase": "edge",
+   "desc": "/hub without a session redirects to login",
+   "expected": "303 -> /hub/login",
+   "actual": "303 /hub/login",
+   "pass": true
+  },
+  {
+   "id": "2.7b",
+   "phase": "hub",
+   "desc": "first-run wizard unavailable once an administrator exists",
+   "expected": "303 -> /hub/login (or 303 -> /hub/setup only while unconfigured)",
+   "actual": "303 /hub/login",
+   "pass": true
+  },
+  {
+   "id": "3.1",
+   "phase": "veto",
+   "desc": "sentinel in user turn -> 400 veto_triggered",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "3.1b",
+   "phase": "veto",
+   "desc": "veto written to audit log",
+   "expected": "line count +1",
+   "actual": "252->253",
+   "pass": true
+  },
+  {
+   "id": "3.2",
+   "phase": "veto",
+   "desc": "history containing a vetoed turn stays refused (fabricated history is scanned; start a new chat)",
+   "expected": "400",
+   "actual": "400 ''",
+   "pass": true
+  },
+  {
+   "id": "3.2b",
+   "phase": "veto",
+   "desc": "a fresh conversation after a veto works normally",
+   "expected": "200 + answer",
+   "actual": "200 'Paris.'",
+   "pass": true
+  },
+  {
+   "id": "3.3",
+   "phase": "veto",
+   "desc": "letter-spaced sentinel -> 400",
+   "expected": "400",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "3.4",
+   "phase": "veto",
+   "desc": "base64-wrapped sentinel -> 400",
+   "expected": "400",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "3.5",
+   "phase": "veto",
+   "desc": "zero-width-obfuscated sentinel -> 400",
+   "expected": "400",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "3.6",
+   "phase": "veto",
+   "desc": "/v1/completions prompt field scanned",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "3.7",
+   "phase": "veto",
+   "desc": "/v1/embeddings input field scanned",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "3.8",
+   "phase": "veto",
+   "desc": "tool-result message scanned (roadmap: MCP)",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "3.9",
+   "phase": "veto",
+   "desc": "ordinary coding vocabulary is NOT vetoed",
+   "expected": "200",
+   "actual": "200/None",
+   "pass": true
+  },
+  {
+   "id": "3.10",
+   "phase": "veto",
+   "desc": "streaming request passes through buffered classifier",
+   "expected": "200 + data:",
+   "actual": "200 b'data: {\"id\":\"chatcmpl-7bc51852-d185-41e0-8f41-0b4c63e73eb3\",'",
+   "pass": true
+  },
+  {
+   "id": "3.11",
+   "phase": "veto",
+   "desc": "guard model resident in ollama",
+   "expected": "llama-guard3 listed",
+   "actual": "NAME               ID              SIZE      PROCESSOR    CONTEXT    UNTIL             \ngemma3:27b         a418f5838eaf ",
+   "pass": true
+  },
+  {
+   "id": "3.13",
+   "phase": "veto",
+   "desc": "unreadable classifier verdict is refused and logged with got/expected",
+   "expected": "guard_verdict_unparseable True True + noadapter True",
+   "actual": "guard_verdict_unparseable True True noadapter True VetoGuard policy loaded: mode",
+   "pass": true
+  },
+  {
+   "id": "3.14",
+   "phase": "veto",
+   "desc": "S4 is immutable + evidence; sentinel is neither; evidence key present",
+   "expected": "True False True False True",
+   "actual": "True False True False True\nVetoGuard policy loaded: model=llama-guard3:8b blocked=['S1', 'S10', 'S11', 'S2', 'S3', 'S4', 'S9'] extra_tripwires=0",
+   "pass": false
+  },
+  {
+   "id": "3.15",
+   "phase": "hygiene",
+   "desc": "evidence store is root-only",
+   "expected": "root 700",
+   "actual": "root 700",
+   "pass": true
+  },
+  {
+   "id": "3.16",
+   "phase": "veto",
+   "desc": "sentinel test vetoes are clearable (not flagged immutable)",
+   "expected": "immutable count < sentinel count",
+   "actual": "1/225",
+   "pass": true
+  },
+  {
+   "id": "3.12",
+   "phase": "veto",
+   "desc": "main model resident on GPU (not CPU fallback)",
+   "expected": ">=1 model on GPU",
+   "actual": "2",
+   "pass": true
+  },
+  {
+   "id": "4.1",
+   "phase": "hygiene",
+   "desc": "OpenWebUI does not hold the master key",
+   "expected": "virtual key",
+   "actual": "masked",
+   "pass": true
+  },
+  {
+   "id": "4.2",
+   "phase": "hygiene",
+   "desc": "Caddyfile root-owned 640; .env 600",
+   "expected": "root 640 / <owner> 600",
+   "actual": "root 640\n<user> 600",
+   "pass": true
+  },
+  {
+   "id": "4.3",
+   "phase": "hygiene",
+   "desc": "openwebui data dir not world-readable",
+   "expected": "700",
+   "actual": "700",
+   "pass": true
+  },
+  {
+   "id": "4.4-caddy",
+   "phase": "hygiene",
+   "desc": "caddy: not privileged, cap_drop ALL, no-new-privileges",
+   "expected": "false [ALL] [no-new-privileges:true]",
+   "actual": "false [ALL] [no-new-privileges:true]",
+   "pass": true
+  },
+  {
+   "id": "4.4-openwebui",
+   "phase": "hygiene",
+   "desc": "openwebui: not privileged, cap_drop ALL, no-new-privileges",
+   "expected": "false [ALL] [no-new-privileges:true]",
+   "actual": "false [ALL] [no-new-privileges:true]",
+   "pass": true
+  },
+  {
+   "id": "4.4-litellm",
+   "phase": "hygiene",
+   "desc": "litellm: not privileged, cap_drop ALL, no-new-privileges",
+   "expected": "false [ALL] [no-new-privileges:true]",
+   "actual": "false [ALL] [no-new-privileges:true]",
+   "pass": true
+  },
+  {
+   "id": "4.4-ollama",
+   "phase": "hygiene",
+   "desc": "ollama: not privileged, cap_drop ALL, no-new-privileges",
+   "expected": "false [ALL] [no-new-privileges:true]",
+   "actual": "false [ALL] [no-new-privileges:true]",
+   "pass": true
+  },
+  {
+   "id": "4.5",
+   "phase": "hygiene",
+   "desc": "backend network is internal",
+   "expected": "true",
+   "actual": "true",
+   "pass": true
+  },
+  {
+   "id": "5.3",
+   "phase": "hub",
+   "desc": "policy file has S4 blocked",
+   "expected": "True",
+   "actual": "True",
+   "pass": true
+  },
+  {
+   "id": "5.4",
+   "phase": "hub",
+   "desc": "policy dir/file root-only",
+   "expected": "root 700 / root 600",
+   "actual": "root 700\nroot 600",
+   "pass": true
+  },
+  {
+   "id": "5.5",
+   "phase": "network",
+   "desc": "openwebui cannot reach modeld (mgmt isolated)",
+   "expected": "000",
+   "actual": "000",
+   "pass": true
+  },
+  {
+   "id": "5.6",
+   "phase": "network",
+   "desc": "modeld HAS egress (pull path)",
+   "expected": "egress",
+   "actual": "egress",
+   "pass": true
+  },
+  {
+   "id": "5.7",
+   "phase": "network",
+   "desc": "litellm cannot reach modeld",
+   "expected": "fails",
+   "actual": "3] Temporary failure in name resolution>",
+   "pass": true
+  },
+  {
+   "id": "5.8",
+   "phase": "edge",
+   "desc": "ComfyUI route hard-gated at edge",
+   "expected": "503",
+   "actual": "503",
+   "pass": true
+  },
+  {
+   "id": "5.9",
+   "phase": "hub",
+   "desc": "litellm mounts policy read-only",
+   "expected": "/app/policy:false",
+   "actual": "/app/custom_logger/veto_filter.py:false /app/policy:false /app/audit:true /app/evidence:true /app/config/config.yaml:false",
+   "pass": true
+  },
+  {
+   "id": "5.10",
+   "phase": "hub",
+   "desc": "hub shares caddy netns, read-only fs, cap_drop ALL",
+   "expected": "container:\u2026 true [ALL]",
+   "actual": "container:c8988d45a4cb9f35aa34efa527effc99bc23bccf7c2f6a5f549fa04d8a95ea76 true [ALL]",
+   "pass": true
+  },
+  {
+   "id": "6.1",
+   "phase": "veto",
+   "desc": "assistant-prefill after sentinel user turn is still scanned",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "6.2",
+   "phase": "veto",
+   "desc": "system message scanned",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "6.3",
+   "phase": "veto",
+   "desc": "tool schema description scanned",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "6.4",
+   "phase": "veto",
+   "desc": "URL-safe base64 sentinel decoded",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "6.5",
+   "phase": "veto",
+   "desc": "arbitrary-delimiter despacing",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "6.6",
+   "phase": "veto",
+   "desc": "combining-mark obfuscation stripped",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "6.7",
+   "phase": "veto",
+   "desc": "Cyrillic confusable mapped",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "6.8",
+   "phase": "veto",
+   "desc": "assistant tool_calls arguments in history scanned",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "6.9",
+   "phase": "veto",
+   "desc": "classifier chunk budget bounded (<=100)",
+   "expected": "<=100",
+   "actual": "100",
+   "pass": true
+  },
+  {
+   "id": "7.1",
+   "phase": "veto",
+   "desc": "sentinel in an EARLIER user turn (fabricated history) is caught",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "7.2",
+   "phase": "veto",
+   "desc": "non-standard content part type still extracted",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "7.3",
+   "phase": "veto",
+   "desc": "lowercase Cyrillic confusable mapped",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "7.4",
+   "phase": "veto",
+   "desc": "JSON-escaped tool-call arguments unescaped before tripwires",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "7.5",
+   "phase": "veto",
+   "desc": "base64 of just the sentinel (no padding text) decoded",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "7.6",
+   "phase": "veto",
+   "desc": "request with messages but no extractable text is refused (fail-closed)",
+   "expected": "400",
+   "actual": "400",
+   "pass": true
+  },
+  {
+   "id": "7.7",
+   "phase": "veto",
+   "desc": "n=2 streaming request is classified per choice and released",
+   "expected": "200 + data:",
+   "actual": "200 b'data: {\"id\":\"chatcmpl-7ce5250e-afec-468d'",
+   "pass": true
+  },
+  {
+   "id": "7.8",
+   "phase": "veto",
+   "desc": "no thread growth from audit writes (single writer)",
+   "expected": "< 40 threads",
+   "actual": "1",
+   "pass": true
+  },
+  {
+   "id": "8.1",
+   "phase": "veto",
+   "desc": "oversized unknown multipart block still scanned",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "8.2",
+   "phase": "veto",
+   "desc": "base64 with stray non-printable bytes still decoded",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "8.3",
+   "phase": "veto",
+   "desc": "indented multi-line base64 joined and decoded",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "8.4",
+   "phase": "veto",
+   "desc": "assistant prefill containing the sentinel is caught",
+   "expected": "400/veto_triggered",
+   "actual": "400/veto_triggered",
+   "pass": true
+  },
+  {
+   "id": "8.5",
+   "phase": "hygiene",
+   "desc": "snippet diagnostics default OFF",
+   "expected": "False",
+   "actual": "False",
+   "pass": true
+  }
+ ]
+}

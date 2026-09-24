@@ -1,6 +1,14 @@
 """
-VetoGuard rev 2.8 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
+VetoGuard rev 2.9 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
 driven by an admin-editable policy file (hot-reloaded) that only the hub may write.
+
+rev 2.9: RETENTION + EVIDENCE. Every audit entry carries "immutable": true when its category/tripwire is in
+the policy's immutable set (S4 always) — the hub's "clear log" keeps those until they expire by time.
+Vetoes in the evidence set (S4 + CSAM tripwires by default) additionally produce a sealed EVIDENCE
+RECORD in VETO_EVIDENCE_DIR: full request (and output), timestamp, key alias, client IP/agent, model,
+categories with names, exact matched spans, hash-chained (prev_hash -> hash) and Fernet-encrypted with
+VETO_EVIDENCE_KEY. A plaintext index (metadata only, no content) lets the hub list record ids. Export and
+decryption are console-only (scripts/evidence-export.sh).
 
 rev 2.8: verdict ADAPTERS. Each safety-model family has an adapter that builds the classifier request and
 parses its answer; only Llama Guard ships today. A model with no adapter, or an answer the adapter cannot
@@ -65,6 +73,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import binascii
 import fcntl
+import hashlib
 import copy
 import json
 import logging
@@ -87,6 +96,8 @@ GUARD_URL = os.environ.get("VETO_GUARD_URL", "http://ollama:11434").rstrip("/")
 POLICY_PATH = os.environ.get("VETO_POLICY_PATH", "/app/policy/veto-policy.json")
 AUDIT_PATH = os.environ.get("VETO_AUDIT_PATH", "/app/audit/veto-audit.jsonl")
 SNIPPET_PATH = os.environ.get("VETO_SNIPPET_PATH", "/app/audit/veto-snippets.jsonl")
+EVIDENCE_DIR = os.environ.get("VETO_EVIDENCE_DIR", "/app/evidence")
+EVIDENCE_KEY = os.environ.get("VETO_EVIDENCE_KEY", "")
 SNIPPET_CHARS = 160
 NEVER_SNIPPET = ("S4", "csam", "despaced")
 AUDIT_ROTATE_BYTES = 50 * 1024 * 1024
@@ -113,6 +124,8 @@ DEFAULT_POLICY = {
     "categories": {c: {"block": c in DEFAULT_BLOCK} for c in LLAMA_GUARD_CATEGORIES},
     "tripwires": {"enabled": True, "extra_patterns": []},
     "audit": {"store_snippet": False},
+    "retention": {"immutable_categories": ["S4", "S3", "S10", "S11"], "immutable_tripwires": ["csam", "despaced"], "immutable_days": 730,
+                  "evidence": {"enabled": True, "categories": ["S4"], "tripwires": ["csam", "despaced"], "days": 730}},
 }
 
 
@@ -174,9 +187,11 @@ class Policy:
                 try:
                     with open(POLICY_PATH, encoding="utf-8") as f:
                         loaded = json.load(f)
-                    for k in ("guard", "tripwires", "audit"):
+                    for k in ("guard", "tripwires", "audit", "retention"):
                         if isinstance(loaded.get(k), dict):
-                            data[k].update(loaded[k])
+                            if k == "retention" and isinstance(loaded[k].get("evidence"), dict):
+                                data[k]["evidence"].update(loaded[k]["evidence"])
+                            data[k].update({kk: vv for kk, vv in loaded[k].items() if kk != "evidence"})
                     if isinstance(loaded.get("categories"), dict):
                         for c, v in loaded["categories"].items():
                             if c in data["categories"] and isinstance(v, dict):
@@ -187,6 +202,11 @@ class Policy:
             elif self._mtime is not None:
                 log.error("policy file vanished; keeping previous policy")
                 return
+            # S4 is always immutable and always captured as evidence
+            r = data["retention"]
+            r["immutable_categories"] = sorted(set(r.get("immutable_categories", [])) | {"S4"})
+            r["evidence"]["categories"] = sorted(set(r["evidence"].get("categories", [])) | {"S4"})
+            r["immutable_days"] = max(90, int(r.get("immutable_days", 730))); r["evidence"]["days"] = max(90, int(r["evidence"].get("days", 730)))
             for c in LOCKED_CATEGORIES:
                 data["categories"][c]["block"] = True
             pats = []
@@ -401,13 +421,18 @@ class RequestView:
         self.new_texts = [t for t in self.new_segment + self.decoded if t and t.strip()]
 
 
+LAST_SPAN = threading.local()   # matched text of the last tripwire hit (evidence only; never audited)
+
+
 def scan(texts: Iterable[str], patterns: list[re.Pattern]) -> str | None:
     if not patterns:
         return None
     for t in texts:
         n = normalise(t)
         for p in patterns:
-            if p.search(n):
+            m = p.search(n)
+            if m:
+                LAST_SPAN.value = m.group(0)[:200]
                 return p.pattern
     return None
 
@@ -416,19 +441,23 @@ def scan_despaced(texts: Iterable[str]) -> str | None:
     for t in texts:
         d = NON_ALNUM_RE.sub("", normalise(t))
         for p in DESPACED_RE:
-            if p.search(d):
+            m = p.search(d)
+            if m:
+                LAST_SPAN.value = m.group(0)[:200]
                 return p.pattern
     return None
 
 
-def tripwire_check(texts: list[str], lists: tuple[str, ...]) -> tuple[str, str] | None:
+def tripwire_check(texts: list[str], lists: tuple[str, ...]) -> tuple[str, str, str] | None:
+    """Returns (list_name, pattern, matched_span) on first hit."""
+    LAST_SPAN.value = ""
     table = {"sentinel": SENTINEL_RE, "csam": CSAM_RE, "malware": MALWARE_RE, "extra": POLICY.extra_re}
     for name in lists:
         hit = scan(texts, table[name])
         if hit:
-            return name, hit
+            return name, hit, getattr(LAST_SPAN, "value", "")
     hit = scan_despaced(texts)
-    return ("despaced", hit) if hit else None
+    return ("despaced", hit, getattr(LAST_SPAN, "value", "")) if hit else None
 
 
 _SCAN_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="veto-scan")
@@ -475,6 +504,70 @@ def _audit_writer() -> None:
 threading.Thread(target=_audit_writer, name="veto-audit-writer", daemon=True).start()
 
 
+def _is_immutable(reason: str, detail: str) -> bool:
+    r = POLICY.data.get("retention", {})
+    cats = set(re.findall(r"\bS\d{1,2}\b", detail or ""))
+    if cats & set(r.get("immutable_categories", [])):
+        return True
+    return any(reason == f"regex:{t}" for t in r.get("immutable_tripwires", []))
+
+
+def _wants_evidence(reason: str, detail: str) -> bool:
+    e = POLICY.data.get("retention", {}).get("evidence", {})
+    if not e.get("enabled", True):
+        return False
+    cats = set(re.findall(r"\bS\d{1,2}\b", detail or ""))
+    if cats & set(e.get("categories", [])):
+        return True
+    return any(reason == f"regex:{t}" for t in e.get("tripwires", []))
+
+
+def _client_meta(data: dict) -> dict:
+    h = {}
+    for src in (data.get("proxy_server_request", {}) or {}).get("headers", {}), (data.get("metadata", {}) or {}).get("headers", {}):
+        if isinstance(src, dict):
+            h.update({str(k).lower(): str(v) for k, v in src.items()})
+    return {"client_ip": (h.get("x-forwarded-for", "").split(",")[0].strip() or h.get("x-real-ip") or None), "user_agent": h.get("user-agent")}
+
+
+_EVIDENCE_LOCK = threading.Lock()
+
+
+def write_evidence(stage: str, reason: str, detail: str, data: dict, key_dict: Any, matches: list[dict], output: str | None) -> str | None:
+    """Sealed, hash-chained, encrypted record for the serious class. Returns the record id."""
+    if not EVIDENCE_KEY:
+        log.error("evidence capture requested but VETO_EVIDENCE_KEY is not set")
+        return None
+    try:
+        from cryptography.fernet import Fernet
+        f = Fernet(base64.urlsafe_b64encode(hashlib.sha256(EVIDENCE_KEY.encode()).digest()))
+        os.makedirs(EVIDENCE_DIR, exist_ok=True)
+        rid = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + hashlib.sha256(os.urandom(16)).hexdigest()[:8]
+        cats = [{"code": c, "name": LLAMA_GUARD_CATEGORIES.get(c, "")} for c in re.findall(r"\bS\d{1,2}\b", detail or "")]
+        rec = {"id": rid, "ts": datetime.now(timezone.utc).isoformat(), "stage": stage, "reason": reason, "detail": detail, "categories": cats,
+               "matches": matches, "call_id": data.get("litellm_call_id"), "model": data.get("model"), "key_alias": _key_alias(key_dict), **_client_meta(data),
+               "request": {k: data.get(k) for k in ("messages", "prompt", "input", "system", "tools", "functions") if data.get(k) is not None},
+               "output": output}
+        with _EVIDENCE_LOCK:
+            chain = os.path.join(EVIDENCE_DIR, "chain.txt")
+            prev = open(chain).read().strip() if os.path.exists(chain) else "GENESIS"
+            body = json.dumps(rec, sort_keys=True, ensure_ascii=False)
+            h = hashlib.sha256((prev + body).encode()).hexdigest()
+            rec["prev_hash"], rec["hash"] = prev, h
+            path = os.path.join(EVIDENCE_DIR, rid + ".json.enc")
+            with open(path, "wb") as fh:
+                fh.write(f.encrypt(json.dumps(rec, sort_keys=True, ensure_ascii=False).encode()))
+            os.chmod(path, 0o600)
+            with open(chain, "w") as fh:
+                fh.write(h)
+            with open(os.path.join(EVIDENCE_DIR, "index.jsonl"), "a", encoding="utf-8") as fh:   # metadata only, no content
+                fh.write(json.dumps({"id": rid, "ts": rec["ts"], "stage": stage, "reason": reason, "categories": [c["code"] for c in cats], "key_alias": rec["key_alias"], "hash": h}) + "\n")
+        return rid
+    except Exception as e:  # noqa: BLE001
+        log.error("evidence write failed: %s", _short_err(e))
+        return None
+
+
 def _key_alias(key_dict: Any) -> str | None:
     if isinstance(key_dict, dict):
         return key_dict.get("key_alias") or key_dict.get("user_id")
@@ -485,10 +578,15 @@ def _short_err(e: Any) -> str:
     return f"{type(e).__name__}: {str(e).splitlines()[0][:80]}" if isinstance(e, BaseException) else str(e)[:120]
 
 
-def audit(stage: str, reason: str, detail: str, data: dict, key_dict: Any) -> None:
+def audit(stage: str, reason: str, detail: str, data: dict, key_dict: Any, matches: list[dict] | None = None, output: str | None = None) -> None:
     dcap = 240 if reason in ("guard_verdict_unparseable", "guard_no_adapter") else 120
     rec = {"ts": datetime.now(timezone.utc).isoformat(), "stage": stage, "reason": reason, "detail": (detail.replace("\n", "\\n")[:dcap] if detail else ""),
-           "call_id": data.get("litellm_call_id"), "model": data.get("model"), "key_alias": _key_alias(key_dict)}
+           "call_id": data.get("litellm_call_id"), "model": data.get("model"), "key_alias": _key_alias(key_dict),
+           "immutable": _is_immutable(reason, detail)}
+    if _wants_evidence(reason, detail):
+        rid = write_evidence(stage, reason, detail, data, key_dict, matches or [], output)
+        if rid:
+            rec["evidence_id"] = rid
     log.warning("VETO %s", json.dumps(rec))
     try:
         _AUDIT_Q.put_nowait(rec)
@@ -724,7 +822,7 @@ class VetoGuard(CustomLogger):
                 audit("pre_call", "regex_budget_exhausted", "", data, user_api_key_dict)
                 _refuse(400, "veto_triggered", "Request refused by policy.")
             if hit:
-                audit("pre_call", f"regex:{hit[0]}", hit[1], data, user_api_key_dict)
+                audit("pre_call", f"regex:{hit[0]}", hit[1], data, user_api_key_dict, matches=[{"list": hit[0], "pattern": hit[1], "span": hit[2]}])
                 _refuse(400, "veto_triggered", "Request refused by policy.")
         try:
             unsafe, cats = await classify_request(view)
@@ -749,7 +847,7 @@ class VetoGuard(CustomLogger):
             if hit == "timeout":
                 audit(stage, "regex_budget_exhausted", "", data, key); return ["REGEX_BUDGET"]
             if hit:
-                audit(stage, f"regex:{hit[0]}", hit[1], data, key); snippet(stage, f"regex:{hit[0]}", hit[1], data, key, "\n".join(outputs)); return [hit[0]]
+                audit(stage, f"regex:{hit[0]}", hit[1], data, key, matches=[{"list": hit[0], "pattern": hit[1], "span": hit[2]}], output="\n".join(outputs)); snippet(stage, f"regex:{hit[0]}", hit[1], data, key, "\n".join(outputs)); return [hit[0]]
         try:
             try:
                 last_user = RequestView(data).last_user
@@ -761,7 +859,7 @@ class VetoGuard(CustomLogger):
         except GuardUnavailable as e:
             audit(stage, "guard_unavailable", _short_err(e), data, key); return ["GUARD_UNAVAILABLE"]
         if unsafe:
-            audit(stage, "classifier", cats_str(cats), data, key); snippet(stage, "classifier", cats_str(cats), data, key, "\n".join(outputs)); return cats
+            audit(stage, "classifier", cats_str(cats), data, key, output="\n".join(outputs)); snippet(stage, "classifier", cats_str(cats), data, key, "\n".join(outputs)); return cats
         return None
 
     async def async_post_call_success_hook(self, data, user_api_key_dict, response):

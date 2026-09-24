@@ -24,6 +24,9 @@
 ## Why there is no Docker socket in any container
 The Docker socket is root on the host. A container holding it turns any code-execution bug in that container into host compromise — every network split, capability drop and policy file becomes irrelevant. The hub therefore never talks to Docker. It writes one JSON request file; a root service *on the host* (`aegis-watchdog`) reads it, validates it against a fixed allow-list, and acts. The channel is a file in a root-only directory, not a socket or a port, so nothing on any network can reach it.
 
+## Evidence handling
+Sealed evidence records exist so that the most serious category of misuse (child sexual exploitation by default) can be reported with usable detail. They contain the offending request text. They are encrypted at rest, hash-chained, root-only, never rendered in any UI, and exportable only from the console with the chain verified. Treat exported bundles as sensitive material; retention defaults to two years and cannot be set below 90 days.
+
 ## Out of scope / known limits
 - The lexical tripwire is evadable by paraphrase; the classifier is the control and is itself imperfect.
   Tune with `VETO_GUARD_IGNORE_CATEGORIES` only after reviewing the audit log.

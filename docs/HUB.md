@@ -7,8 +7,8 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 |---|---|---|---|
 | Overview | Dashboard | — | services by network, safety posture, VRAM residency, certificates, recent vetoes |
 | | Services | start / stop / restart (checked containers) | real container status from the host **watchdog**; caddy and hub can only be restarted; one request at a time; every watchdog response (log + errors) listed |
-| Safety | VetoGuard policy | **classifier model (the one place it is chosen — saving loads it and unloads other guards)**, blocked categories, tripwires, extra regexes, diagnostics snippet toggle (default off) | **S4 is locked on**; classifier and fail-closed cannot be disabled; every save is audited + alerted |
-| | Audit log | — | last 150 vetoes and 100 admin actions; never contains content |
+| Safety | VetoGuard policy | **classifier model (the one place it is chosen — saving loads it and unloads other guards)**, blocked categories, tripwires, extra regexes, **retention & evidence** (immutable categories, days; evidence categories, days), diagnostics snippet toggle (default off) | **S4 is locked on**; classifier and fail-closed cannot be disabled; every save is audited + alerted |
+| | Audit log | **Clear log** (clearable entries only) | vetoes with immutable flag (🔒) and evidence-record marker; every admin action; sealed-evidence index (ids, times, categories, hashes — never content) |
 | | Alerts | webhook URL | Discord/Slack/generic JSON; "Send test" |
 | Models | Installed | expose / load / unload / remove; "Set as classifier" for guard-family models | expose = register in LiteLLM under a public name (through VetoGuard) — on the native chat API with real tool calls when the model advertises `tools`, text-only otherwise (capability tags shown); guard models never exposable and not loaded/unloaded by hand — their residency follows the policy choice; the active classifier cannot be removed |
 | | Pull | pull | via `modeld` — the only container with both internet and the model store. Apps never fetch their own |
@@ -43,6 +43,11 @@ Llama Guard 3 categories, grouped:
 The lexical tripwire (sentinel, CSAM terms, malware intent, plus admin-added regexes) runs before
 the classifier. The classifier runs on input and on output (streaming is buffered and released only
 after classification). If the guard model is unreachable the request is refused — this is not configurable.
+
+## Retention and sealed evidence
+- Every veto entry is flagged **immutable** when its category is in the immutable set (default S4, S3, S10, S11 — S4 always) or it came from a CSAM tripwire. **Clear log** removes only non-immutable entries; immutable ones expire after `immutable_days` (minimum 90, default 730). Clearing is itself audited with counts.
+- Vetoes in the **evidence** set (default S4 + CSAM tripwires; S4 always) also produce a sealed record in `proxy/evidence/`: full request (and output), timestamp, key alias, client IP and user agent, model, categories with names, and the exact matched spans for tripwire hits. Records are Fernet-encrypted with `VETO_EVIDENCE_KEY` and hash-chained (`prev_hash → hash`), so removal or alteration is detectable. A plaintext `index.jsonl` holds metadata only. The hub lists ids and hashes; it never decrypts. Records expire after `evidence.days` (minimum 90, default 730), audited.
+- **Export (law enforcement):** console only — `scripts/evidence-export.sh <id|all> <outdir>` decrypts inside the LiteLLM container, verifies the whole chain, writes plaintext JSON + `CHAIN-VERIFICATION.txt` + `SHA256SUMS` into a 0700 directory. Keep an offline copy of `VETO_EVIDENCE_KEY`; without it records are unreadable.
 
 ## Guard model choice (measured 2026-09-24 on 2× Tesla T4, Mixtral 8x7B resident)
 | Guard | Placement | 6000-char classification | Mixtral gen | Notes |

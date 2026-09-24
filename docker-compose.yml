@@ -55,6 +55,7 @@ services:
       - ./caddy/hub/state:/app/state
       - ./proxy/policy:/app/policy
       - ./proxy/audit:/app/audit
+      - ./proxy/evidence:/app/evidence
       - ./ops/requests:/app/ops/requests          # hub writes ONE request.json; the host watchdog consumes it
       - ./ops/responses:/app/ops/responses:ro     # watchdog results + status.json
     network_mode: "service:caddy"
@@ -110,7 +111,10 @@ services:
       - VETO_GUARD_URL=http://ollama:11434
       - VETO_POLICY_PATH=/app/policy/veto-policy.json
       - VETO_AUDIT_PATH=/app/audit/veto-audit.jsonl
+      - VETO_EVIDENCE_DIR=/app/evidence
+      - VETO_EVIDENCE_KEY=${VETO_EVIDENCE_KEY}
     volumes:
+      - ./proxy/evidence:/app/evidence
       - ./proxy/config.yaml:/app/config/config.yaml:ro
       - ./proxy/veto_filter.py:/app/custom_logger/veto_filter.py:ro
       - ./proxy/policy:/app/policy:ro

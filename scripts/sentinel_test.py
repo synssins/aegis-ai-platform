@@ -252,6 +252,13 @@ class Suite:
         self.rec("3.11", "veto", "guard model resident in ollama", "llama-guard3 listed", out[:120], "llama-guard3" in out)
         rc, out = docker("exec litellm python3 -c \"import sys;sys.path.insert(0,'/app');from custom_logger import veto_filter as v\nimport json\ntry:\n v._parse_llama_guard('This looks fine to me.')\nexcept v.GuardVerdictUnparseable as e: print(e.reason, 'got' in str(e), 'expected' in str(e))\nprint('noadapter', v.adapter_for('shieldgemma:2b') is None)\"", timeout=30)
         self.rec("3.13", "veto", "unreadable classifier verdict is refused and logged with got/expected", "guard_verdict_unparseable True True + noadapter True", out.replace("\n", " ")[:80], "guard_verdict_unparseable True True" in out and "noadapter True" in out)
+        rc, out = docker("exec litellm python3 -c \"import sys;sys.path.insert(0,'/app');from custom_logger import veto_filter as v\nprint(v._is_immutable('classifier','S4 Child Sexual Exploitation'), v._is_immutable('regex:sentinel','x'), v._wants_evidence('classifier','S4 Child Sexual Exploitation'), v._wants_evidence('regex:sentinel','x'), bool(v.EVIDENCE_KEY))\"", timeout=30)
+        self.rec("3.14", "veto", "S4 is immutable + evidence; sentinel is neither; evidence key present", "True False True False True", out.strip(), out.strip() == "True False True False True")
+        rc, out = sh(f"sudo -n stat -c '%U %a' {ROOT}/proxy/evidence")
+        self.rec("3.15", "hygiene", "evidence store is root-only", "root 700", out.strip(), out.strip() == "root 700")
+        rc, out = sh(f"sudo -n sh -c 'grep -c \"\\\"immutable\\\": true\" {ROOT}/proxy/audit/veto-audit.jsonl; grep -c \"regex:sentinel\" {ROOT}/proxy/audit/veto-audit.jsonl'")
+        parts = out.split()
+        self.rec("3.16", "veto", "sentinel test vetoes are clearable (not flagged immutable)", "immutable count < sentinel count", out.replace("\n", "/"), len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and int(parts[0]) < int(parts[1]) + 1)
         rc, out = docker("exec ollama sh -c 'ollama ps | grep -c GPU'", timeout=15)
         self.rec("3.12", "veto", "main model resident on GPU (not CPU fallback)", ">=1 model on GPU", out.strip(), out.strip().isdigit() and int(out) >= 1)
 
