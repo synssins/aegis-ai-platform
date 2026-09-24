@@ -36,11 +36,11 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
   `proxy/audit/hub-audit.jsonl` and, if configured, the alert webhook.
 
 ## Policy semantics (Safety → VetoGuard policy)
-Llama Guard 3 categories, grouped:
-- **locked:** S4 child sexual exploitation — always blocked, no UI to change it.
-- **illegal (blocked by default):** S1 violent crimes, S2 non-violent crimes, S3 sex-related crimes, S9 indiscriminate weapons.
-- **protected (blocked by default):** S10 hate / protected classes, S11 suicide & self-harm.
-- **adult/legal (allowed by default):** S5, S6, S7, S8, S12 sexual content (adult), S13, S14.
+Categories are Llama Guard 3 hazard codes — definitions in the model card: <https://github.com/meta-llama/PurpleLlama/blob/main/Llama-Guard3/8B/MODEL_CARD.md>.
+- **locked:** S4 — always blocked, always immutable, always sealed as evidence; no UI to change it.
+- **illegal (blocked by default):** S1, S2, S3, S9.
+- **protected (blocked by default):** S10, S11.
+- **adult/legal (allowed by default):** S5, S6, S7, S8, S12, S13, S14.
 
 **Classifier is mandatory and fail-closed:** if the chosen model is not installed, not loadable or unreachable, every request is refused (503 `guard_unavailable`). If VRAM pressure evicts it, Ollama reloads it on the next request (~20 s once). Load the main model *before* choosing a larger classifier so both fit. The dropdown lists installed models named *guard*, *shield* or *guardian*. Each family needs a **verdict adapter** (how it is asked, how its answer is read); today only Llama Guard has one, so other families are listed but not selectable. If a classifier ever returns an answer the adapter cannot read, the request is **refused** (503 `guard_verdict_unparseable`) and the audit entry records `got='<first 120 chars of the classifier's answer>' expected='…'` — classifier output only, never user content — and the event is alerted.
 
@@ -49,7 +49,7 @@ the classifier. The classifier runs on input and on output (streaming is buffere
 after classification). If the guard model is unreachable the request is refused — this is not configurable.
 
 ## Retention and sealed evidence
-- Every veto entry is flagged **immutable** when its category is in the immutable set (default S4, S3, S10, S11 — S4 always) or it came from a CSAM tripwire. **Clear log** removes only non-immutable entries; immutable ones expire after `immutable_days` (minimum 90, default 730). Clearing is itself audited with counts.
+- Every veto entry is flagged **immutable** when its category is in the immutable set (default S4, S3, S10, S11 — S4 always) or it came from a CSAM tripwire. See `docs/EVIDENCE.md` for the evidence path. **Clear log** removes only non-immutable entries; immutable ones expire after `immutable_days` (minimum 90, default 730). Clearing is itself audited with counts.
 - Vetoes in the **evidence** set (default S4 + CSAM tripwires; S4 always) also produce a sealed record in `proxy/evidence/`: full request (and output), timestamp, key alias, client IP and user agent, model, categories with names, and the exact matched spans for tripwire hits. Records are Fernet-encrypted with `VETO_EVIDENCE_KEY` and hash-chained (`prev_hash → hash`), so removal or alteration is detectable. A plaintext `index.jsonl` holds metadata only. The hub lists ids and hashes; it never decrypts. Records expire after `evidence.days` (minimum 90, default 730), audited.
 - **Handoff from the hub:** Safety → Audit log → "Export for handoff" re-encrypts one record with a fresh key, offers the `.aegis-evidence` file for download and shows the key once — send file and key by separate channels; the recipient opens it with `scripts/evidence-open.py` (standalone, needs only `cryptography`). Export and download are audited and alerted.
 - **Bulk export (console):** `scripts/evidence-export.sh <id|all> <outdir>` decrypts inside the LiteLLM container, verifies the whole chain, writes plaintext JSON + `CHAIN-VERIFICATION.txt` + `SHA256SUMS` into a 0700 directory. Keep an offline copy of `VETO_EVIDENCE_KEY`; without it records are unreadable.

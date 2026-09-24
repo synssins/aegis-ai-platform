@@ -20,6 +20,7 @@
 | Brute force on the hub | login | argon2id, mandatory TOTP with replay protection, per-user and per-IP lockout, audit + alert |
 | Future tool/MCP servers | tool results | treated as untrusted input; scanned like user text; isolated `tools` network |
 | Operator workstation | SSH | (host-level; supervised) key-only auth, scoped sudo |
+| Spoofed network identity | claimed IP / user agent | never trusted as identity: audit and evidence name the **API key alias** (cryptographic) and, once device certificates are enabled, the **client-certificate fingerprint** (requires the device's private key) |
 
 ## Why there is no Docker socket in any container
 The Docker socket is root on the host. A container holding it turns any code-execution bug in that container into host compromise — every network split, capability drop and policy file becomes irrelevant. The hub therefore never talks to Docker. It writes one JSON request file; a root service *on the host* (`aegis-watchdog`) reads it, validates it against a fixed allow-list, and acts. The channel is a file in a root-only directory, not a socket or a port, so nothing on any network can reach it.
@@ -32,8 +33,7 @@ Sealed evidence records exist so that the most serious category of misuse (child
   Tune with `VETO_GUARD_IGNORE_CATEGORIES` only after reviewing the audit log.
 - The host can reach container ports via the Docker bridge gateway. Mitigated by strong keys; a
   host-level `OUTPUT` rule is a supervised follow-up.
-- Llama Guard 3 **1B** is used because it fits beside a 26 GB model on 32 GB of VRAM; the 8B model is
-  stronger and should replace it when a second GPU class is available for the guard.
+- The classifier is only as good as its model; Llama Guard 3 8B is the recommendation and is what runs by default with Gemma 3 27B. See `docs/SAFETY.md`.
 - Image generation (planned) must not be enabled without a prompt-side classifier, an output-side
   multimodal classifier, and its own audit log.
 

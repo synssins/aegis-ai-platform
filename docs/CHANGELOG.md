@@ -2,7 +2,13 @@
 
 All significant changes to the platform are recorded here. Every entry must name the files touched, the reason, who/what made the change, and how it was verified. Security-relevant changes must link an audit record in `docs/audits/`.
 
-## 2026-09-24 (night) — 8B guard live with Gemma 3 27B
+## 2026-09-24 (late) — Documentation set for publication; original GitHub history merged
+
+- Sanitisation sweep of the tracked tree (one public-hostname reference in a report fixed); the pre-commit hook now also derives the public hostname/domain from hub state.
+- New/rewritten docs: README (index), INSTALL (replaces MIGRATION), CONFIG, SAFETY, EVIDENCE (law-enforcement facing; links Fernet spec, PDQ, Llama Guard model card), OPERATIONS, TESTING, HARDWARE-REBAR (hardware-agnostic guide + the original Proxmox/R740 worked example preserved from GitHub), HUB/SECURITY/ARCHITECTURE refreshed; categories referenced by code with a link to the Llama Guard 3 model card.
+- Original GitHub history (3 commits: architecture README, VFIO/ReBAR configuration) merged with `--allow-unrelated-histories`; nothing lost.
+- `scripts/publish-wiki.sh` mirrors `docs/` to the repository wiki (source of truth stays in the repo).
+- Device identity (client certificates → fingerprint in sessions, audit and evidence) designed; implementation next.
 
 - **Evidence handoff from the hub:** per-record re-encryption with a fresh key (file download + key shown once, separate channels), `scripts/evidence-open.py` for recipients (verifies chain hash), audited. Hub now holds `VETO_EVIDENCE_KEY` (admin plane, noted). Round-trip tested in throwaway containers; wrong key refused.
 - **Design for review:** `docs/designs/portal-and-identity.md` — portal shell, Authelia identity, hub as single source of truth with enforcement at LiteLLM/portal proxies, gallery with prompt-gate-first and destroy-never-store output gate (perceptual-hash evidence), model browser per the Gemini exchange (guest-bound telemetry, badges not scrubbing, mgmt-only egress, safetensors/GGUF + SHA-256, preview blackout, blue/red CivitAI key scope).
