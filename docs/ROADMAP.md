@@ -19,6 +19,12 @@ Ordered by dependency, not by desire. Each item names its safety precondition.
  **Done** — by operator decision the hub holds the master key; mitigations: edge basic-auth, Caddy-namespace-only reachability, read-only fs, CSRF, audit + alert on every action |
 
 ## Next session (plan as of 2026-09-24 late)
+**State at shutdown (2026-09-24 ~23:00 UTC):** all work committed and pushed (`main` = origin). Claude can now call `agy`
+directly (Claude Code allow-rule; agy trusted workspace `/data/ai-unified` + read-only command allow-list, no
+skip-permissions). One smoke review already ran and left **three open findings on `caddy/hub/scheduler.py`**
+(`docs/tests/agy-review-round6-01-scheduler.md`) — nothing fixed yet. On power-up: `docker compose --profile apps up -d`
+brings the stack (T4 safety pool, Arc #2 chat pool, Arc #1 images); the wide container exists but is stopped;
+`qwen3-coder` was the resident chat model, `gemma3` loads on request; classifiers reload from policy on first use.
 1. **Adversarial audit round 6** with Gemini (`agy`) over everything shipped since round 5 — brief and scope in
    `docs/audits/2026-09-24-round6-brief.md`. Fix, add suite assertions (new phase 10: portal/scheduler), re-review
    until clean. Record rounds in `docs/tests/agy-review-round6-*.md` like earlier rounds.
