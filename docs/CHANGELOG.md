@@ -4,6 +4,8 @@ All significant changes to the platform are recorded here. Every entry must name
 
 ## 2026-09-24 (night) — 8B guard live with Gemma 3 27B
 
+- **Home Assistant tool calls:** HA sends function schemas; Gemma 3 (and Mixtral) have no `tools` capability in Ollama and the hub registered models on LiteLLM's `ollama/` provider (emulated functions ⇒ the call came back as JSON text). Hub "Expose" now reads Ollama's declared capabilities and registers tool-capable models on `ollama_chat/` (native tool calls); Installed/Exposed pages show capability tags. `qwen3:30b` (tools, ~19 GB, fits beside the 8B guard) pulled as the HA candidate.
+
 - **VetoGuard 2.8 — verdict adapters.** Adapter registry (request template + parser per safety family; Llama Guard shipped). No adapter or unreadable answer ⇒ refused with 503 `guard_no_adapter` / `guard_verdict_unparseable`; audit records `got=` (classifier answer, ≤ 120 chars) and `expected=`; alerted. Hub refuses to select adapter-less families and says why. Operator rule: unreadable verdict = fail closed + diagnose, never allow. Test 3.13.
 
 - **Classifier selection is now one action** (operator finding: it took two places). Safety → VetoGuard policy chooses the model *and* loads it (unloading other guard models); Models → Installed offers "Set as classifier" (same action) and no longer exposes Load/Unload for guard-family models. Policy page and dashboard show classifier residency; a missing classifier is flagged as "all requests refused". Guard-family detection: *guard* / *shield* / *guardian*; other families need verdict adapters (roadmap #11).

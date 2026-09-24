@@ -347,6 +347,39 @@ def policy() -> dict:
     return p
 
 
+_CAPS: dict[str, list[str]] = {}
+
+
+def model_caps(name: str) -> list[str]:
+    """Ollama's declared capabilities (completion, tools, vision, embedding, thinking). Cached per name."""
+    if name not in _CAPS:
+        st, j = http("POST", OLLAMA + "/api/show", {"model": name}, timeout=20)
+        _CAPS[name] = sorted(j.get("capabilities", [])) if isinstance(j, dict) else []
+    return _CAPS[name]
+
+
+CAP_ICONS = {  # 16x16 inline SVG, currentColor; title = capability
+    "vision": ("Vision (accepts images)", '<path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5z" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="8" cy="8" r="2.2" fill="currentColor"/>'),
+    "tools": ("Tool calls (can drive assistants such as Home Assistant)", '<path d="M10.5 2.2a3.3 3.3 0 0 0-3.1 4.4L2.2 11.8a1.3 1.3 0 0 0 1.9 1.9l5.2-5.2a3.3 3.3 0 0 0 4.4-3.1l-2 2-1.6-.4-.4-1.6z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>'),
+    "thinking": ("Thinking / reasoning output", '<path d="M6 2.5a2.5 2.5 0 0 0-2.4 3.1A2.5 2.5 0 0 0 3 10a2.5 2.5 0 0 0 3 2.4V2.5zm4 0a2.5 2.5 0 0 1 2.4 3.1A2.5 2.5 0 0 1 13 10a2.5 2.5 0 0 1-3 2.4V2.5z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 2.5v10" stroke="currentColor" stroke-width="1.3"/>'),
+    "embedding": ("Embeddings (vectors)", '<circle cx="4" cy="4" r="1.4" fill="currentColor"/><circle cx="8" cy="4" r="1.4" fill="currentColor"/><circle cx="12" cy="4" r="1.4" fill="currentColor"/><circle cx="4" cy="8" r="1.4" fill="currentColor"/><circle cx="8" cy="8" r="1.4" fill="currentColor"/><circle cx="12" cy="8" r="1.4" fill="currentColor"/><circle cx="4" cy="12" r="1.4" fill="currentColor"/><circle cx="8" cy="12" r="1.4" fill="currentColor"/><circle cx="12" cy="12" r="1.4" fill="currentColor"/>'),
+    "completion": ("Text completion / chat", '<path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>'),
+}
+
+
+def cap_icons(caps: list[str]) -> str:
+    out = []
+    for c in caps:
+        title, body = CAP_ICONS.get(c, (c, '<circle cx="8" cy="8" r="3" fill="currentColor"/>'))
+        out.append(f'<span class="cap{" hi" if c == "tools" else ""}" title="{esc(title)}" aria-label="{esc(title)}"><svg viewBox="0 0 16 16" width="15" height="15">{body}</svg></span>')
+    return "".join(out)
+
+
+def provider_for(name: str) -> str:
+    """Native chat API (real tool calls) when the model supports tools; generate API otherwise."""
+    return "ollama_chat" if "tools" in model_caps(name) else "ollama"
+
+
 def installed_models() -> list[dict]:
     st, j = http("GET", OLLAMA + "/api/tags", timeout=10)
     models = j.get("models", []) if isinstance(j, dict) else []
@@ -356,6 +389,7 @@ def installed_models() -> list[dict]:
         m["loaded"] = m.get("name") in loaded
         m["vram"] = loaded.get(m.get("name"), {}).get("size_vram", 0)
         m["is_guard"] = is_guard_name(m.get("name") or "")
+        m["caps"] = model_caps(m.get("name") or "")
     return sorted(models, key=lambda m: m.get("name", ""))
 
 
@@ -524,6 +558,7 @@ form.inline{display:inline}label{display:block;margin:10px 0 4px;color:#ccc}.row
 pre{background:#0d0d0d;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12px;max-height:520px}
 .msg{padding:10px 14px;border-radius:10px;margin:0 0 14px;background:#1c2a1c;border:1px solid #2f5a2f}.msg.bad{background:#2a1c1c;border-color:#5a2f2f}
 .pager{display:flex;gap:18px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin:8px 0 2px;font-size:12px;color:#bbb}.pager a{padding:2px 7px;border-radius:6px;background:#2a2a2a;text-decoration:none;margin:0 1px}.pager a.on{background:#3a3a3a;color:#fff}
+.cap{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:6px;background:#2a2a2a;color:#cfcfcf;margin-left:3px;vertical-align:middle;cursor:default}.cap.hi{color:var(--ok);background:#1c2a1c}
 .lock{opacity:.6}.key{font-family:ui-monospace,monospace;background:#0d0d0d;padding:6px 10px;border-radius:8px;display:inline-block;user-select:all;word-break:break-all}
 .login{max-width:380px;margin:12vh auto;padding:0 16px}.login .card{padding:24px}
 @media (max-width:760px){.wrap{flex-direction:column;height:auto;overflow:visible}nav{width:auto;border-right:0;border-bottom:1px solid var(--line);overflow:visible}main{overflow:visible;padding:18px 16px}}
@@ -703,8 +738,8 @@ def p_installed(msg="", ok=True):
                 f'<form class="inline" method="post" action="/hub/api/models/setguard">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Set as classifier</button></form>') if m["is_guard"] else (f'<span class="tag ok">exposed as {esc(exp)}</span>' if exp else f'<form class="inline" method="post" action="/hub/api/models/expose">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input name="public" placeholder="public name" style="width:150px" value="{esc(n.split(":")[0].split("/")[-1])}"> <button class="ghost">Expose</button></form>')
         ld = "" if m["is_guard"] else (f'<form class="inline" method="post" action="/hub/api/models/unload">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Unload</button></form>' if m["loaded"] else f'<form class="inline" method="post" action="/hub/api/models/load">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Load</button></form>')
         rm = "" if exp or m["loaded"] or n == policy()["guard"]["model"] else f'<form class="inline" method="post" action="/hub/api/models/remove">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input type="hidden" name="confirm" value="{esc(n)}"><button class="danger">Remove</button></form>'
-        rows += f'<tr><td>{esc(n)}</td><td>{size:.1f} GiB</td><td>{"<span class=ok>resident</span>" if m["loaded"] else "<span class=mut>on disk</span>"}</td><td>{act}</td><td>{ld} {rm}</td></tr>'
-    body = f'<div class="card">{mctl}<table><tr><th>Model</th><th>Size</th><th>State</th><th>Exposure</th><th></th></tr>{rows or "<tr><td colspan=5 class=mut>none</td></tr>"}</table></div><p class="mut">"Expose" registers the model in LiteLLM under a public name (through VetoGuard). Guard models are never exposable; the active classifier is chosen in Safety → VetoGuard policy (or "Set as classifier" here — same action) and is loaded/unloaded by that choice, not by hand. Unload before removing.</p>'
+        rows += f'<tr><td>{esc(n)} {cap_icons(m.get("caps", []))}</td><td>{size:.1f} GiB</td><td>{"<span class=ok>resident</span>" if m["loaded"] else "<span class=mut>on disk</span>"}</td><td>{act}</td><td>{ld} {rm}</td></tr>'
+    body = f'<div class="card">{mctl}<table><tr><th>Model</th><th>Size</th><th>State</th><th>Exposure</th><th></th></tr>{rows or "<tr><td colspan=5 class=mut>none</td></tr>"}</table></div><p class="mut">"Expose" registers the model in LiteLLM under a public name (through VetoGuard); models that advertise <b>tools</b> are registered on the native chat API so assistants such as Home Assistant get real tool calls — a model without <b>tools</b> can only answer in text. Guard models are never exposable; the active classifier is chosen in Safety → VetoGuard policy (or "Set as classifier" here — same action) and is loaded/unloaded by that choice, not by hand. Unload before removing.</p>'
     return page("models", "installed", "Installed models", "What is in the shared model store, and what apps can see.", body, msg, ok)
 
 
@@ -724,7 +759,8 @@ def p_exposed(msg="", ok=True):
         mid = str(m.get("model_info", {}).get("id", "")); pub = m.get("model_name"); up = m.get("litellm_params", {}).get("model")
         src = "hub" if len(mid) >= 8 and "-" in mid else "config.yaml (console)"
         rm = f'<form class="inline" method="post" action="/hub/api/models/unexpose">{csrf_field()}<input type="hidden" name="id" value="{esc(mid)}"><input type="hidden" name="public" value="{esc(pub)}"><button class="danger">Unexpose</button></form>' if src == "hub" else '<span class="mut">console</span>'
-        rows += f'<tr><td>{esc(pub)}</td><td>{esc(up)}</td><td>{esc(src)}</td><td>{rm}</td></tr>'
+        tools = '<span class="tag ok">tool calls</span>' if str(up).startswith("ollama_chat/") else '<span class="tag">text only</span>'
+        rows += f'<tr><td>{esc(pub)}</td><td>{esc(up)} {tools}</td><td>{esc(src)}</td><td>{rm}</td></tr>'
     body = f'<div class="card">{ectl}<table><tr><th>Public name</th><th>Upstream</th><th>Defined in</th><th></th></tr>{rows or "<tr><td colspan=4 class=mut>none</td></tr>"}</table></div>'
     return page("models", "exposed", "Exposed to apps", "Models LiteLLM currently serves — all through VetoGuard.", body, msg, ok)
 
@@ -856,9 +892,10 @@ def act_expose(form):
         return p_installed("Guard models cannot be exposed.", False)
     if not ALIAS_RE.match(pub):
         return p_installed("Public name must be lowercase letters, digits, dot, dash, underscore.", False)
-    st, j = litellm("POST", "/model/new", {"model_name": pub, "litellm_params": {"model": f"ollama/{m}", "api_base": OLLAMA}}); ok = st == 200
-    audit("model_exposed" if ok else "model_expose_failed", model=m, public=pub, status=st)
-    return p_installed(f"Exposed {m} as {pub}." if ok else f"LiteLLM refused ({st}): {str(j)[:200]}", ok)
+    prov = provider_for(m)
+    st, j = litellm("POST", "/model/new", {"model_name": pub, "litellm_params": {"model": f"{prov}/{m}", "api_base": OLLAMA}}); ok = st == 200
+    audit("model_exposed" if ok else "model_expose_failed", model=m, public=pub, provider=prov, tools="tools" in model_caps(m), status=st)
+    return p_installed((f"Exposed {m} as {pub} (native tool calls)." if prov == "ollama_chat" else f"Exposed {m} as {pub}. Note: this model does not support tool calling; assistants that send tools will get text, not actions.") if ok else f"LiteLLM refused ({st}): {str(j)[:200]}", ok)
 
 
 def act_unexpose(form):
