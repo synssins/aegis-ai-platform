@@ -13,6 +13,7 @@ Runs read-only assertions against the live deployment and writes `docs/tests/<UT
 | 3 veto | every evasion class against the neutral sentinel; field coverage; streaming; classifier residency; unparseable-verdict refusal; immutability/evidence gating |
 | 4 hygiene | keys not in web containers, file ownership/modes, capabilities, internal network |
 | 5 admin plane | hub pages (with a session), CSRF, policy file locks, `modeld` isolation, ComfyUI gate, mounts, watchdog status and a real restart round-trip, self-stop refusal, lockout |
+| 9 images | ComfyUI unreachable without a session, uploads off, previews off, no network path from the chat UI, no egress, attribute registry root-only |
 | 6–8 | bypass classes found in adversarial reviews (assistant prefill, system/tool schema fields, URL-safe/wrapped base64, confusables, tool-call history, oversized parts, JSON-escaped arguments, …) |
 
 The suite uses only the neutral trigger `[TEST_SENTINEL_BLOCK_ALPHA]` — never harmful content — and reads no
@@ -30,6 +31,13 @@ Measured 2026-09-24: a **custom benign category** (e.g. "S15: computer hardware 
 Llama Guard 3 prompt is **not** honoured reliably by the 8B — six prompt variants, only one tripped and only on one of
 three questions. Llama Guard 3 is tuned to its 14-category taxonomy; do not rely on custom categories for testing or
 policy. Verdict adapters for models that take free-form policies (ShieldGemma, Granite Guardian) are the roadmap path.
+
+## Image gate manual checks (throwaway `images` account)
+Unclassified checkpoint hidden and refused → classify it SFW in Models → Image model store → visible. A prompt
+containing the sentinel is refused before queueing (veto audit `portal-<user>`). A benign prompt renders, the
+gallery shows it, `comfyui/output/` is empty. Mark the checkpoint NSFW → a non-NSFW user is refused. In Safety →
+VetoGuard policy pick a text-only classifier → every output is destroyed as unparseable (fail closed); pick a
+non-resident model → submissions refused with 503. Delete from the gallery → file, record and history gone.
 
 ## Adversarial reviews
 `docs/tests/agy-vetoguard-review-*.md` record each round of external adversarial review of VetoGuard and what

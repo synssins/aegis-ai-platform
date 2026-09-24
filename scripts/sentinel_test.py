@@ -192,7 +192,7 @@ class Suite:
                  "HSTS+nosniff, no Server", {k: hl.get(k) for k in ("strict-transport-security", "x-content-type-options", "server")},
                  "strict-transport-security" in hl and "x-content-type-options" in hl and "server" not in hl)
         st, h, _ = http("GET", f"{self.base}/hub/overview/dashboard")
-        self.rec("2.7", "edge", "/hub without a session redirects to login", "303 -> /hub/login", f"{st} {h.get('Location', '')}", st == 303 and "/hub/login" in h.get("Location", ""))
+        self.rec("2.7", "edge", "/hub without a session redirects to login", "303 -> /login (portal) or /hub/login", f"{st} {h.get('Location', '')}", st == 303 and "/login" in h.get("Location", ""))
         st, h, _ = http("GET", f"{self.base}/hub/setup")
         self.rec("2.7b", "hub", "first-run wizard unavailable once an administrator exists", "303 -> /hub/login (or 303 -> /hub/setup only while unconfigured)", f"{st} {h.get('Location', '')}", st == 303)
         H = self.hub_login()
@@ -323,7 +323,7 @@ class Suite:
         rc, out = docker("exec litellm python3 -c \"import urllib.request;print(urllib.request.urlopen('http://modeld:11434/api/version',timeout=3).status)\"", timeout=15)
         self.rec("5.7", "network", "litellm cannot reach modeld", "fails", out[-40:], rc != 0)
         st, _, _ = http("GET", f"{self.base}/comfy")
-        self.rec("5.8", "edge", "ComfyUI route hard-gated at edge", "503", st, st == 503)
+        self.rec("5.8", "edge", "ComfyUI route refused without a hub session (gate live)", "308 to /comfy/ then 303/401/403", st, st in (303, 308, 401, 403))
         st, _, b = http("GET", f"{self.base}/status")
         self.rec("5.16", "edge", "public /status renders GPU/host load without login", "200 + GPU + CPU", st, st == 200 and b"utilisation" in b and b"CPU" in b)
         self.rec("5.17", "edge", "public /status contains no keys/aliases/secrets", "no matches", "checked", st == 200 and not re.search(rb"sk-[A-Za-z0-9]{8,}|key_alias|password|secret", b, re.I))
@@ -342,7 +342,7 @@ class Suite:
         # 5.22: a real device certificate is identified by its TLS fingerprint even when a forged header is sent
         import tempfile, subprocess as sp
         d = tempfile.mkdtemp()
-        rc, out = docker("exec hub python3 -c \"import importlib.util,sys;sys.argv=['x'];spec=importlib.util.spec_from_file_location('hub','/app/hub.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);from cryptography.hazmat.primitives.serialization import pkcs12,Encoding,PrivateFormat,NoEncryption;m.REQ.user='sentinel';fp,p12,pw=m.issue_device('sentinel-test','sentinel');k,c,_=pkcs12.load_key_and_certificates(p12,pw.encode());print(fp);print('CERT');print(c.public_bytes(Encoding.PEM).decode());print('KEY');print(k.private_bytes(Encoding.PEM,PrivateFormat.PKCS8,NoEncryption()).decode())\"", timeout=60)
+        rc, out = docker("exec hub python3 -c \"import sys; sys.path.insert(0, '/app'); import importlib.util,sys;sys.argv=['x'];spec=importlib.util.spec_from_file_location('hub','/app/hub.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);from cryptography.hazmat.primitives.serialization import pkcs12,Encoding,PrivateFormat,NoEncryption;m.REQ.user='sentinel';fp,p12,pw=m.issue_device('sentinel-test','sentinel');k,c,_=pkcs12.load_key_and_certificates(p12,pw.encode());print(fp);print('CERT');print(c.public_bytes(Encoding.PEM).decode());print('KEY');print(k.private_bytes(Encoding.PEM,PrivateFormat.PKCS8,NoEncryption()).decode())\"", timeout=60)
         ok = False; fp = ""
         if "CERT" in out and "KEY" in out:
             fp = out.split("\n", 1)[0].strip(); cert = out.split("CERT", 1)[1].split("KEY", 1)[0].strip(); key = out.split("KEY", 1)[1].strip()
@@ -428,8 +428,28 @@ class Suite:
         rc, out = sh(f"sudo -n python3 -c \"import json;print(json.load(open('{ROOT}/proxy/policy/veto-policy.json')).get('audit',{{}}).get('store_snippet', False))\"")
         self.rec("8.5", "hygiene", "snippet diagnostics default OFF", "False", out, out.strip() == "False")
 
+    def phase9(self):
+        """Image gate (ComfyUI): nothing reaches ComfyUI without a hub session; uploads and previews are off; the chat UI
+        has no network path to the generator; the classifier pool holds the guard; the model store is attribute-gated."""
+        st, _, _ = http("GET", f"{self.base}/comfy/", None, {})
+        self.rec("9.1", "images", "ComfyUI UI without a session is refused (forward_auth)", "303 or 401/403", st, st in (303, 401, 403))
+        st, _, _ = http("POST", f"{self.base}/comfy/prompt", {"prompt": {}}, {})
+        self.rec("9.2", "images", "workflow submission without a session is refused", "401", st, st == 401)
+        st, _, _ = http("POST", f"{self.base}/comfy/upload/image", None, {})
+        self.rec("9.3", "images", "image uploads are disabled at the edge", "403", st, st == 403)
+        st, _, _ = http("GET", f"{self.base}/comfy/view?filename=x.png&type=temp", None, {})
+        self.rec("9.4", "images", "temp/preview images are not served without a session", "303 or 401/403", st, st in (303, 401, 403))
+        rc, out = docker("exec openwebui python3 -c \"import socket;socket.create_connection(('comfyui',8188),3)\"", timeout=20)
+        self.rec("9.5", "images", "chat UI has no network path to ComfyUI", "connection fails", f"rc={rc}", rc != 0)
+        rc, out = docker("exec comfyui python3 -c \"import socket;socket.create_connection(('1.1.1.1',443),3)\"", timeout=20)
+        self.rec("9.6", "images", "ComfyUI has no internet egress", "connection fails", f"rc={rc}", rc != 0)
+        rc, out = docker("inspect comfyui --format '{{range .Config.Env}}{{println .}}{{end}}'", timeout=20)
+        self.rec("9.7", "images", "ComfyUI runs with previews disabled", "--preview-method none in CLI_ARGS", [l for l in out.splitlines() if l.startswith("CLI_ARGS")][:1], "--preview-method none" in out)
+        rc, out = sh(f"sudo -n sh -c 'test -f {ROOT}/comfyui/.aegis-attributes.json && stat -c %a {ROOT}/comfyui/.aegis-attributes.json'")
+        self.rec("9.8", "images", "model-store attribute registry is root-only (or absent before first classification)", "600 or absent", out.strip() or "absent", out.strip() in ("600", ""))
+
     def run(self):
-        for ph in (self.phase1, self.phase2, self.phase3, self.phase4, self.phase5, self.phase6, self.phase7, self.phase8):
+        for ph in (self.phase1, self.phase2, self.phase3, self.phase4, self.phase5, self.phase6, self.phase7, self.phase8, self.phase9):
             try: ph()
             except Exception as e:  # noqa: BLE001
                 self.rec(ph.__name__, "harness", "phase crashed", "no exception", repr(e), False)

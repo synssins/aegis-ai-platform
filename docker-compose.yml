@@ -40,7 +40,7 @@ services:
     # LiteLLM, ollama (backend, read/delete), modeld (mgmt, pulls). Reachable only via caddy at /hub
     # behind basic-auth. Holds the LiteLLM master key (key/model management) — every action audited.
     <<: *hardened
-    image: aegis/hub:4                             # caddy/hub/build/Dockerfile — python:3.12-alpine + argon2id + Fernet + qrcode
+    image: aegis/hub:5                             # caddy/hub/build/Dockerfile — python:3.12-alpine + argon2id + Fernet + qrcode
     container_name: hub
     command: ["python3", "-u", "/app/hub.py"]
     environment:
@@ -53,6 +53,8 @@ services:
     volumes:
       - ./caddy/hub/hub.py:/app/hub.py:ro
       - ./caddy/hub/browse.py:/app/browse.py:ro
+      - ./caddy/hub/imagegate.py:/app/imagegate.py:ro
+      - ./gallery:/app/gallery                        # approved images per user; users purge their own
       - ./comfyui:/app/comfy-store                # model browser downloads (checkpoints/, loras/, …); ComfyUI reads the same tree
       - ./caddy/conf:/etc/caddy/conf:ro
       - ./docker-compose.yml:/app/view/docker-compose.yml:ro
@@ -266,24 +268,28 @@ services:
               capabilities: [gpu]
 
   comfyui:
-    # HARD GATE (docs/ROADMAP.md #8): caddy returns 503 for /comfy until a prompt classifier,
-    # an output multimodal classifier and an isolated audit log exist. Do not remove the gate here;
-    # enabling is a console-only Caddyfile change after the gate is tested with sentinels.
+    # Image generation. Reachable ONLY through the hub's gate (Caddy: /comfy -> hub for /prompt, /view, /object_info,
+    # /history; forward_auth for the rest). The hub classifies every prompt (VetoGuard), every model file (per-file
+    # NSFW attribute) and every output (vision classifier) — docs/HUB.md -> Images. No egress (apps is internal).
     <<: *hardened
-    image: yanwk/comfyui-boot:cu126-slim            # TODO pin once selected; UI on :8188
+    image: yanwk/comfyui-boot:cu126-slim-20260921     # community image that BUNDLES upstream ComfyUI (no fork; copies /default-comfyui-bundle at first start, no download)
     container_name: comfyui
     profiles: [apps]
+    environment:
+      - CLI_ARGS=--listen 0.0.0.0 --port 8188 --preview-method none --disable-auto-launch --disable-metadata
+    devices:
+      - nvidia.com/gpu=all                            # CDI, same as ollama (survives daemon-reload)
     volumes:
       - ./comfyui/checkpoints:/root/ComfyUI/models/checkpoints
       - ./comfyui/loras:/root/ComfyUI/models/loras
-    networks: [apps]                                  # reachable from Caddy only — never from Open WebUI (edge)
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+      - ./comfyui/vae:/root/ComfyUI/models/vae
+      - ./comfyui/controlnet:/root/ComfyUI/models/controlnet
+      - ./comfyui/upscale_models:/root/ComfyUI/models/upscale_models
+      - ./comfyui/embeddings:/root/ComfyUI/models/embeddings
+      - ./comfyui/output:/root/ComfyUI/output          # the hub gates and MOVES files out of here
+      - ./comfyui/temp:/root/ComfyUI/temp
+      - ./comfyui/user:/root/ComfyUI/user
+    networks: [apps]
 
 networks:
   edge:

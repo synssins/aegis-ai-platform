@@ -62,3 +62,13 @@ Metrics page and the dashboard show residency; a classifier that is not resident
 Regex is a tripwire, not a boundary. The classifier is imperfect and English-strongest. Both are logged so the
 policy can be tuned from evidence rather than guesswork. Adversarial reviews and their outcomes are kept in
 `docs/tests/agy-vetoguard-review-*.md`.
+
+## Image generation (ComfyUI)
+Same posture as text, applied three times per workflow (see `docs/HUB.md` → Images and Gallery): prompt texts
+through VetoGuard; model files gated by a per-file NSFW attribute against the account's `images_nsfw` grant;
+every output judged by a vision model before anyone can see it. Illegal / minor content is destroyed and sealed
+as evidence **without the image** (prompt, files, verdict, perceptual hash); NSFW without the grant is destroyed;
+an unreadable verdict destroys. ComfyUI is reachable only through the hub's gate, has no egress, and the chat UI
+has no route to it. Known limits: the output classifier is a general vision model, not a hash-matching CSAM
+detector — the prompt gate and the destroy-on-doubt policy are the primary controls; uploads (img2img) stay
+disabled until an input-image gate exists.

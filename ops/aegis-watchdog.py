@@ -32,7 +32,7 @@ STATUS = os.path.join(RESP_DIR, "status.json")
 POLL, STATUS_EVERY = 2, 5
 
 DEPENDENTS = {                      # name -> direct dependents (must be down while name restarts)
-    "caddy": ["hub"], "hub": [], "litellm-db": ["litellm"], "ollama": ["litellm"], "litellm": [],
+    "caddy": ["hub"], "hub": [], "litellm-db": ["litellm"], "ollama": ["litellm"], "ollama-intel": ["litellm"], "litellm": [],
     "openwebui": [], "modeld": [], "prometheus": ["grafana"], "grafana": [], "node-exporter": [], "dcgm-exporter": [],
     "fish-speech": [], "comfyui": [],
 }

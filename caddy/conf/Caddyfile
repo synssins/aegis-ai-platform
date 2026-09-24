@@ -53,7 +53,7 @@
 
     # Admin control centre (hub shares this container's network namespace). The hub enforces its own
     # authentication: argon2id passwords, mandatory TOTP, signed cookies, lockout. Nothing at the edge.
-    @hub path /hub* /login* /logout /portal* /account* /setup* /chat/api/*
+    @hub path /hub* /login* /logout /portal* /account* /setup* /chat/api/* /gallery*
     handle @hub {
         reverse_proxy localhost:9000 {
             header_up X-Device-Fingerprint {http.request.tls.client.fingerprint}
@@ -78,8 +78,28 @@
         reverse_proxy fish-speech:7860
     }
     # ComfyUI HARD GATE — see docs/ROADMAP.md #8. Console-only change, after the safety gate is tested.
-    handle /comfy* {
-        respond "ComfyUI is disabled until its two-stage safety gate exists." 503
+    # Image generation behind the hub's gate. The hub handles the calls that carry prompts, model choices and
+    # outputs; everything else (UI assets, websocket progress, queue) is allowed only for a session the hub
+    # vouches for (forward_auth). Uploads stay off until an input-image gate exists. Previews are disabled.
+    @comfy_hub path /comfy/prompt /comfy/api/prompt /comfy/view /comfy/api/view /comfy/object_info* /comfy/api/object_info* /comfy/history* /comfy/api/history*
+    handle @comfy_hub {
+        reverse_proxy localhost:9000 {
+            header_up X-Device-Fingerprint {http.request.tls.client.fingerprint}
+            header_up X-Device-Subject {http.request.tls.client.subject}
+        }
+    }
+    @comfy_upload path /comfy/upload* /comfy/api/upload*
+    handle @comfy_upload {
+        respond "image uploads are not enabled" 403
+    }
+    redir /comfy /comfy/ 308
+    handle /comfy/* {
+        forward_auth localhost:9000 {
+            uri /hub/authz/comfy
+            copy_headers X-Aegis-User
+        }
+        uri strip_prefix /comfy
+        reverse_proxy comfyui:8188
     }
 
     log {

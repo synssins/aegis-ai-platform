@@ -11,6 +11,8 @@ systemd service on the host that reads one request file, enforces an allow-list 
 (caddy→hub, litellm-db→litellm, ollama→litellm, prometheus→grafana), and writes a response with a per-step log.
 `caddy` and `hub` can only be restarted. One request at a time. Console equivalents: `docker compose …`.
 Watchdog logs: `journalctl -u aegis-watchdog`.
+The service runs the **installed copy** `/usr/local/sbin/aegis-watchdog.py`; after editing `ops/aegis-watchdog.py` (e.g. a new
+container in its allow-list) install it again: `sudo install -m 755 ops/aegis-watchdog.py /usr/local/sbin/ && sudo systemctl restart aegis-watchdog`.
 
 ## Models
 - Pull from the hub (Models → Pull) or `scripts/pull-model.sh <name>` — both use a throw-away puller; the
@@ -34,6 +36,8 @@ echo $(basename $r) $(basename $(readlink -f $r/device)); done`. DCGM/Grafana do
 `/status` read Ollama's own discovery numbers.
 
 ## Model store for images (`comfyui/`)
+Start image generation: `docker compose --profile apps up -d comfyui` (the hub's Services page can restart it once
+running). The output classifier (Safety → VetoGuard policy) must be resident or every submission is refused.
 Filled by Hub → Models → Browse (downloads) and read by ComfyUI when its profile is up. Directories must stay
 `root:<operator group> 2775` (root-owned, group-writable, setgid) — the hub runs with all capabilities dropped, so it can only write directories root owns.
 Delete a model by removing its file; the browser refuses to overwrite an existing file.

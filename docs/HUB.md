@@ -41,6 +41,36 @@ registry publishes one, write to `.part` and rename on success, and land in `com
 GGUF pulls go through `modeld` (Models → Pull) as `hf.co/<repo>:<quant>`. Keys are Fernet-encrypted in hub
 state. Fit badges compare a file to one card's memory (LLMs with a KV-cache band); guidance, not a control.
 
+## Images and Gallery (ComfyUI behind the gate)
+The portal's **Images** section is ComfyUI itself, framed at `/comfy/`, for accounts with the `images` grant. It is
+reachable only through Caddy → hub: the hub handles every call that carries a prompt, a model choice or an output
+(`/comfy/prompt`, `/comfy/view`, `/comfy/object_info`, `/comfy/history`); everything else (UI, websocket progress,
+queue) is allowed only for a session the hub vouches for (`forward_auth`). ComfyUI has no internet egress and no
+network path from the chat UI. Uploads are off until an input-image gate exists; live previews are disabled
+(`--preview-method none`, temp images are never served).
+
+Three gates on every workflow, all in `caddy/hub/imagegate.py` + `hub.py` (`_comfy_prompt`, `gate_worker`):
+
+1. **Prompt gate** — every text input in the workflow goes through LiteLLM/VetoGuard as the user's own key
+   (`portal-<user>`, one token, surface `image_prompt`): tripwires → Llama Guard → veto = 400 and the usual audit /
+   evidence. Nothing is queued if this fails.
+2. **File gate** — every string input that names a file in `comfyui/` is checked against the per-file attribute
+   (Models → Image model store): NSFW needs the `images_nsfw` grant; unclassified is administrators only (they
+   classify it there). `object_info` is filtered the same way, so users never see files they cannot use.
+3. **Output gate** — when ComfyUI finishes, the hub classifies each image with the vision model chosen in Safety →
+   VetoGuard policy (default `gemma3:27b`; must be resident or generation is refused up front). Verdict JSON:
+   `nsfw, sexual_content, minor_present, sexual_minor, illegal, violence_gore`. Sexualised minor / illegal →
+   image overwritten and unlinked, immutable veto-audit entry (S4/S3), sealed evidence (prompt texts, files,
+   verdict, 64-bit DCT perceptual hash — **never the image**), alert. NSFW without the grant → destroyed, clearable
+   audit (S12). Unreadable verdict or classifier error → destroyed (fail closed). Approved images are copied to
+   `gallery/<user>/` and the output file wiped; `/comfy/view` serves only from the user's gallery (long-polls the
+   gate for up to 25 s so the ComfyUI canvas shows the result).
+
+**Gallery** (portal section, `images` grant): grid of the user's approved images with select-all / bulk delete.
+Deletion wipes the file, its record and ComfyUI's history entry — users purge their own without review, by
+operator decision. Safety → VetoGuard policy → *Administrator review of user galleries* opens Safety → Galleries
+for admins (every open audited); the Gallery page tells users when review is on.
+
 ## Portal chat (portal-native)
 The portal's **Chat** section is the hub's own chat, not Open WebUI. Deliberately minimal: no user settings — a model picker, a message box, and a conversation list kept in the user's browser (localStorage; nothing stored server-side). Rules, all enforced server-side in `caddy/hub/hub.py` (`_chat_stream`):
 
