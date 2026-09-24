@@ -337,6 +337,19 @@ class Suite:
         self.rec("5.20", "edge", "Caddy requests client certificates against the device CA", ">=1", out.strip(), out.strip().isdigit() and int(out) >= 1)
         rc, out = sh(f"sudo -n stat -c '%a' {ROOT}/caddy/hub/state/device-ca.key.enc")
         self.rec("5.21", "hygiene", "device CA private key is encrypted at rest and root-only", "600", out.strip(), out.strip() == "600")
+        # 5.22: a real device certificate is identified by its TLS fingerprint even when a forged header is sent
+        import tempfile, subprocess as sp
+        d = tempfile.mkdtemp()
+        rc, out = docker("exec hub python3 -c \"import importlib.util,sys;sys.argv=['x'];spec=importlib.util.spec_from_file_location('hub','/app/hub.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);from cryptography.hazmat.primitives.serialization import pkcs12,Encoding,PrivateFormat,NoEncryption;m.REQ.user='sentinel';fp,p12,pw=m.issue_device('sentinel-test','sentinel');k,c,_=pkcs12.load_key_and_certificates(p12,pw.encode());print(fp);print('CERT');print(c.public_bytes(Encoding.PEM).decode());print('KEY');print(k.private_bytes(Encoding.PEM,PrivateFormat.PKCS8,NoEncryption()).decode())\"", timeout=60)
+        ok = False; fp = ""
+        if "CERT" in out and "KEY" in out:
+            fp = out.split("\n", 1)[0].strip(); cert = out.split("CERT", 1)[1].split("KEY", 1)[0].strip(); key = out.split("KEY", 1)[1].strip()
+            open(f"{d}/c.pem", "w").write(cert + "\n"); open(f"{d}/k.pem", "w").write(key + "\n")
+            r = sp.run(["curl", "-sk", "--cert", f"{d}/c.pem", "--key", f"{d}/k.pem", "-H", "X-Device-Fingerprint: " + "f" * 64, f"{self.base}/status/api"], capture_output=True, text=True)
+            try: j = json.loads(r.stdout); ok = j.get("device_certificate_presented") is True and j.get("device_fingerprint_prefix") == fp[:8]
+            except Exception: ok = False  # noqa: BLE001
+        sh(f"rm -rf {d}")
+        self.rec("5.22", "edge", "real device certificate identified by TLS fingerprint (forged header ignored)", "presented + prefix matches issued", f"{'ok' if ok else out[-80:]}", ok)
         rc, out = docker("inspect litellm --format '{{range .Mounts}}{{.Destination}}:{{.RW}} {{end}}'")
         self.rec("5.9", "hub", "litellm mounts policy read-only", "/app/policy:false", out, "/app/policy:false" in out)
         rc, out = docker("inspect hub --format '{{.HostConfig.NetworkMode}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}}'")

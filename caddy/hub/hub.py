@@ -49,6 +49,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.hazmat.primitives.asymmetric import ec
 from datetime import timedelta
 
@@ -406,10 +407,10 @@ def issue_device(name: str, user: str) -> tuple[str, bytes, str]:
     pw = secrets.token_urlsafe(12)
     try:  # broad OS/browser compatibility for the PKCS#12 import (older importers need 3DES/SHA1 PBE)
         enc = (serialization.PrivateFormat.PKCS12.encryption_builder().kdf_rounds(50000)
-               .key_cert_algorithm(serialization.pkcs12.PBES.PBESv1SHA1And3KeyTripleDESCBC).hmac_hash(hashes.SHA1()).build(pw.encode()))
+               .key_cert_algorithm(pkcs12.PBES.PBESv1SHA1And3KeyTripleDESCBC).hmac_hash(hashes.SHA1()).build(pw.encode()))
     except Exception:  # noqa: BLE001
         enc = serialization.BestAvailableEncryption(pw.encode())
-    p12 = serialization.pkcs12.serialize_key_and_certificates(name.encode(), key, cert, [ca_cert], enc)
+    p12 = pkcs12.serialize_key_and_certificates(name.encode(), key, cert, [ca_cert], enc)
     return fp, p12, pw
 
 
@@ -1485,7 +1486,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _fp(self) -> str:
         v = (self.headers.get("X-Device-Fingerprint", "") or "").strip().lower()
-        return v if re.fullmatch(r"[0-9a-f]{64}", v) else ""
+        # Caddy's placeholder yields SHA-256("") when no client certificate was presented; that is "none".
+        return v if re.fullmatch(r"[0-9a-f]{64}", v) and v != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" else ""
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
@@ -1495,7 +1497,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, p_status_public())
         if p == "/status/api":
             snap = metrics_snapshot(); snap.pop("cpu_series", None); [g.pop("util_series", None) or g.pop("mem_series", None) for g in snap["gpus"].values()]
-            snap["device_certificate_presented"] = bool(self._fp())
+            snap["device_certificate_presented"] = bool(self._fp()); snap["device_fingerprint_prefix"] = self._fp()[:8]
             return self._send(200, json.dumps(snap), "application/json")
         if setup_needed():
             return self._send(200, p_setup()) if p == "/hub/setup" else self._redirect("/hub/setup")

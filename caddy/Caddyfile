@@ -11,6 +11,11 @@
     admin localhost:2019 {
         origins localhost:2019 127.0.0.1:2019
     }
+    # Client-auth policies make Caddy enforce strict SNI/Host matching, which breaks access by bare IP
+    # (no SNI). Both sites request the same device CA, so relaxing it is safe here.
+    servers {
+        strict_sni_host insecure_off
+    }
 }
 
 (site) {

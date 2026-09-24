@@ -529,7 +529,8 @@ def _client_meta(data: dict) -> dict:
             h.update({str(k).lower(): str(v) for k, v in src.items()})
     fp = (h.get("x-device-fingerprint") or "").strip().lower()
     return {"client_ip": (h.get("x-forwarded-for", "").split(",")[0].strip() or h.get("x-real-ip") or None), "user_agent": h.get("user-agent"),
-            "device_fingerprint": fp if re.fullmatch(r"[0-9a-f]{64}", fp) else None, "device_subject": h.get("x-device-subject") or None}
+            "device_fingerprint": fp if re.fullmatch(r"[0-9a-f]{64}", fp) and fp != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" else None,   # SHA-256("") = no certificate
+            "device_subject": h.get("x-device-subject") or None}
 
 
 _EVIDENCE_LOCK = threading.Lock()
