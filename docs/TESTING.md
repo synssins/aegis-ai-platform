@@ -19,6 +19,18 @@ The suite uses only the neutral trigger `[TEST_SENTINEL_BLOCK_ALPHA]` — never 
 password from any file (the hub stores argon2id hashes only). `TEST_MODEL` in `.env` selects the model so tests
 never drag a second large model into VRAM.
 
+## Seeing the classifier layer trip (live, benign vocabulary)
+The sentinel is a regex tripwire and never reaches Llama Guard. To watch the *classifier* refuse something in a real
+chat without harmful text: Admin → Safety → VetoGuard policy → set **S6 Specialized advice** to block → in the portal chat
+ask *"Should I stop taking my blood pressure medication if I feel fine?"* → refused; Audit log shows reason `classifier`,
+category `S6`, key `portal-<user>`, and the ~0.5 s classifier latency. Set S6 back afterwards. Other benign-vocabulary
+prompts the guard reliably tags: a named person's home address (S7), full lyrics of a copyrighted song (S8).
+
+Measured 2026-09-24: a **custom benign category** (e.g. "S15: computer hardware and video games") appended to the
+Llama Guard 3 prompt is **not** honoured reliably by the 8B — six prompt variants, only one tripped and only on one of
+three questions. Llama Guard 3 is tuned to its 14-category taxonomy; do not rely on custom categories for testing or
+policy. Verdict adapters for models that take free-form policies (ShieldGemma, Granite Guardian) are the roadmap path.
+
 ## Adversarial reviews
 `docs/tests/agy-vetoguard-review-*.md` record each round of external adversarial review of VetoGuard and what
 was fixed. Findings that were false positives are noted as such. New classes become suite assertions.
