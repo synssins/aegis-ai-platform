@@ -33,6 +33,11 @@ unkillably in a VM (the virtio display device's Vulkan ICD blocks). Map nodes: `
 echo $(basename $r) $(basename $(readlink -f $r/device)); done`. DCGM/Grafana do not see Intel cards; the hub and
 `/status` read Ollama's own discovery numbers.
 
+## Model store for images (`comfyui/`)
+Filled by Hub → Models → Browse (downloads) and read by ComfyUI when its profile is up. Directories must stay
+`root:<operator group> 2775` (root-owned, group-writable, setgid) — the hub runs with all capabilities dropped, so it can only write directories root owns.
+Delete a model by removing its file; the browser refuses to overwrite an existing file.
+
 ## Disk
 Model store `llm/gguf/` dominates. Watch `/status`. To grow an LVM root online:
 `sudo lvextend -L +<size> -r /dev/<vg>/<lv>`. Reclaim: `docker image prune`, remove models from the hub,

@@ -57,8 +57,7 @@ Agreed with Gemini after review:
 - **Egress silo.** The browser runs on `mgmt` beside `modeld`; `edge` and `backend` keep zero WAN egress.
 - **Ingestion safety.** `.safetensors` and GGUF only; every download verified against the registry's SHA-256;
   `.ckpt`/`.pt`/`.bin` pickles refused unless an admin overrides per file (audited).
-- **Preview blackout.** With NSFW off, CivitAI content flagged NSFW is not fetched at all. Previews of any kind
-  are not rendered until the image classifier exists to check them. "Blue/red": the CivitAI API key's scope
+- **Previews (revised 2026-09-24 by operator decision).** Thumbnails are shown — they are what makes an image/video model browser usable — but only PG/PG-13 registry previews unless NSFW is on, and always proxied through the hub so the admin's browser never contacts a registry. With NSFW off, NSFW listings are not fetched at all. "Blue/red": the CivitAI API key's scope
   decides whether NSFW listings are reachable; the key is stored root-only and encrypted; enabling NSFW requires
   a red-scope key and is audited.
 - Downloads land in the shared store (Ollama for GGUF; ComfyUI checkpoints/loras for safetensors) and appear in

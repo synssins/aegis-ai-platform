@@ -12,6 +12,7 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 | | Audit log | **Clear log** (clearable entries only) | vetoes with immutable flag (🔒) and evidence-record marker; every admin action; sealed-evidence index (ids, times, categories, hashes — never content) |
 | | Alerts | webhook URL | Discord/Slack/generic JSON; "Send test" |
 | Models | Installed | expose / load / unload / remove; "Set as classifier" for guard-family models | expose = register in LiteLLM under a public name (through VetoGuard) — on the native chat API with real tool calls when the model advertises `tools`, text-only otherwise (capability tags shown); guard models never exposable and not loaded/unloaded by hand — their residency follows the policy choice; the active classifier cannot be removed |
+| | Browse | Hugging Face + CivitAI browser: source tabs, search, type/sort filters, list/detail/S/M/L views, local detail view with link to the source page, hardware-fit badges, **Buzz** badge for CivitAI early access, download to `comfyui/<kind>/` or pull GGUF into Ollama | previews proxied through the hub; NSFW never fetched unless the toggle is on (needs a CivitAI key, audited); `.safetensors`/`.gguf` only, SHA-256 verified when published, pickles refused; every download audited |
 | | Pull | pull | via `modeld` — the only container with both internet and the model store. Apps never fetch their own |
 | | Exposed to apps | unexpose (hub-created only) | models from `config.yaml` are console-managed |
 | Access | API keys | mint / revoke | per-client, model-scoped, rate-limited; key shown once |
@@ -23,6 +24,22 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 
 ## Public status page
 `https://<LAN_IP>/status` (and `/status/api` as JSON) shows the same load/health view **without a login** — GPU/CPU/memory/disk load, models in memory, service up/down. It deliberately contains no accounts, keys, aliases or content; the acceptance suite asserts that. It is the first tile of the future portal.
+
+## Model browser (Hub → Models → Browse)
+Admin-only. Two sources today (Hugging Face, CivitAI) behind one experience; a source is a small provider in
+`caddy/hub/browse.py` (search + detail + normalised item), so more registries slot in. Cards show name, author,
+type, base model, downloads, likes, size, and badges: **Buzz** (CivitAI early access — downloading that version
+costs Buzz), **NSFW**, **gated** (HF licence + token). Views: list, detail rows, small/medium/large thumbnails;
+Hugging Face has no previews, CivitAI does. The detail view loads locally (description, previews, versions, files
+with size/format/SHA-256/fit badge, trigger words) and carries the *Open on CivitAI / Hugging Face ↗* link.
+
+Safety rules, all server-side: previews are proxied by the hub from an allow-list of registry image hosts (the
+admin's browser never contacts CivitAI/HF); NSFW listings and previews are **not fetched** unless the NSFW toggle
+is on — the toggle needs a CivitAI API key on file and is audited; downloads accept `.safetensors` and `.gguf`
+only, refuse pickles (`.ckpt/.pt/.bin`) and anything the registry's own scans did not clear, verify SHA-256 when the
+registry publishes one, write to `.part` and rename on success, and land in `comfyui/<checkpoints|loras|vae|…>/`;
+GGUF pulls go through `modeld` (Models → Pull) as `hf.co/<repo>:<quant>`. Keys are Fernet-encrypted in hub
+state. Fit badges compare a file to one card's memory (LLMs with a KV-cache band); guidance, not a control.
 
 ## Portal chat (portal-native)
 The portal's **Chat** section is the hub's own chat, not Open WebUI. Deliberately minimal: no user settings — a model picker, a message box, and a conversation list kept in the user's browser (localStorage; nothing stored server-side). Rules, all enforced server-side in `caddy/hub/hub.py` (`_chat_stream`):

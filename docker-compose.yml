@@ -51,6 +51,8 @@ services:
       - GRAFANA_ENABLED=${GRAFANA_ENABLED:-0}
     volumes:
       - ./caddy/hub/hub.py:/app/hub.py:ro
+      - ./caddy/hub/browse.py:/app/browse.py:ro
+      - ./comfyui:/app/comfy-store                # model browser downloads (checkpoints/, loras/, …); ComfyUI reads the same tree
       - ./caddy/conf:/etc/caddy/conf:ro
       - ./docker-compose.yml:/app/view/docker-compose.yml:ro
       - ./caddy/sites-enabled:/etc/caddy/sites-enabled
