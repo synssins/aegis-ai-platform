@@ -14,6 +14,11 @@
 }
 
 (site) {
+    # Device identity: these headers are set ONLY from the TLS client certificate below. Anything a client
+    # sends under these names is discarded before routing, so they cannot be forged.
+    request_header -X-Device-Fingerprint
+    request_header -X-Device-Subject
+
     request_body {
         max_size 32MB
     }
@@ -33,6 +38,8 @@
         reverse_proxy litellm:4000 {
             header_up -X-Forwarded-Host
             header_up -X-Real-IP
+            header_up X-Device-Fingerprint {http.request.tls.client.fingerprint}
+            header_up X-Device-Subject {http.request.tls.client.subject}
         }
     }
     handle /v1/* {
@@ -42,12 +49,17 @@
     # Admin control centre (hub shares this container's network namespace). The hub enforces its own
     # authentication: argon2id passwords, mandatory TOTP, signed cookies, lockout. Nothing at the edge.
     handle /hub* {
-        reverse_proxy localhost:9000
+        reverse_proxy localhost:9000 {
+            header_up X-Device-Fingerprint {http.request.tls.client.fingerprint}
+            header_up X-Device-Subject {http.request.tls.client.subject}
+        }
     }
 
     # Public status page (GPU/CPU/memory load, resident models, service health — no sensitive data, no login).
     handle /status* {
-        reverse_proxy localhost:9000
+        reverse_proxy localhost:9000 {
+            header_up X-Device-Fingerprint {http.request.tls.client.fingerprint}
+        }
     }
 
     # Monitoring — present when `--profile monitoring` is up (502 otherwise). Grafana has its own login.
@@ -74,9 +86,16 @@
     }
 }
 
-# LAN access by IP with the internal CA.
+# LAN access by IP with the internal CA. Client certificates are REQUESTED (optional): a device that has one
+# is identified by its fingerprint; one that has none still connects. The hub decides what a missing
+# certificate means (Access -> Devices).
 {$AEGIS_LAN_IP} {
-    tls internal
+    tls internal {
+        client_auth {
+            mode request
+            trusted_ca_cert_file /etc/caddy/sites-enabled/device-ca.pem
+        }
+    }
     import site
 }
 

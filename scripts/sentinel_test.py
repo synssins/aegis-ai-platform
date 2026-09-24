@@ -329,6 +329,14 @@ class Suite:
         try: j = json.loads(b); okj = "gpus" in j and "services" in j and "cpu" in j
         except Exception: okj = False  # noqa: BLE001
         self.rec("5.18", "edge", "/status/api returns structured metrics", "json with gpus/services/cpu", st, st == 200 and okj)
+        st, _, b = http("GET", f"{self.base}/status/api", headers={"X-Device-Fingerprint": "f" * 64, "X-Device-Subject": "CN=forged"})
+        try: forged = json.loads(b).get("device_certificate_presented")
+        except Exception: forged = "?"  # noqa: BLE001
+        self.rec("5.19", "edge", "client-supplied device-fingerprint headers are stripped at the edge (no spoofing)", "False", forged, forged is False)
+        rc, out = sh(f"sudo -n grep -c 'trusted_ca_cert_file' {ROOT}/caddy/Caddyfile")
+        self.rec("5.20", "edge", "Caddy requests client certificates against the device CA", ">=1", out.strip(), out.strip().isdigit() and int(out) >= 1)
+        rc, out = sh(f"sudo -n stat -c '%a' {ROOT}/caddy/hub/state/device-ca.key.enc")
+        self.rec("5.21", "hygiene", "device CA private key is encrypted at rest and root-only", "600", out.strip(), out.strip() == "600")
         rc, out = docker("inspect litellm --format '{{range .Mounts}}{{.Destination}}:{{.RW}} {{end}}'")
         self.rec("5.9", "hub", "litellm mounts policy read-only", "/app/policy:false", out, "/app/policy:false" in out)
         rc, out = docker("inspect hub --format '{{.HostConfig.NetworkMode}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}}'")

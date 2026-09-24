@@ -527,7 +527,9 @@ def _client_meta(data: dict) -> dict:
     for src in (data.get("proxy_server_request", {}) or {}).get("headers", {}), (data.get("metadata", {}) or {}).get("headers", {}):
         if isinstance(src, dict):
             h.update({str(k).lower(): str(v) for k, v in src.items()})
-    return {"client_ip": (h.get("x-forwarded-for", "").split(",")[0].strip() or h.get("x-real-ip") or None), "user_agent": h.get("user-agent")}
+    fp = (h.get("x-device-fingerprint") or "").strip().lower()
+    return {"client_ip": (h.get("x-forwarded-for", "").split(",")[0].strip() or h.get("x-real-ip") or None), "user_agent": h.get("user-agent"),
+            "device_fingerprint": fp if re.fullmatch(r"[0-9a-f]{64}", fp) else None, "device_subject": h.get("x-device-subject") or None}
 
 
 _EVIDENCE_LOCK = threading.Lock()
@@ -582,6 +584,7 @@ def audit(stage: str, reason: str, detail: str, data: dict, key_dict: Any, match
     dcap = 240 if reason in ("guard_verdict_unparseable", "guard_no_adapter") else 120
     rec = {"ts": datetime.now(timezone.utc).isoformat(), "stage": stage, "reason": reason, "detail": (detail.replace("\n", "\\n")[:dcap] if detail else ""),
            "call_id": data.get("litellm_call_id"), "model": data.get("model"), "key_alias": _key_alias(key_dict),
+           "device_fingerprint": _client_meta(data).get("device_fingerprint"),
            "immutable": _is_immutable(reason, detail)}
     if _wants_evidence(reason, detail):
         rid = write_evidence(stage, reason, detail, data, key_dict, matches or [], output)

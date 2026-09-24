@@ -23,6 +23,9 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 ## Public status page
 `https://<LAN_IP>/status` (and `/status/api` as JSON) shows the same load/health view **without a login** — GPU/CPU/memory/disk load, models in memory, service up/down. It deliberately contains no accounts, keys, aliases or content; the acceptance suite asserts that. It is the first tile of the future portal.
 
+## Device identity (hard identifiers)
+IP addresses and user agents are claims; a certificate is proof of possession of a key. Caddy *requests* a client certificate on every site (optional — connections without one still work) and forwards only the TLS-derived fingerprint to the hub and LiteLLM, discarding any client-supplied header of the same name. The hub issues per-device certificates (Access → Devices), binds admin sessions to the presenting fingerprint, can require a known device for admin sign-in, and records fingerprints in every login audit; VetoGuard records them in veto audit entries and evidence. Revocation is immediate at the hub (Caddy still completes the TLS handshake in request mode; the hub refuses the session).
+
 ## Privilege model
 - The hub's own login is the administrator boundary (see top). One admin identity by design until the identity layer lands (roadmap).
 - **Container control has no Docker socket in any container.** The hub writes exactly one `ops/requests/request.json`; `aegis-watchdog` (a root systemd service on the host, `ops/aegis-watchdog.py`) validates it against an allow-list, refuses `stop` for caddy/hub, orders dependents (caddy→hub, litellm-db→litellm, ollama→litellm, prometheus→grafana), executes with the docker CLI, writes `ops/responses/<ts>-<id>.json`, archives the request, and publishes `status.json` every 5 s. Only one request can be pending.

@@ -29,6 +29,9 @@ sudo chown root:$USER caddy/Caddyfile proxy/config.yaml proxy/veto_filter.py cad
 Why root-owned 700/640: every container drops all capabilities, so root inside a container obeys ordinary
 file permissions; data directories must belong to root, and the gateway config must be writable only by root.
 
+## 2b. Device CA (once)
+`docker compose up -d hub && docker exec hub python3 /app/hub.py --init-device-ca` creates the device CA (key encrypted at rest in hub state; public cert at `caddy/sites-enabled/device-ca.pem`, which the Caddyfile references — Caddy will not start without it). Then `docker compose restart caddy hub`.
+
 ## 3. Images
 `docker build -t aegis/hub:4 caddy/hub/build` — or pull `ghcr.io/<owner>/aegis-hub` once published. All
 other images are stock upstream, pinned in `docker-compose.yml`.
