@@ -87,7 +87,9 @@ OPS_RESP = "/app/ops/responses"
 OPS_STATUS = os.path.join(OPS_RESP, "status.json")
 CADDY_ADMIN = "http://127.0.0.1:2019"
 LITELLM = "http://litellm:4000"
-OLLAMA = "http://ollama:11434"
+OLLAMA = "http://ollama:11434"                                   # NVIDIA pool: chat models
+GUARD_OLLAMA = os.environ.get("GUARD_OLLAMA", OLLAMA).rstrip("/")  # classifier pool (Intel Arc when present)
+POOLS = {"nvidia": OLLAMA, "intel": GUARD_OLLAMA} if GUARD_OLLAMA != OLLAMA else {"nvidia": OLLAMA}
 MODELD = "http://modeld:11434"
 PROM = "http://prometheus:9090"
 CSRF = secrets.token_urlsafe(24)
@@ -549,11 +551,14 @@ def provider_for(name: str) -> str:
 def installed_models() -> list[dict]:
     st, j = http("GET", OLLAMA + "/api/tags", timeout=10)
     models = j.get("models", []) if isinstance(j, dict) else []
-    st2, ps = http("GET", OLLAMA + "/api/ps", timeout=10)
-    loaded = {m.get("name"): m for m in (ps.get("models", []) if isinstance(ps, dict) else [])}
+    loaded = {}
+    for pool, url in POOLS.items():
+        st2, ps = http("GET", url + "/api/ps", timeout=10)
+        for m in (ps.get("models", []) if isinstance(ps, dict) else []):
+            loaded[m.get("name")] = {**m, "pool": pool}
     for m in models:
         m["loaded"] = m.get("name") in loaded
-        m["vram"] = loaded.get(m.get("name"), {}).get("size_vram", 0)
+        m["vram"] = loaded.get(m.get("name"), {}).get("size_vram", 0); m["pool"] = loaded.get(m.get("name"), {}).get("pool")
         m["is_guard"] = is_guard_name(m.get("name") or "")
         m["caps"] = model_caps(m.get("name") or "")
     return sorted(models, key=lambda m: m.get("name", ""))
@@ -570,10 +575,10 @@ def activate_guard(model: str) -> None:
     """Make the policy's classifier resident and drop other guard models (one selection, one residency)."""
     def run():
         for m in installed_models():
-            if m["is_guard"] and m["loaded"] and m["name"] != model:
-                http("POST", OLLAMA + "/api/generate", {"model": m["name"], "keep_alive": 0}, timeout=120)
-        st, j = http("POST", OLLAMA + "/api/generate", {"model": model, "keep_alive": "24h"}, timeout=900)
-        audit("guard_loaded" if st == 200 else "guard_load_failed", model=model, status=st)
+            if m["is_guard"] and m["loaded"] and (m["name"] != model or (m.get("pool") and POOLS.get(m["pool"]) != GUARD_OLLAMA)):
+                http("POST", POOLS.get(m.get("pool"), OLLAMA) + "/api/generate", {"model": m["name"], "keep_alive": 0}, timeout=120)
+        st, j = http("POST", GUARD_OLLAMA + "/api/generate", {"model": model, "keep_alive": "24h"}, timeout=900)
+        audit("guard_loaded" if st == 200 else "guard_load_failed", model=model, status=st, pool=GUARD_OLLAMA)
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -816,8 +821,10 @@ def metrics_snapshot() -> dict:
     disk_size = next(iter(prom_instant('node_filesystem_size_bytes{mountpoint="/"}')), ({}, None))[1]
     disk_avail = next(iter(prom_instant('node_filesystem_avail_bytes{mountpoint="/"}')), ({}, None))[1]
     load1 = next(iter(prom_instant("node_load1")), ({}, None))[1]
-    st, ps = http("GET", OLLAMA + "/api/ps", timeout=5)
-    resident = [{"name": m.get("name"), "vram_gib": round(m.get("size_vram", 0) / 2**30, 1), "gpu": m.get("size_vram", 0) > 0} for m in (ps.get("models", []) if isinstance(ps, dict) else [])]
+    resident = []
+    for pool, url in POOLS.items():
+        st, ps = http("GET", url + "/api/ps", timeout=5)
+        resident += [{"name": m.get("name"), "vram_gib": round(m.get("size_vram", 0) / 2**30, 1), "gpu": m.get("size_vram", 0) > 0, "pool": pool} for m in (ps.get("models", []) if isinstance(ps, dict) else [])]
     cst, cts = container_status()
     services = {n: (s.get("status") == "running" and s.get("health") in ("", "healthy")) for n, s in cst.items() if s.get("status") != "absent"}
     return {"ts": now(), "gpus": dict(sorted(gpus.items())), "cpu": cpu, "cpu_series": cpu_series, "load1": load1, "mem_total": mem_total, "mem_avail": mem_avail,

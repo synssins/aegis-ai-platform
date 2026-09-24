@@ -45,6 +45,7 @@ services:
     command: ["python3", "-u", "/app/hub.py"]
     environment:
       - AEGIS_LAN_IP=${AEGIS_LAN_IP}
+      - GUARD_OLLAMA=http://ollama-intel:11434         # where the hub loads/checks the safety classifier
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
       - HUB_SECRET_KEY=${HUB_SECRET_KEY}
       - VETO_EVIDENCE_KEY=${VETO_EVIDENCE_KEY}      # evidence handoff export (re-encrypts one record with a fresh key)
@@ -113,7 +114,7 @@ services:
       - STORE_MODEL_IN_DB=True                      # models exposed from the hub persist in the DB
       - DISABLE_ADMIN_UI=True
       - LITELLM_LOG=INFO
-      - VETO_GUARD_URL=http://ollama:11434
+      - VETO_GUARD_URL=http://ollama-intel:11434        # classifier pool (Intel Arc); fail-closed if unreachable
       - VETO_POLICY_PATH=/app/policy/veto-policy.json
       - VETO_AUDIT_PATH=/app/audit/veto-audit.jsonl
       - VETO_EVIDENCE_DIR=/app/evidence
@@ -163,6 +164,30 @@ services:
     networks: [backend]
 
   # ---------------------------------------------------------------- monitoring (profile) ----
+  ollama-intel:
+    # GPU pool "intel": the two Arc Pro B60 on Ollama's Vulkan backend (stock image, no fork). Holds the safety
+    # classifier by policy so the NVIDIA pool keeps its memory for the chat model and image generation.
+    # Pass ONLY the Intel render/card nodes and the Intel Vulkan ICD: the whole /dev/dri (virtio display) hangs
+    # discovery in a VM. Map nodes with: for r in /sys/class/drm/renderD*; do echo $(basename $r) $(basename $(readlink -f $r/device)); done
+    <<: *hardened
+    image: ollama/ollama:0.34.3
+    container_name: ollama-intel
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_VULKAN=1
+      - VK_DRIVER_FILES=/usr/share/vulkan/icd.d/intel_icd.json
+      - OLLAMA_CONTEXT_LENGTH=8192
+    devices:
+      - /dev/dri/renderD129
+      - /dev/dri/renderD131
+      - /dev/dri/card0
+      - /dev/dri/card3
+    group_add: ["991", "44"]                          # render, video (host gids)
+    volumes:
+      - ./llm/gguf:/root/.ollama                      # shared model store (pulled by modeld)
+    networks: [backend]
+
   prometheus:
     <<: *hardened
     image: prom/prometheus:v3.5.0

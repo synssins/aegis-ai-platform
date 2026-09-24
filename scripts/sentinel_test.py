@@ -248,8 +248,10 @@ class Suite:
         st, _, b = http("POST", f"{self.base}/v1/chat/completions", {"model": self.model, "max_tokens": 8, "stream": True,
                         "messages": [{"role": "user", "content": "Say the word hello."}]}, self.auth)
         self.rec("3.10", "veto", "streaming request passes through buffered classifier", "200 + data:", f"{st} {b[:60]!r}", st == 200 and b.startswith(b"data:"))
-        rc, out = docker("exec ollama ollama ps", timeout=15)
-        self.rec("3.11", "veto", "guard model resident in ollama", "llama-guard3 listed", out[:120], "llama-guard3" in out)
+        rc, out = docker("exec ollama-intel ollama ps", timeout=15)
+        if rc != 0:
+            rc, out = docker("exec ollama ollama ps", timeout=15)
+        self.rec("3.11", "veto", "guard model resident in the classifier pool", "llama-guard3 listed", out[:120], "llama-guard3" in out)
         rc, out = docker("exec litellm python3 -c \"import sys;sys.path.insert(0,'/app');from custom_logger import veto_filter as v\nimport json\ntry:\n v._parse_llama_guard('This looks fine to me.')\nexcept v.GuardVerdictUnparseable as e: print(e.reason, 'got' in str(e), 'expected' in str(e))\nprint('noadapter', v.adapter_for('shieldgemma:2b') is None)\"", timeout=30)
         self.rec("3.13", "veto", "unreadable classifier verdict is refused and logged with got/expected", "guard_verdict_unparseable True True + noadapter True", out.replace("\n", " ")[-80:], "guard_verdict_unparseable True True" in out and "noadapter True" in out)
         rc, out = docker("exec litellm python3 -c \"import sys;sys.path.insert(0,'/app');from custom_logger import veto_filter as v\nprint(v._is_immutable('classifier','S4 Child Sexual Exploitation'), v._is_immutable('regex:sentinel','x'), v._wants_evidence('classifier','S4 Child Sexual Exploitation'), v._wants_evidence('regex:sentinel','x'), bool(v.EVIDENCE_KEY))\"", timeout=30)
