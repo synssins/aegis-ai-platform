@@ -1521,7 +1521,7 @@ document.querySelectorAll(".br-src").forEach(b=>b.onclick=()=>{st.src=b.dataset.
 $("#br-q").addEventListener("keydown",e=>{if(e.key==="Enter"){st.q=e.target.value.trim();search(false)}});$("#br-go").onclick=()=>{st.q=$("#br-q").value.trim();search(false)};
 $("#br-type").onchange=e=>{st.type=e.target.value;search(false)};$("#br-sort").onchange=e=>{st.sort=e.target.value;search(false)};
 document.querySelectorAll(".br-view").forEach(b=>{b.classList.toggle("on",b.dataset.v===st.view);b.onclick=()=>{st.view=b.dataset.v;localStorage.setItem("br_view",st.view);document.querySelectorAll(".br-view").forEach(x=>x.classList.toggle("on",x===b));render()}});
-$("#br-more").onclick=()=>search(true);$("#br-close").onclick=()=>{$("#br-modal").hidden=true};$("#br-modal").addEventListener("click",e=>{if(e.target.id==="br-modal")$("#br-modal").hidden=true});
+$("#br-gear").onclick=()=>{const p=$("#br-settings");p.hidden=!p.hidden;$("#br-gear").classList.toggle("on",!p.hidden)};$("#br-more").onclick=()=>search(true);$("#br-close").onclick=()=>{$("#br-modal").hidden=true};$("#br-modal").addEventListener("click",e=>{if(e.target.id==="br-modal")$("#br-modal").hidden=true});
 st.nsfw=document.body.dataset.nsfw==="1";search(false);jobs();})();
 """
 
@@ -1543,18 +1543,23 @@ def p_browse(msg="", ok=True):
     cfg = browse_settings()
     types = "".join(f'<option value="{k}"{" selected" if k == "image" else ""}>{esc(v)}</option>' for k, v in browse.TYPES)
     sorts = "".join(f'<option value="{k}">{esc(v)}</option>' for k, v in browse.SORTS)
+    open_settings = bool(msg) or not cfg["civitai_key"]; settings = _browse_settings_card(cfg)
     views = "".join(f'<button class="br-view" data-v="{k}" title="{t}">{lbl}</button>' for k, lbl, t in (("list", "≡", "list"), ("detail", "☰", "detail rows"), ("s", "▪", "small thumbnails"), ("m", "◼", "medium"), ("l", "⬛", "large posters")))
     body = f"""<div class="br-bar"><button class="br-src" data-src="hf">Hugging Face</button><button class="br-src on" data-src="civitai">CivitAI</button>
-<input id="br-q" placeholder="search…" style="min-width:220px"><button id="br-go" class="ghost">Search</button><select id="br-type">{types}</select><select id="br-sort">{sorts}</select><span style="margin-left:auto">{views}</span></div>
+<input id="br-q" placeholder="search…" style="min-width:220px"><button id="br-go" class="ghost">Search</button><select id="br-type">{types}</select><select id="br-sort">{sorts}</select><span style="margin-left:auto">{views} <button id="br-gear" class="br-view{" on" if open_settings else ""}" title="Registry settings: CivitAI key, Hugging Face token, NSFW">⚙</button></span></div>
+<div id="br-settings" {"" if open_settings else "hidden"}>{settings}</div>
 <div class="mut" style="margin-bottom:10px"><span id="br-state"></span> · previews are proxied through the hub (your browser never contacts the registries) · <span class="tag warn">Buzz</span> = CivitAI early access, costs Buzz to download · fit badges are guidance against one card's memory (Intel cards counted once a runtime reports them)</div>
 <div id="br-results"></div><div style="text-align:center;margin:14px"><button id="br-more" class="ghost" hidden>More</button></div><div id="br-jobs"></div>
 <div id="br-modal" hidden><div class="inner"><button id="br-close" title="close">×</button><div id="br-mbody"></div></div></div>
-<form method="post" action="/hub/api/browse/settings">{csrf_field()}<div class="card"><h2 style="margin-top:0">Registry settings</h2><div class="row"><div><label>CivitAI API key {"<span class=tag>on file</span>" if cfg["civitai_key"] else ""}</label><input name="civitai_key" type="password" autocomplete="off" placeholder="{"replace" if cfg["civitai_key"] else "needed for NSFW listings and many downloads"}"><label style="display:inline"><input type="checkbox" name="clear_civitai_key"> clear</label></div>
-<div><label>Hugging Face token {"<span class=tag>on file</span>" if cfg["hf_token"] else ""}</label><input name="hf_token" type="password" autocomplete="off" placeholder="{"replace" if cfg["hf_token"] else "only for gated repositories"}"><label style="display:inline"><input type="checkbox" name="clear_hf_token"> clear</label></div></div>
-<label style="margin-top:10px"><input type="checkbox" name="nsfw" {"checked" if cfg["nsfw"] else ""}> Show NSFW listings and previews (CivitAI; Hugging Face "not-for-all-audiences"). Off = such content is never fetched. Audited.</label><div style="margin-top:10px"><button>Save</button></div><div class="mut" style="margin-top:6px">Keys are Fernet-encrypted in hub state and used only server-side. Downloads: .safetensors/.gguf only, SHA-256 verified when the registry publishes one, pickles refused; files land in <code>comfyui/&lt;kind&gt;/</code> (GGUF pulls go to Ollama via Models → Pull).</div></div></form>
 <script>{BROWSE_JS.replace("__CSRF__", CSRF)}</script>"""
-    html_ = page("models", "browse", "Browse models", "Hugging Face and CivitAI, searched from here. Click a card for details; the source page opens from the detail view.", body, msg, ok)
+    html_ = page("models", "browse", "Browse models", "Hugging Face and CivitAI, searched from here. Click a card for details; the source page opens from the detail view. ⚙ holds the registry keys.", body, msg, ok)
     return html_.replace("<style>", "<style>" + BROWSE_CSS, 1).replace("<body>", f'<body data-nsfw="{1 if cfg["nsfw"] else 0}">', 1)
+
+
+def _browse_settings_card(cfg) -> str:
+    return f"""<form method="post" action="/hub/api/browse/settings">{csrf_field()}<div class="card"><h2 style="margin-top:0">Registry settings</h2><div class="row"><div><label>CivitAI API key {"<span class=tag>on file</span>" if cfg["civitai_key"] else ""}</label><input name="civitai_key" type="password" autocomplete="off" placeholder="{"replace" if cfg["civitai_key"] else "needed for NSFW listings and many downloads"}"><label style="display:inline"><input type="checkbox" name="clear_civitai_key"> clear</label></div>
+<div><label>Hugging Face token {"<span class=tag>on file</span>" if cfg["hf_token"] else ""}</label><input name="hf_token" type="password" autocomplete="off" placeholder="{"replace" if cfg["hf_token"] else "only for gated repositories"}"><label style="display:inline"><input type="checkbox" name="clear_hf_token"> clear</label></div></div>
+<label style="margin-top:10px"><input type="checkbox" name="nsfw" {"checked" if cfg["nsfw"] else ""}> Show NSFW listings and previews (CivitAI; Hugging Face "not-for-all-audiences"). Off = such content is never fetched. Audited.</label><div style="margin-top:10px"><button>Save</button></div><div class="mut" style="margin-top:6px">Keys are Fernet-encrypted in hub state and used only server-side. Downloads: .safetensors/.gguf only, SHA-256 verified when the registry publishes one, pickles refused; files land in <code>comfyui/&lt;kind&gt;/</code> (GGUF pulls go to Ollama via Models → Pull).</div></div></form>"""
 
 
 def act_pull(form):
