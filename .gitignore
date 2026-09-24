@@ -17,3 +17,6 @@ __pycache__/
 monitoring/data/
 caddy/hub/state/
 proxy/policy/
+ops/requests/
+ops/responses/
+ops/archive/

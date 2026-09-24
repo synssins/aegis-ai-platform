@@ -1,0 +1,19 @@
+[Unit]
+Description=Aegis watchdog — file-driven container start/stop/restart for the hub (runs outside Docker)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/aegis-watchdog.py
+Environment=AEGIS_OPS_DIR=/data/ai-unified/ops
+Restart=always
+RestartSec=3
+# The only writable places it needs: the ops dir. Everything else read-only.
+ProtectSystem=strict
+ReadWritePaths=/data/ai-unified/ops /var/run/docker.sock
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

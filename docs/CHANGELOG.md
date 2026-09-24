@@ -2,6 +2,22 @@
 
 All significant changes to the platform are recorded here. Every entry must name the files touched, the reason, who/what made the change, and how it was verified. Security-relevant changes must link an audit record in `docs/audits/`.
 
+## 2026-09-24 (evening, continued) — GPU loss root-caused and fixed: CDI device injection
+
+- **Root cause (both incidents, 15:12 and 16:10):** the legacy NVIDIA runtime hook grants GPU device access through cgroup rules that a host `systemctl daemon-reload` (or any package/unit install) resets for running containers → `NVML: Unknown Error` → Ollama falls back to CPU silently. The 16:10 trigger was the watchdog's own unit install.
+- **Fix (host + compose):** `nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml`; `ollama` and `dcgm-exporter` now take `devices: [nvidia.com/gpu=all]` (CDI) instead of the `driver: nvidia` reservation. **Verified:** NVML and inference intact after a deliberate `systemctl daemon-reload` and a `systemctl reload docker`; DCGM metrics flowing. Regenerate the CDI spec after a driver upgrade (`docs/MIGRATION.md`).
+- Watchdog demonstrated in anger: `restart ollama` stopped and restarted `litellm` around it in order.
+
+## 2026-09-24 (evening) — Hub v3: own authentication (argon2id + mandatory TOTP); host watchdog replaces any Docker-socket control; services control page
+
+- **Decision (operator):** no Docker socket in any container. Control goes through `aegis-watchdog`, a root systemd service on the host (`ops/aegis-watchdog.py`, `ops/aegis-watchdog.service`, installed 16:10 UTC): one request file, allow-listed names, `start|stop|restart`, dependency ordering (dependents down deepest-first, up shallowest-first), **caddy/hub may only be restarted**, responses + `status.json` in `ops/responses/`. Round-trip and protected-stop refusal tested. The `opsd` socket sidecar drafted earlier was withdrawn (and refused by the harness) — see `docs/SECURITY.md`.
+- **Hub v3 (`aegis/hub:3`):** login page replaces Caddy basic-auth. argon2id hashes only (no plaintext anywhere — `HUB_ADMIN_PASSWORD*` removed from `.env`), TOTP mandatory with replay protection, Fernet-encrypted TOTP secret, signed HttpOnly/Secure/SameSite=Strict cookies, per-user/per-IP lockout, bootstrap password printed once on first start with forced change + MFA enrolment, console reset script. TOTP verified against RFC 6238 vectors. Full flow tested end-to-end with a throwaway identity, then reset for the operator.
+- **Services page:** checkbox · container · status (from watchdog) · purpose · last response; Start/Stop/Restart on the checked set; Stop refused for protected; one pending request at a time; response log viewer.
+- **Also:** veto audit records category names with codes; hub alerts every illegal/protected-class veto to the webhook (never sentinel tests); Models → Installed gains Unload/Load; every table paginated.
+- **Caddyfile:** `/hub` no longer wrapped in `basic_auth` (the hub authenticates); `hub-auth.conf` and `scripts/seed-hub-auth.sh` retired.
+- **Harness:** hub phase uses the real login flow (`--hub-password` + TOTP via `docker exec hub python3 /app/hub.py --totp-now`); new assertions: unauthenticated redirect, argon2id + encrypted TOTP in the store, watchdog status, hub refuses to stop itself, restart round-trip through the watchdog, lockout after 5 failures.
+- **Portal + single identity:** design recorded in `docs/ROADMAP.md` #9 for review before build.
+
 ## 2026-09-24 (late afternoon) — VetoGuard 2.6 → 2.7 (Agy rounds 4–5); snippet diagnostics; first real-world false positive
 
 - **Home Assistant false positive (15:16 UTC):** key `home-assistant-test`, user "Good morning." → reply withheld, `post_call_stream classifier S1`. Llama Guard 1B scored 0/20 false positives on generic assistant exchanges, so the flag was content-specific (HA replies recite device/lock/alarm state). Diagnosis is blocked by the no-content audit design → added an **admin-only, default-off** policy toggle (Safety → VetoGuard policy → Diagnostics) storing ≤ 160 chars of *flagged output* in `proxy/audit/veto-snippets.jsonl` (root-only), never for S4 / CSAM-tripwire reasons; toggling is audited + alerted; snippets are viewable in Safety → Audit log. The durable fix remains a stronger guard (8B) paired with a ≤ 20 GB main model (`gemma3:27b` is pulled).

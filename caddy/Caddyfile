@@ -39,11 +39,9 @@
         respond 404
     }
 
-    # Admin control centre (hub shares this container's network namespace). Basic-auth at the edge.
+    # Admin control centre (hub shares this container's network namespace). The hub enforces its own
+    # authentication: argon2id passwords, mandatory TOTP, signed cookies, lockout. Nothing at the edge.
     handle /hub* {
-        # Credential lives in a file the hub rotates (Access -> Admin password). A missing file makes
-        # Caddy refuse to start: fail-closed, never fail-open.
-        import /etc/caddy/sites-enabled/hub-auth.conf
         reverse_proxy localhost:9000
     }
 

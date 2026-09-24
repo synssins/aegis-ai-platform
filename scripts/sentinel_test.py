@@ -12,6 +12,8 @@ Env:    reads ./.env for AEGIS_LAN_IP, LITELLM_MASTER_KEY, TEST_API_KEY, HUB_ADM
 from __future__ import annotations
 
 import argparse
+import re
+import urllib.parse
 import base64
 import json
 import os
@@ -41,13 +43,21 @@ def load_env() -> dict:
     return env
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+
+
+_OPENER = urllib.request.build_opener(urllib.request.HTTPSHandler(context=CTX), _NoRedirect())
+
+
 def http(method, url, body=None, headers=None, timeout=120):
     data = json.dumps(body).encode() if isinstance(body, dict) else body
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     if isinstance(body, dict):
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=CTX) as r:
+        with _OPENER.open(req, timeout=timeout) as r:
             return r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read()
@@ -136,14 +146,31 @@ class Suite:
         self.rec("1.5", "network", "ollama cannot resolve external names", "fails", f"rc={rc}", rc != 0)
 
     # ---------------- Phase 2: edge & API ----------------
-    def hub_auth_ok(self):
+    def hub_login(self) -> dict | None:
+        """Real login flow: password (from --hub-password only, never a file) + TOTP via the console helper."""
+        if getattr(self, "_hub_headers", None) is not None:
+            return self._hub_headers or None
         pw = self.env.get("HUB_ADMIN_PASSWORD")
-        if not pw: return False
-        tok = base64.b64encode(f"admin:{pw}".encode()).decode()
-        st, _, _ = http("GET", f"{self.base}/hub/api/status", headers={"Authorization": f"Basic {tok}"})
-        if st == 401:
-            print("NOTE  hub password in .env is stale (rotated from the UI) — pass --hub-password to run hub tests")
-        return st == 200
+        if not pw:
+            print("NOTE  hub tests need --hub-password (the hub stores only argon2id hashes; nothing is read from a file)")
+            self._hub_headers = {}; return None
+        st, h, b = http("GET", f"{self.base}/hub/login")
+        m = re.search(rb'name="csrf" value="([^"]+)"', b); csrf = m.group(1).decode() if m else ""
+        st, h, b = http("POST", f"{self.base}/hub/login", urllib.parse.urlencode({"csrf": csrf, "user": "admin", "password": pw}).encode(), {"Content-Type": "application/x-www-form-urlencoded"})
+        m = re.search(rb'name="pre" value="([^"]+)"', b)
+        if st != 200 or not m or b"Second factor" not in b:
+            print(f"NOTE  hub login step 1 failed ({st}); is MFA enrolled and the password current?"); self._hub_headers = {}; return None
+        rc, code = docker("exec hub python3 /app/hub.py --totp-now", timeout=30)
+        st, h, b = http("POST", f"{self.base}/hub/login/totp", urllib.parse.urlencode({"csrf": csrf, "pre": m.group(1).decode(), "code": code.strip()}).encode(), {"Content-Type": "application/x-www-form-urlencoded"})
+        ck = h.get("Set-Cookie", "")
+        if st != 303 or "aegis_hub=" not in ck:
+            print(f"NOTE  hub login step 2 failed ({st})"); self._hub_headers = {}; return None
+        self._hub_headers = {"Cookie": ck.split(";")[0]}
+        self.hub_csrf = csrf
+        return self._hub_headers
+
+    def hub_auth_ok(self):
+        return self.hub_login() is not None
 
     def phase2(self):
         st, _, _ = http("GET", f"{self.base}/v1/models")
@@ -163,13 +190,12 @@ class Suite:
         self.rec("2.6", "edge", "security headers present, Server header absent",
                  "HSTS+nosniff, no Server", {k: hl.get(k) for k in ("strict-transport-security", "x-content-type-options", "server")},
                  "strict-transport-security" in hl and "x-content-type-options" in hl and "server" not in hl)
-        st, _, _ = http("GET", f"{self.base}/hub")
-        self.rec("2.7", "edge", "/hub requires auth", "401", st, st == 401)
-        pw = self.env.get("HUB_ADMIN_PASSWORD")
-        if pw and self.hub_auth_ok():
-            tok = base64.b64encode(f"admin:{pw}".encode()).decode()
-            st, _, b = http("GET", f"{self.base}/hub/api/status", headers={"Authorization": f"Basic {tok}"})
-            self.rec("2.8", "edge", "/hub with auth returns cert status", "200 + lan cert", st, st == 200 and b"not_after" in b)
+        st, h, _ = http("GET", f"{self.base}/hub/overview/dashboard")
+        self.rec("2.7", "edge", "/hub without a session redirects to login", "303 -> /hub/login", f"{st} {h.get('Location', '')}", st == 303 and "/hub/login" in h.get("Location", ""))
+        H = self.hub_login()
+        if H:
+            st, _, b = http("GET", f"{self.base}/hub/api/status", headers=H)
+            self.rec("2.8", "hub", "/hub with a session returns status", "200 + lan cert", st, st == 200 and b"not_after" in b)
 
     # ---------------- Phase 3: VetoGuard ----------------
     def phase3(self):
@@ -245,15 +271,32 @@ class Suite:
 
     # ---------------- Phase 5: admin plane, model pipeline, apps framework ----------------
     def phase5(self):
-        pw = self.env.get("HUB_ADMIN_PASSWORD"); tok = base64.b64encode(f"admin:{pw}".encode()).decode() if pw else ""
-        H = {"Authorization": f"Basic {tok}"}
-        hub_ok = self.hub_auth_ok()
-        for pg in ([] if not hub_ok else ("overview/dashboard", "safety/policy", "safety/audit", "models/installed", "models/pull", "models/exposed", "access/keys", "gateway/certs", "gateway/hostname", "gateway/isolation")):
+        H = self.hub_login() or {}
+        hub_ok = bool(H)
+        for pg in ([] if not hub_ok else ("overview/dashboard", "safety/policy", "safety/audit", "models/installed", "models/pull", "models/exposed", "access/keys", "access/account", "gateway/certs", "gateway/hostname", "gateway/isolation", "overview/services")):
             st, _, b = http("GET", f"{self.base}/hub/{pg}", headers=H)
             self.rec(f"5.1-{pg.split('/')[1]}", "hub", f"hub page {pg} renders", "200 + <h1>", st, st == 200 and b"<h1>" in b)
         if hub_ok:
             st, _, b = http("POST", f"{self.base}/hub/api/policy", b"csrf=bogus&guard_model=x", {**H, "Content-Type": "application/x-www-form-urlencoded"})
             self.rec("5.2", "hub", "hub POST without valid CSRF token is refused", "403", st, st == 403)
+            rc, out = sh(f"sudo -n python3 -c \"import json;u=json.load(open('{ROOT}/caddy/hub/state/users.json'));print(u['admin']['hash'][:10], bool(u['admin'].get('totp')), 'plain' in json.dumps(u))\"")
+            self.rec("5.11", "hub", "user store holds argon2id hash + encrypted TOTP, no plaintext", "$argon2id True False", out, out.startswith("$argon2id") and "True" in out and out.strip().endswith("False"))
+            rc, out = sh(f"sudo -n python3 -c \"import json,time;d=json.load(open('{ROOT}/ops/responses/status.json'));print(d['containers']['hub']['status'])\"")
+            self.rec("5.12", "ops", "host watchdog is publishing container status", "running", out, out.strip() == "running")
+            st, _, b = http("POST", f"{self.base}/hub/api/ops", urllib.parse.urlencode({"csrf": self.hub_csrf, "action": "stop", "t": "hub"}).encode(), {**H, "Content-Type": "application/x-www-form-urlencoded"})
+            self.rec("5.13", "ops", "hub refuses to stop itself", "refused", st, st == 200 and b"can only be restarted" in b)
+            st, _, b = http("POST", f"{self.base}/hub/api/ops", urllib.parse.urlencode({"csrf": self.hub_csrf, "action": "restart", "t": "modeld"}).encode(), {**H, "Content-Type": "application/x-www-form-urlencoded"})
+            ok = False
+            for _ in range(30):
+                time.sleep(2); rc, out = sh(f"sudo -n ls -t {ROOT}/ops/responses/ | head -1")
+                if out.strip() and out.strip() != "status.json":
+                    rc, res = sh(f"sudo -n python3 -c \"import json;d=json.load(open('{ROOT}/ops/responses/{out.strip()}'));print(d['ok'], d['request']['targets'])\"")
+                    if "modeld" in res: ok = res.startswith("True"); break
+            self.rec("5.14", "ops", "restart request through the hub is executed by the watchdog", "ok", res if ok else "no response", ok)
+            for i in range(5):
+                http("POST", f"{self.base}/hub/login", urllib.parse.urlencode({"csrf": self.hub_csrf, "user": "lockout-probe", "password": "wrong-password-xx"}).encode(), {"Content-Type": "application/x-www-form-urlencoded"})
+            st, _, _ = http("POST", f"{self.base}/hub/login", urllib.parse.urlencode({"csrf": self.hub_csrf, "user": "lockout-probe", "password": "wrong-password-xx"}).encode(), {"Content-Type": "application/x-www-form-urlencoded"})
+            self.rec("5.15", "hub", "per-user lockout after 5 failures", "429", st, st == 429)
         rc, out = sh(f"sudo -n python3 -c \"import json;d=json.load(open('{ROOT}/proxy/policy/veto-policy.json'));print(d['categories']['S4']['block'])\"")
         self.rec("5.3", "hub", "policy file has S4 blocked", "True", out, out.strip() == "True")
         rc, out = sh(f"sudo -n stat -c '%U %a' {ROOT}/proxy/policy {ROOT}/proxy/policy/veto-policy.json")

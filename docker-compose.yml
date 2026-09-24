@@ -39,12 +39,13 @@ services:
     # LiteLLM, ollama (backend, read/delete), modeld (mgmt, pulls). Reachable only via caddy at /hub
     # behind basic-auth. Holds the LiteLLM master key (key/model management) — every action audited.
     <<: *hardened
-    image: aegis/hub:2                             # caddy/hub/build/Dockerfile — python:3.12-alpine + bcrypt
+    image: aegis/hub:3                             # caddy/hub/build/Dockerfile — python:3.12-alpine + argon2id + Fernet
     container_name: hub
     command: ["python3", "-u", "/app/hub.py"]
     environment:
       - AEGIS_LAN_IP=${AEGIS_LAN_IP}
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - HUB_SECRET_KEY=${HUB_SECRET_KEY}
       - GRAFANA_ENABLED=${GRAFANA_ENABLED:-0}
     volumes:
       - ./caddy/hub/hub.py:/app/hub.py:ro
@@ -54,6 +55,8 @@ services:
       - ./caddy/hub/state:/app/state
       - ./proxy/policy:/app/policy
       - ./proxy/audit:/app/audit
+      - ./ops/requests:/app/ops/requests          # hub writes ONE request.json; the host watchdog consumes it
+      - ./ops/responses:/app/ops/responses:ro     # watchdog results + status.json
     network_mode: "service:caddy"
     depends_on: [caddy]
     read_only: true
@@ -142,13 +145,10 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0:11434
       - OLLAMA_KEEP_ALIVE=24h
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    # GPUs via CDI (nvidia-ctk cdi generate -> /etc/cdi/nvidia.yaml): device nodes are injected into the
+    # container spec directly, so a host `systemctl daemon-reload` no longer strips them (NVML Unknown Error).
+    devices:
+      - nvidia.com/gpu=all
     volumes:
       - ./llm/gguf:/root/.ollama
     networks: [backend]
@@ -184,13 +184,8 @@ services:
     profiles: [monitoring]
     environment:
       - DCGM_EXPORTER_LISTEN=:9400
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    devices:
+      - nvidia.com/gpu=all
     cap_add: [SYS_ADMIN]                           # DCGM needs it for profiling metrics
     networks: [monitoring]
 

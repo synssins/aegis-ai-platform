@@ -16,9 +16,13 @@
 | Authenticated chat user | prompts, uploads | VetoGuard tripwire + Llama Guard pre/post; no direct engine path; web fetch off |
 | API client | `/v1` | own virtual key, model allow-list, rpm/tpm limits; same VetoGuard path |
 | Compromised web container | lateral | cannot reach ollama (backend internal); cannot reach Caddy admin; no docker socket; no caps |
-| Compromised hub | Caddy admin API | can only push the read-only Caddyfile + one templated site file; basic-auth at edge |
+| Compromised hub | Caddy admin API, LiteLLM master key, one request file | can only push the read-only Caddyfile + one templated site file; ask the watchdog for allow-listed start/stop/restart (never stop caddy/hub); no Docker socket anywhere in the stack |
+| Brute force on the hub | login | argon2id, mandatory TOTP with replay protection, per-user and per-IP lockout, audit + alert |
 | Future tool/MCP servers | tool results | treated as untrusted input; scanned like user text; isolated `tools` network |
 | Operator workstation | SSH | (host-level; supervised) key-only auth, scoped sudo |
+
+## Why there is no Docker socket in any container
+The Docker socket is root on the host. A container holding it turns any code-execution bug in that container into host compromise — every network split, capability drop and policy file becomes irrelevant. The hub therefore never talks to Docker. It writes one JSON request file; a root service *on the host* (`aegis-watchdog`) reads it, validates it against a fixed allow-list, and acts. The channel is a file in a root-only directory, not a socket or a port, so nothing on any network can reach it.
 
 ## Out of scope / known limits
 - The lexical tripwire is evadable by paraphrase; the classifier is the control and is itself imperfect.

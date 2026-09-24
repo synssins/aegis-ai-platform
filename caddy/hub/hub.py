@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """
-Aegis Hub v2 — admin control centre. Stdlib only.
+Aegis Hub v3 — admin control centre with its own authentication.
 
-Reachable only through Caddy at /hub behind basic-auth (the "administrator"). Shares Caddy's network
-namespace, so it can talk to: Caddy admin (localhost:2019), LiteLLM (edge), Ollama (backend, read +
-delete), modeld (mgmt, pulls). Every state change is appended to /app/audit/hub-audit.jsonl and, if a
-webhook is configured, alerted.
+Auth (replaces Caddy basic-auth):
+  * users in /app/state/users.json — argon2id hashes only (no reversible secret anywhere);
+  * TOTP (RFC 6238) required for every account; the TOTP secret is Fernet-encrypted at rest with
+    HUB_SECRET_KEY; replay of a used code is rejected;
+  * sessions are HMAC-signed, HttpOnly, Secure, SameSite=Strict cookies scoped to /hub, 12 h;
+  * lockout: 5 failures per user => 5 min; 20 failures per client IP => 15 min; all audited;
+  * bootstrap: no user store => a random admin password is generated, printed ONCE to the container
+    log, and the first login forces a password change and MFA enrolment.
+  * console recovery: `python3 /app/hub.py --reset-admin` inside the container (see scripts/hub-reset-admin.sh).
 
-What the hub may change            What it may only VIEW (isolation layer — console-only)
-  VetoGuard policy (categories,       caddy/Caddyfile (routes, auth, headers, interconnects)
-    guard model, tripwires)           docker-compose.yml (networks, mounts, capabilities)
-  Models: pull / remove / expose
-  API keys: mint / revoke
-  Public hostname + Cloudflare token (one templated site file)
-  Alert webhook
-Hard rules enforced here regardless of UI: S4 cannot be unblocked; guard models cannot be exposed;
-the classifier cannot be disabled; fail-closed cannot be disabled.
+Control (via the host watchdog, never a Docker socket in a container):
+  * the hub writes exactly one /app/ops/requests/request.json; the watchdog executes and answers in
+    /app/ops/responses/; caddy/hub can only be restarted, never stopped; one request at a time.
+
+Everything else as v2: VetoGuard policy (S4 locked), audit log + snippets, alerts, models (pull /
+load / unload / remove / expose), API keys, certificates, public hostname (Cloudflare DNS-01),
+isolation view. Every state change is audited and alerted. Stdlib + argon2-cffi + cryptography.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import html
 import json
 import os
@@ -26,6 +32,7 @@ import re
 import secrets
 import socket
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -35,30 +42,43 @@ import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+from cryptography.fernet import Fernet, InvalidToken
+
 # ---------------------------------------------------------------- config / paths ----------
 LAN_IP = os.environ.get("AEGIS_LAN_IP", "127.0.0.1")
 MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")
+SECRET = os.environ.get("HUB_SECRET_KEY", "")
 GRAFANA_ENABLED = os.environ.get("GRAFANA_ENABLED", "0") == "1"
 CADDYFILE = "/etc/caddy/Caddyfile"
 COMPOSE_VIEW = "/app/view/docker-compose.yml"
 SITES_DIR = "/etc/caddy/sites-enabled"
 DOMAIN_FILE = os.path.join(SITES_DIR, "domain.caddy")
-HUB_AUTH_FILE = os.path.join(SITES_DIR, "hub-auth.conf")
 POLICY_FILE = "/app/policy/veto-policy.json"
-STATE_FILE = "/app/state/hub.json"
+STATE_DIR = "/app/state"
+STATE_FILE = os.path.join(STATE_DIR, "hub.json")
+USERS_FILE = os.path.join(STATE_DIR, "users.json")
 AUDIT_DIR = "/app/audit"
 HUB_AUDIT = os.path.join(AUDIT_DIR, "hub-audit.jsonl")
 VETO_AUDIT = os.path.join(AUDIT_DIR, "veto-audit.jsonl")
+SNIPPETS = os.path.join(AUDIT_DIR, "veto-snippets.jsonl")
+OPS_REQ = "/app/ops/requests/request.json"
+OPS_RESP = "/app/ops/responses"
+OPS_STATUS = os.path.join(OPS_RESP, "status.json")
 CADDY_ADMIN = "http://127.0.0.1:2019"
 LITELLM = "http://litellm:4000"
 OLLAMA = "http://ollama:11434"
 MODELD = "http://modeld:11434"
 CSRF = secrets.token_urlsafe(24)
+SESSION_TTL = 12 * 3600
+PH = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 
 HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?!-)([a-z0-9-]{1,63}(?<!-)\.)+[a-z]{2,63}$")
 CF_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{30,80}$")
 MODEL_RE = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,120}(:[a-z0-9._-]{1,60})?$")
 ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,40}$")
+USER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,30}$")
 
 CATEGORIES = {
     "S1": ("Violent crimes", "illegal"), "S2": ("Non-violent crimes", "illegal"), "S3": ("Sex-related crimes", "illegal"),
@@ -68,9 +88,19 @@ CATEGORIES = {
     "S13": ("Elections", "adult/legal"), "S14": ("Code interpreter abuse", "adult/legal"),
 }
 DEFAULT_BLOCK = {"S1", "S2", "S3", "S4", "S9", "S10", "S11"}
-DEFAULT_POLICY = {"guard": {"model": "llama-guard3:1b", "chunk_chars": 6000, "max_chunks": 200, "timeout": 60},
+DEFAULT_POLICY = {"guard": {"model": "llama-guard3:1b", "chunk_chars": 6000, "chunk_overlap": 600, "max_chunks": 100, "timeout": 60, "concurrency": 2},
                   "categories": {c: {"block": c in DEFAULT_BLOCK} for c in CATEGORIES},
-                  "tripwires": {"enabled": True, "extra_patterns": []}, "updated": None, "updated_by": None}
+                  "tripwires": {"enabled": True, "extra_patterns": []}, "audit": {"store_snippet": False}, "updated": None, "updated_by": None}
+
+SERVICES = {  # name -> (purpose, network, protected)
+    "caddy": ("Gateway: TLS, routing, edge auth", "edge", True), "hub": ("This admin console", "edge (caddy netns)", True),
+    "openwebui": ("Chat interface", "edge", False), "litellm": ("OpenAI-compatible API + VetoGuard", "edge/backend", False),
+    "litellm-db": ("Key/model store for LiteLLM", "backend", False), "ollama": ("Inference engine (GPU)", "backend", False),
+    "modeld": ("Model pulls (only container with internet + model store)", "mgmt", False),
+    "prometheus": ("Metrics store", "monitoring", False), "grafana": ("Dashboards", "monitoring/edge", False),
+    "node-exporter": ("Host metrics", "monitoring", False), "dcgm-exporter": ("GPU metrics", "monitoring", False),
+    "fish-speech": ("Text-to-speech (apps profile)", "apps", False), "comfyui": ("Image generation (apps profile, gated)", "apps", False),
+}
 
 DOMAIN_TEMPLATE = """# GENERATED BY AEGIS HUB {ts} — regenerate from /hub or delete on the console. Do not hand-edit.
 {hostname} {{
@@ -85,41 +115,17 @@ NAV = [
     ("overview", "Overview", [("dashboard", "Dashboard"), ("services", "Services")]),
     ("safety", "Safety", [("policy", "VetoGuard policy"), ("audit", "Audit log"), ("alerts", "Alerts")]),
     ("models", "Models", [("installed", "Installed"), ("pull", "Pull"), ("exposed", "Exposed to apps")]),
-    ("access", "Access", [("keys", "API keys"), ("password", "Admin password")]),
+    ("access", "Access", [("keys", "API keys"), ("account", "Admin account")]),
     ("gateway", "Gateway", [("certs", "Certificates"), ("hostname", "Public hostname"), ("isolation", "Isolation (read-only)")]),
 ]
-
+PAGE_SIZES = (10, 25, 50, 100)
 ALERT_ON = ("S1 ", "S2 ", "S3 ", "S4 ", "S9 ", "S10 ", "S11 ", "regex:csam", "regex:despaced", "regex:extra", "regex:malware")
-
-
-def _veto_watcher():
-    """Tail the veto audit log; push illegal/protected-class vetoes to the webhook. Codes/names/key/time only."""
-    pos = None
-    while True:
-        try:
-            with open(VETO_AUDIT, encoding="utf-8") as f:
-                if pos is None:
-                    f.seek(0, 2); pos = f.tell()
-                else:
-                    f.seek(pos)
-                    for line in f:
-                        try: e = json.loads(line)
-                        except ValueError: continue
-                        d, r = str(e.get("detail", "")), str(e.get("reason", ""))
-                        if any(k in d or k in r for k in ALERT_ON) and "sentinel" not in r and "sentinel" not in d:
-                            alert(f"[aegis-veto] {e.get('stage')} {r} {d} key={e.get('key_alias')} model={e.get('model')} at {e.get('ts', '')[:19]}")
-                    pos = f.tell()
-        except FileNotFoundError:
-            pos = None
-        except OSError:
-            pass
-        time.sleep(3)
-
 
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
-REQ = threading.local()          # per-request: REQ.q (query dict), REQ.path
-PAGE_SIZES = (10, 25, 50, 100)
+REQ = threading.local()
+FAILS: dict[str, list[float]] = {}      # key -> failure timestamps
+FAILS_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------- utilities ----------------
@@ -151,15 +157,17 @@ def state() -> dict:
     return load_json(STATE_FILE, {"webhook": "", "hostname": ""})
 
 
+def q(key, default=""):
+    return getattr(REQ, "q", {}).get(key, [default])[0]
+
+
 def http(method, url, body=None, headers=None, timeout=15):
-    """Return (status, parsed-json-or-text). Never raises."""
     data = json.dumps(body).encode() if isinstance(body, (dict, list)) else (body.encode() if isinstance(body, str) else body)
     h = {"Content-Type": "application/json", **(headers or {})}
     req = urllib.request.Request(url, data=data, method=method, headers=h)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read().decode(errors="replace")
-            st = r.status
+            raw = r.read().decode(errors="replace"); st = r.status
     except urllib.error.HTTPError as e:
         raw, st = e.read().decode(errors="replace"), e.code
     except Exception as e:  # noqa: BLE001
@@ -175,23 +183,22 @@ def litellm(method, path, body=None):
 
 
 def audit(event: str, **fields) -> None:
-    rec = {"ts": now(), "actor": "admin", "event": event, **fields}
+    actor = getattr(REQ, "user", None) or "system"
+    rec = {"ts": now(), "actor": actor, "event": event, **fields}
     try:
         os.makedirs(AUDIT_DIR, exist_ok=True)
         with open(HUB_AUDIT, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
     except OSError as e:
         print(f"audit write failed: {e}", file=sys.stderr)
-    alert(f"[aegis-hub] {event}: " + ", ".join(f"{k}={v}" for k, v in fields.items() if k not in ("token",)))
+    alert(f"[aegis-hub] {event} by {actor}: " + ", ".join(f"{k}={v}" for k, v in fields.items() if k not in ("token",)))
 
 
 def alert(text: str) -> None:
     url = state().get("webhook", "")
     if not url:
         return
-    def _send():
-        http("POST", url, {"text": text, "content": text, "source": "aegis-hub", "ts": now()}, timeout=5)
-    threading.Thread(target=_send, daemon=True).start()
+    threading.Thread(target=lambda: http("POST", url, {"text": text, "content": text, "source": "aegis-hub", "ts": now()}, timeout=5), daemon=True).start()
 
 
 def tail_jsonl(path, n=200):
@@ -209,13 +216,7 @@ def tail_jsonl(path, n=200):
     return out
 
 
-
-def q(key, default=""):
-    return getattr(REQ, "q", {}).get(key, [default])[0]
-
-
 def paginate(rows, key, default_per=25):
-    """Slice rows for table `key` using ?<key>_per=&<key>_page=; returns (page_rows, controls_html)."""
     try: per = int(q(f"{key}_per", default_per))
     except ValueError: per = default_per
     per = per if per in PAGE_SIZES else default_per
@@ -225,13 +226,108 @@ def paginate(rows, key, default_per=25):
     path = getattr(REQ, "path", "/hub")
     other = {k: v[0] for k, v in getattr(REQ, "q", {}).items() if not k.startswith(key + "_")}
     def link(p, n):
-        params = {**other, f"{key}_per": str(n), f"{key}_page": str(p)}
-        return path + "?" + urllib.parse.urlencode(params)
+        return path + "?" + urllib.parse.urlencode({**other, f"{key}_per": str(n), f"{key}_page": str(p)})
     sizes = " ".join(f'<a href="{link(1, n)}"{" class=on" if n == per else ""}>{n}</a>' for n in PAGE_SIZES)
     prev = f'<a href="{link(pg - 1, per)}">&larr; prev</a>' if pg > 1 else '<span class="mut">&larr; prev</span>'
     nxt = f'<a href="{link(pg + 1, per)}">next &rarr;</a>' if pg < pages else '<span class="mut">next &rarr;</span>'
     ctl = f'<div class="pager"><span>per page: {sizes}</span><span>{prev} &nbsp; page {pg} / {pages} &nbsp; {nxt}</span><span class="mut">{total} entries</span></div>'
     return rows[(pg - 1) * per: pg * per], ctl
+
+
+# ---------------------------------------------------------------- auth ---------------------
+def fernet() -> Fernet:
+    key = hashlib.sha256(SECRET.encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(key))
+
+
+def users() -> dict:
+    return load_json(USERS_FILE, {})
+
+
+def save_users(u: dict) -> None:
+    save_json(USERS_FILE, u)
+
+
+def totp_now(secret_b32: str, at: float | None = None) -> str:
+    key = base64.b32decode(secret_b32.upper() + "=" * (-len(secret_b32) % 8))
+    counter = int((at or time.time()) // 30)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    off = digest[-1] & 0x0F
+    code = (struct.unpack(">I", digest[off:off + 4])[0] & 0x7FFFFFFF) % 1_000_000
+    return f"{code:06d}"
+
+
+def totp_verify(secret_b32: str, code: str, last_counter: int) -> int | None:
+    """Returns the matched counter (for replay protection) or None."""
+    code = re.sub(r"\D", "", code or "")
+    if len(code) != 6:
+        return None
+    base = int(time.time() // 30)
+    for c in (base - 1, base, base + 1):
+        if c <= last_counter:
+            continue
+        if hmac.compare_digest(totp_now(secret_b32, c * 30), code):
+            return c
+    return None
+
+
+def password_policy(pw: str) -> str | None:
+    if len(pw) < 14: return "too short (minimum 14 characters)"
+    if len(pw) > 128: return "too long (maximum 128)"
+    if any(ch.isspace() for ch in pw): return "must not contain spaces"
+    classes = sum([any(c.islower() for c in pw), any(c.isupper() for c in pw), any(c.isdigit() for c in pw), any(not c.isalnum() for c in pw)])
+    if classes < 3: return "needs at least three of: lowercase, uppercase, digit, symbol"
+    if any(w in pw.lower() for w in ("admin", "aegis", "password", "qwerty", "123456")): return "contains a forbidden word"
+    return None
+
+
+def bootstrap_admin(reset: bool = False) -> None:
+    u = users()
+    if "admin" in u and not reset:
+        return
+    pw = secrets.token_urlsafe(18)
+    u["admin"] = {"hash": PH.hash(pw), "totp": None, "totp_last": 0, "must_change": True, "created": now(), "updated": now()}
+    save_users(u)
+    print(f"\n==== AEGIS HUB {'RESET' if reset else 'BOOTSTRAP'} ====\ninitial admin password (shown once, change it at first login): {pw}\n=================================\n", flush=True)
+    audit("admin_reset" if reset else "admin_bootstrap", user="admin")
+
+
+def sign(payload: dict) -> str:
+    raw = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    sig = hmac.new(SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+    return f"{raw}.{sig}"
+
+
+def unsign(token: str) -> dict | None:
+    try:
+        raw, sig = token.split(".", 1)
+        if not hmac.compare_digest(hmac.new(SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest(), sig):
+            return None
+        d = json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+        return d if d.get("exp", 0) > time.time() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def client_ip(h: BaseHTTPRequestHandler) -> str:
+    return (h.headers.get("X-Forwarded-For", "").split(",")[0].strip() or h.client_address[0])
+
+
+def locked(key: str, limit: int, window: int) -> bool:
+    with FAILS_LOCK:
+        ts = [t for t in FAILS.get(key, []) if time.time() - t < window]
+        FAILS[key] = ts
+        return len(ts) >= limit
+
+
+def fail(key: str) -> None:
+    with FAILS_LOCK:
+        FAILS.setdefault(key, []).append(time.time())
+
+
+def clear_fail(key: str) -> None:
+    with FAILS_LOCK:
+        FAILS.pop(key, None)
 
 
 # ---------------------------------------------------------------- domain objects ----------
@@ -240,9 +336,7 @@ def policy() -> dict:
     for c in CATEGORIES:
         p.setdefault("categories", {}).setdefault(c, {"block": c in DEFAULT_BLOCK})
     p["categories"]["S4"]["block"] = True
-    p.setdefault("guard", DEFAULT_POLICY["guard"].copy())
-    p.setdefault("tripwires", {"enabled": True, "extra_patterns": []})
-    p.setdefault("audit", {"store_snippet": False})
+    p.setdefault("guard", DEFAULT_POLICY["guard"].copy()); p.setdefault("tripwires", {"enabled": True, "extra_patterns": []}); p.setdefault("audit", {"store_snippet": False})
     return p
 
 
@@ -281,8 +375,7 @@ def caddy_reload() -> tuple[bool, str]:
             body = f.read()
     except OSError as e:
         return False, f"cannot read Caddyfile: {e}"
-    req = urllib.request.Request(f"{CADDY_ADMIN}/load", data=body, method="POST",
-                                 headers={"Content-Type": "text/caddyfile", "Origin": "http://127.0.0.1:2019"})
+    req = urllib.request.Request(f"{CADDY_ADMIN}/load", data=body, method="POST", headers={"Content-Type": "text/caddyfile", "Origin": "http://127.0.0.1:2019"})
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             return True, f"caddy reloaded ({r.status})"
@@ -312,22 +405,21 @@ def probe_cert(host, sni=None, port=443) -> dict:
             "days": round((exp - datetime.now(timezone.utc)).total_seconds() / 86400, 1)}
 
 
-def service_status() -> list[dict]:
-    checks = [
-        ("Caddy (gateway)", CADDY_ADMIN + "/config/", "edge"),
-        ("Open WebUI", "http://openwebui:8080/health", "edge"),
-        ("LiteLLM (API + VetoGuard)", LITELLM + "/health/liveliness", "edge/backend"),
-        ("Ollama (inference)", OLLAMA + "/api/version", "backend"),
-        ("modeld (model pulls)", MODELD + "/api/version", "mgmt"),
-    ]
-    if GRAFANA_ENABLED:
-        checks.append(("Grafana", "http://grafana:3000/api/health", "edge/monitoring"))
+def container_status() -> dict:
+    d = load_json(OPS_STATUS, {})
+    return d.get("containers", {}), d.get("ts", "")
+
+
+def ops_responses(n=200) -> list[dict]:
     out = []
-    for name, url, net in checks:
-        st, _ = http("GET", url, timeout=4)
-        out.append({"name": name, "net": net, "up": 200 <= st < 400, "code": st})
-    for name, note in (("Fish Speech (TTS)", "apps profile — not started"), ("ComfyUI", "apps profile — 503 at edge until safety gate")):
-        out.append({"name": name, "net": "apps", "up": None, "code": note})
+    try:
+        names = sorted((f for f in os.listdir(OPS_RESP) if f.endswith(".json") and f != "status.json"), reverse=True)[:n]
+    except OSError:
+        return []
+    for f in names:
+        d = load_json(os.path.join(OPS_RESP, f), None)
+        if d:
+            d["_file"] = f; out.append(d)
     return out
 
 
@@ -336,21 +428,16 @@ def pull_job(model: str) -> str:
     with JOBS_LOCK:
         JOBS[jid] = {"model": model, "status": "starting", "completed": 0, "total": 0, "started": now(), "done": False}
     def run():
-        req = urllib.request.Request(MODELD + "/api/pull", data=json.dumps({"name": model, "stream": True}).encode(),
-                                     headers={"Content-Type": "application/json"}, method="POST")
+        req = urllib.request.Request(MODELD + "/api/pull", data=json.dumps({"name": model, "stream": True}).encode(), headers={"Content-Type": "application/json"}, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=3600) as r:
                 for line in r:
-                    try:
-                        d = json.loads(line)
-                    except ValueError:
-                        continue
+                    try: d = json.loads(line)
+                    except ValueError: continue
                     with JOBS_LOCK:
-                        JOBS[jid].update({"status": d.get("status", ""), "completed": d.get("completed", JOBS[jid]["completed"]),
-                                          "total": d.get("total", JOBS[jid]["total"])})
+                        JOBS[jid].update({"status": d.get("status", ""), "completed": d.get("completed", JOBS[jid]["completed"]), "total": d.get("total", JOBS[jid]["total"])})
                         if d.get("error"):
-                            JOBS[jid].update({"status": "error: " + d["error"], "done": True})
-                            return
+                            JOBS[jid].update({"status": "error: " + d["error"], "done": True}); return
             with JOBS_LOCK:
                 JOBS[jid].update({"status": "complete", "done": True})
             audit("model_pull_complete", model=model)
@@ -363,18 +450,40 @@ def pull_job(model: str) -> str:
     return jid
 
 
+def _veto_watcher():
+    pos = None
+    while True:
+        try:
+            with open(VETO_AUDIT, encoding="utf-8") as f:
+                if pos is None:
+                    f.seek(0, 2); pos = f.tell()
+                else:
+                    f.seek(pos)
+                    for line in f:
+                        try: e = json.loads(line)
+                        except ValueError: continue
+                        d, r = str(e.get("detail", "")), str(e.get("reason", ""))
+                        if any(k in d or k in r for k in ALERT_ON) and "sentinel" not in r and "sentinel" not in d:
+                            alert(f"[aegis-veto] {e.get('stage')} {r} {d} key={e.get('key_alias')} model={e.get('model')} at {e.get('ts', '')[:19]}")
+                    pos = f.tell()
+        except FileNotFoundError:
+            pos = None
+        except OSError:
+            pass
+        time.sleep(3)
+
+
 # ---------------------------------------------------------------- HTML ---------------------
 CSS = """
 :root{--bg:#171717;--side:#0d0d0d;--card:#1f1f1f;--line:#2e2e2e;--fg:#ececec;--mut:#9a9a9a;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;--acc:#ececec}
 *{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,Inter,"Segoe UI",system-ui,sans-serif}
 a{color:inherit}.wrap{display:flex;height:100vh;height:100dvh;overflow:hidden}
-nav{width:232px;flex:none;background:var(--side);border-right:1px solid var(--line);padding:18px 12px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:none;-ms-overflow-style:none;-webkit-overflow-scrolling:touch}nav::-webkit-scrollbar{display:none}
+nav{width:232px;flex:none;background:var(--side);border-right:1px solid var(--line);padding:18px 12px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:none;-ms-overflow-style:none;-webkit-overflow-scrolling:touch;display:flex;flex-direction:column}nav::-webkit-scrollbar{display:none}
 nav .brand{font-weight:600;font-size:16px;padding:6px 10px 16px;letter-spacing:.2px}
 nav details{margin:2px 0}nav summary{list-style:none;cursor:pointer;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.08em;padding:10px 10px 4px;user-select:none;display:flex;justify-content:space-between;align-items:center}
-nav summary::-webkit-details-marker{display:none}nav summary::after{content:"+";font-size:13px;color:#666}nav details[open] summary::after{content:"–"}
-nav details[open] summary{color:#ddd}
-nav a{display:block;padding:7px 10px 7px 14px;border-radius:8px;text-decoration:none;color:#cfcfcf}
-nav a:hover{background:#1a1a1a}nav a.on{background:#262626;color:#fff}
+nav summary::-webkit-details-marker{display:none}nav summary::after{content:"+";font-size:13px;color:#666}nav details[open] summary::after{content:"–"}nav details[open] summary{color:#ddd}
+nav a{display:block;padding:7px 10px 7px 14px;border-radius:8px;text-decoration:none;color:#cfcfcf}nav a:hover{background:#1a1a1a}nav a.on{background:#262626;color:#fff}
+nav .foot{margin-top:auto;padding:12px 10px 0;font-size:12px;color:var(--mut)}
 main{flex:1;min-width:0;overflow-y:auto;padding:26px 34px}main>.inner{max-width:1180px}
 h1{font-size:20px;font-weight:600;margin:0 0 4px}h2{font-size:15px;font-weight:600;margin:22px 0 8px}
 .sub{color:var(--mut);margin:0 0 18px}.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:12px 0}
@@ -383,14 +492,15 @@ table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px
 .card table{display:block;overflow-x:auto}
 .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;background:#2a2a2a;color:#ddd}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.mut{color:var(--mut)}
 input,select,textarea{background:#111;color:var(--fg);border:1px solid #3a3a3a;border-radius:8px;padding:8px 10px;font:inherit;width:100%;max-width:520px}
-textarea{min-height:90px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
-button{background:var(--acc);color:#111;border:0;border-radius:8px;padding:8px 14px;font:inherit;font-weight:600;cursor:pointer}
+input[type=checkbox]{width:auto}textarea{min-height:90px;font-family:ui-monospace,Menlo,monospace;font-size:12px}
+button{background:var(--acc);color:#111;border:0;border-radius:8px;padding:8px 14px;font:inherit;font-weight:600;cursor:pointer}button:disabled{opacity:.4;cursor:not-allowed}
 button.ghost{background:#2a2a2a;color:#eee}button.danger{background:var(--bad);color:#fff}
 form.inline{display:inline}label{display:block;margin:10px 0 4px;color:#ccc}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
 pre{background:#0d0d0d;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;font-size:12px;max-height:520px}
 .msg{padding:10px 14px;border-radius:10px;margin:0 0 14px;background:#1c2a1c;border:1px solid #2f5a2f}.msg.bad{background:#2a1c1c;border-color:#5a2f2f}
 .pager{display:flex;gap:18px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin:8px 0 2px;font-size:12px;color:#bbb}.pager a{padding:2px 7px;border-radius:6px;background:#2a2a2a;text-decoration:none;margin:0 1px}.pager a.on{background:#3a3a3a;color:#fff}
 .lock{opacity:.6}.key{font-family:ui-monospace,monospace;background:#0d0d0d;padding:6px 10px;border-radius:8px;display:inline-block;user-select:all;word-break:break-all}
+.login{max-width:380px;margin:12vh auto;padding:0 16px}.login .card{padding:24px}
 @media (max-width:760px){.wrap{flex-direction:column;height:auto;overflow:visible}nav{width:auto;border-right:0;border-bottom:1px solid var(--line);overflow:visible}main{overflow:visible;padding:18px 16px}}
 """
 
@@ -402,109 +512,143 @@ def page(section, sub, title, subtitle, body, msg="", ok=True):
         nav.append(f'<details{" open" if sid == section else ""}><summary>{esc(sname)}</summary>{links}</details>')
     apps = '<a href="/">Open WebUI ↗</a>' + ('<a href="/grafana/">Grafana ↗</a>' if GRAFANA_ENABLED else '')
     nav.append(f'<details><summary>Apps</summary>{apps}</details>')
+    nav.append(f'<div class="foot">{esc(getattr(REQ, "user", ""))} · <a href="/hub/logout">sign out</a></div>')
     m = f'<div class="msg{"" if ok else " bad"}">{esc(msg)}</div>' if msg else ""
     return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Aegis Hub — {esc(title)}</title><style>{CSS}</style></head><body><div class="wrap"><nav>{''.join(nav)}</nav>
 <main><div class="inner"><h1>{esc(title)}</h1><p class="sub">{esc(subtitle)}</p>{m}{body}</div></main></div></body></html>"""
 
 
+def plain_page(title, body, msg="", ok=True):
+    m = f'<div class="msg{"" if ok else " bad"}">{esc(msg)}</div>' if msg else ""
+    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Aegis Hub — {esc(title)}</title><style>{CSS}</style></head>
+<body><div class="login"><div class="card"><h1 style="margin-bottom:14px">{esc(title)}</h1>{m}{body}</div></div></body></html>"""
+
+
 def csrf_field():
     return f'<input type="hidden" name="csrf" value="{CSRF}">'
+
+
+# ---------------------------------------------------------------- auth pages ---------------
+def p_login(msg="", ok=True):
+    return plain_page("Sign in", f'<form method="post" action="/hub/login">{csrf_field()}<label>Username</label><input name="user" autocomplete="username" required autofocus><label>Password</label><input name="password" type="password" autocomplete="current-password" required><div style="margin-top:14px"><button>Continue</button></div></form>', msg, ok)
+
+
+def p_totp(pre: str, msg="", ok=True):
+    return plain_page("Second factor", f'<form method="post" action="/hub/login/totp">{csrf_field()}<input type="hidden" name="pre" value="{esc(pre)}"><label>Authenticator code</label><input name="code" inputmode="numeric" pattern="[0-9 ]*" autocomplete="one-time-code" required autofocus><div style="margin-top:14px"><button>Sign in</button></div></form>', msg, ok)
+
+
+def p_enrol(pre: str, secret: str, user: str, msg="", ok=True):
+    uri = f"otpauth://totp/Aegis%20Hub:{urllib.parse.quote(user)}?secret={secret}&issuer=Aegis%20Hub&digits=6&period=30"
+    return plain_page("Enrol MFA", f'''<p class="mut">Add this account to your authenticator app (manual entry or paste the URI), then confirm with a code. MFA is mandatory.</p>
+<label>Secret</label><div class="key">{esc(secret)}</div><label>otpauth URI</label><div class="key" style="font-size:11px">{esc(uri)}</div>
+<form method="post" action="/hub/login/enrol">{csrf_field()}<input type="hidden" name="pre" value="{esc(pre)}"><input type="hidden" name="secret" value="{esc(secret)}"><label>Code from the app</label><input name="code" inputmode="numeric" required autofocus><div style="margin-top:14px"><button>Confirm and sign in</button></div></form>''', msg, ok)
+
+
+def p_force_password(msg="", ok=True):
+    return plain_page("Set a new password", f'<p class="mut">This account is using a bootstrap password. Choose your own before continuing.</p><form method="post" action="/hub/account/password">{csrf_field()}<input type="hidden" name="forced" value="1"><label>Current (bootstrap) password</label><input name="current" type="password" required><label>New password</label><input name="new" type="password" required minlength="14"><label>Confirm</label><input name="confirm" type="password" required minlength="14"><div class="mut" style="margin-top:6px">≥ 14 chars; 3 of 4 classes; no spaces; no "admin"/"aegis"/"password".</div><div style="margin-top:14px"><button>Save</button></div></form>', msg, ok)
 
 
 # ---------------------------------------------------------------- pages --------------------
 def p_dashboard(msg="", ok=True):
     pol = policy(); blocked = sorted(c for c, v in pol["categories"].items() if v.get("block"))
-    svc = service_status()
-    tiles = "".join(
-        f'<div class="card"><b>{esc(s["name"])}</b> <span class="tag">{esc(s["net"])}</span><div class="{"ok" if s["up"] else ("mut" if s["up"] is None else "bad")}">'
-        f'{"up" if s["up"] else ("—" if s["up"] is None else "DOWN")} <span class="mut">{esc(s["code"])}</span></div></div>' for s in svc)
+    cst, cts = container_status()
+    tiles = "".join(f'<div class="card"><b>{esc(n)}</b> <span class="tag">{esc(SERVICES.get(n, ("", "", False))[1])}</span><div class="{"ok" if s.get("status") == "running" and s.get("health") in ("", "healthy") else ("mut" if s.get("status") == "absent" else "bad")}">{esc(s.get("status"))} {esc(s.get("health"))}</div></div>' for n, s in cst.items() if s.get("status") != "absent") or '<div class="card mut">watchdog status not available — is aegis-watchdog running on the host?</div>'
     models = installed_models(); loaded = [m for m in models if m["loaded"]]
     vram = ", ".join(f'{esc(m["name"])} ({m["vram"] / 2**30:.1f} GiB VRAM)' for m in loaded) or "nothing resident"
     if loaded and all(m["vram"] == 0 for m in loaded):
-        vram += ' <span class="bad">— resident models have 0 VRAM: the inference container has lost its GPUs (NVML error). Console: <code>docker compose restart ollama</code>.</span>'
-        if msg == "":
-            msg, ok = "GPU residency lost — see Safety posture. Inference is running on CPU.", False
+        vram += ' <span class="bad">— resident models have 0 VRAM: the inference container has lost its GPUs. Restart ollama from Services.</span>'
+        if not msg:
+            msg, ok = "GPU residency lost — inference is running on CPU. Restart ollama from Services.", False
     certs = [probe_cert(LAN_IP)] + ([probe_cert(LAN_IP, current_domain())] if current_domain() else [])
     certrows = "".join(f'<tr><td>{esc(c["host"])}</td><td>{esc(c.get("issuer", c.get("error")))}</td><td class="{"warn" if c.get("days", 99) < 14 else "ok"}">{c.get("days", "—")}</td></tr>' for c in certs)
     events = tail_jsonl(VETO_AUDIT, 8)
-    evrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))}</td><td>{esc(e.get("detail", ""))[:60]}</td><td>{esc(e.get("key_alias"))}</td></tr>' for e in events) or '<tr><td colspan="5" class="mut">no vetoes recorded</td></tr>'
-    body = f"""<div class="grid">{tiles}</div>
-<div class="card"><h2 style="margin-top:0">Safety posture</h2>Guard model <span class="tag">{esc(pol["guard"]["model"])}</span> · blocking {len(blocked)} categories: {esc(", ".join(blocked))} · tripwires {"on" if pol["tripwires"].get("enabled") else "OFF"} · <b>fail-closed</b> · streaming buffered
+    evrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))}</td><td>{esc(e.get("detail", ""))[:70]}</td><td>{esc(e.get("key_alias"))}</td></tr>' for e in events) or '<tr><td colspan="5" class="mut">no vetoes recorded</td></tr>'
+    body = f"""<div class="grid">{tiles}</div><p class="mut">Container status via host watchdog · {esc(cts[:19])}</p>
+<div class="card"><h2 style="margin-top:0">Safety posture</h2>Guard model <span class="tag">{esc(pol["guard"]["model"])}</span> · blocking {len(blocked)} categories: {esc(", ".join(blocked))} · tripwires {"on" if pol["tripwires"].get("enabled") else "OFF"} · <b>fail-closed</b> · streaming buffered · snippets {"ON" if pol.get("audit", {}).get("store_snippet") else "off"}
 <div class="mut" style="margin-top:6px">Resident in VRAM: {vram}</div></div>
 <div class="card"><h2 style="margin-top:0">Certificates</h2><table><tr><th>Host</th><th>Issuer</th><th>Days left</th></tr>{certrows}</table></div>
 <div class="card"><h2 style="margin-top:0">Recent vetoes</h2><table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Detail</th><th>Key</th></tr>{evrows}</table></div>"""
     return page("overview", "dashboard", "Dashboard", "Live state of the platform. Nothing here is editable.", body, msg, ok)
 
 
-def p_services():
-    svc, sctl = paginate(service_status(), "s")
-    rows = "".join(f'<tr><td>{esc(s["name"])}</td><td><span class="tag">{esc(s["net"])}</span></td><td class="{"ok" if s["up"] else ("mut" if s["up"] is None else "bad")}">{"up" if s["up"] else ("not started" if s["up"] is None else "DOWN")}</td><td class="mut">{esc(s["code"])}</td></tr>' for s in svc)
-    body = f'<div class="card">{sctl}<table><tr><th>Service</th><th>Network</th><th>State</th><th>Detail</th></tr>{rows}</table></div><p class="mut">Starting/stopping services and changing what they may talk to is an isolation-layer change: console only.</p>'
-    return page("overview", "services", "Services", "Health of every container, by network.", body)
+def p_services(msg="", ok=True):
+    cst, cts = container_status()
+    pending = os.path.exists(OPS_REQ)
+    resp = ops_responses(500)
+    last: dict[str, str] = {}
+    for r in resp:
+        for t in (r.get("request", {}).get("targets") or []):
+            names = list(SERVICES) if t == "*" else [t]
+            for n in names:
+                if n not in last:
+                    errs = [e for e in r.get("errors", []) if n in e]
+                    last[n] = ("ok" if r.get("ok") else ("error: " + "; ".join(errs)[:80] if errs else "error (see responses)")) + f' <span class="mut">{esc(r.get("completed", "")[:19])}</span>'
+    rows = ""
+    for n, (purpose, net, prot) in SERVICES.items():
+        s = cst.get(n, {"status": "unknown", "health": ""})
+        cls = "ok" if s.get("status") == "running" and s.get("health") in ("", "healthy") else ("mut" if s.get("status") in ("absent", "unknown") else "bad")
+        rows += f'<tr><td><input type="checkbox" name="t" value="{esc(n)}" form="ops"></td><td>{esc(n)}{" <span class=tag>protected</span>" if prot else ""}</td><td class="{cls}">{esc(s.get("status"))} {esc(s.get("health"))}</td><td class="mut">{esc(purpose)}</td><td>{last.get(n, "<span class=mut>—</span>")}</td></tr>'
+    dis = "disabled" if pending else ""
+    body = f"""<form method="post" action="/hub/api/ops" id="ops">{csrf_field()}<div class="card"><div class="row"><button name="action" value="start" {dis}>Start</button><button name="action" value="stop" class="danger" {dis}>Stop</button><button name="action" value="restart" class="ghost" {dis}>Restart</button>
+<span class="mut">{"a request is in progress — wait for the response" if pending else "applies to the checked containers · caddy and hub can only be restarted"}</span></div></div></form>
+<div class="card"><table><tr><th></th><th>Container</th><th>Status</th><th>Purpose</th><th>Last response</th></tr>{rows}</table><p class="mut">Status via host watchdog at {esc(cts[:19])}. Stopping a dependency stops its dependents first; restarting brings them back in order.</p></div>"""
+    rr, rctl = paginate(resp, "r", 10)
+    rrows = "".join(f'<tr><td class="mut">{esc(r.get("completed", "")[:19])}</td><td>{esc(r.get("request", {}).get("action"))} {esc(",".join(r.get("request", {}).get("targets") or []))}</td><td class="{"ok" if r.get("ok") else "bad"}">{"ok" if r.get("ok") else "failed"}</td><td><details><summary class="mut">{len(r.get("log", []))} steps{", " + str(len(r.get("errors", []))) + " errors" if r.get("errors") else ""}</summary><pre>{esc(chr(10).join(r.get("log", []) + r.get("errors", [])))}</pre></details></td></tr>' for r in rr) or '<tr><td colspan="4" class="mut">no requests yet</td></tr>'
+    body += f'<div class="card"><h2 style="margin-top:0">Watchdog responses</h2>{rctl}<table><tr><th>Completed</th><th>Request</th><th>Result</th><th>Log</th></tr>{rrows}</table></div>'
+    return page("overview", "services", "Services", "Container control through the host watchdog (no Docker socket in any container).", body, msg, ok)
 
 
 def p_policy(msg="", ok=True):
-    pol = policy(); guards = [m["name"] for m in installed_models() if m["is_guard"]] or [pol["guard"]["model"]]
+    pol = policy(); guards = [m["name"] for m in installed_models() if m["is_guard"]]
     if pol["guard"]["model"] not in guards:
         guards.append(pol["guard"]["model"])
     opts = "".join(f'<option value="{esc(g)}"{" selected" if g == pol["guard"]["model"] else ""}>{esc(g)}</option>' for g in guards)
     rows = ""
     for c, (name, kind) in CATEGORIES.items():
-        b = pol["categories"][c]["block"]; locked = c == "S4"
-        rows += f'<tr class="{"lock" if locked else ""}"><td><input type="checkbox" name="block_{c}" {"checked" if b else ""} {"disabled" if locked else ""} style="width:auto"></td><td>{c}</td><td>{esc(name)}</td><td><span class="tag">{esc(kind)}</span></td><td class="mut">{"always blocked — cannot be changed" if locked else ""}</td></tr>'
+        b = pol["categories"][c]["block"]; locked_c = c == "S4"
+        rows += f'<tr class="{"lock" if locked_c else ""}"><td><input type="checkbox" name="block_{c}" {"checked" if b else ""} {"disabled" if locked_c else ""}></td><td>{c}</td><td>{esc(name)}</td><td><span class="tag">{esc(kind)}</span></td><td class="mut">{"always blocked — cannot be changed" if locked_c else ""}</td></tr>'
     extra = "\n".join(pol["tripwires"].get("extra_patterns", []))
     body = f"""<form method="post" action="/hub/api/policy">{csrf_field()}
-<div class="card"><h2 style="margin-top:0">Classifier (Llama Guard 3)</h2>
-<label>Guard model (installed models containing "guard")</label><select name="guard_model">{opts}</select>
-<div class="mut" style="margin-top:6px">The classifier runs on every request and every response (streaming buffered). It cannot be disabled. If it is unreachable, requests are refused. Changing the model takes effect on the next request; the first call loads it.</div></div>
-<div class="card"><h2 style="margin-top:0">Blocked categories</h2><table><tr><th>Block</th><th>Code</th><th>Category</th><th>Class</th><th></th></tr>{rows}</table>
-<div class="mut">Policy intent: illegal and protected-class content never passes; adult content may. Unchecking an "illegal" class is allowed but audited and alerted.</div></div>
-<div class="card"><h2 style="margin-top:0">Lexical tripwires</h2><label><input type="checkbox" name="tripwires" {"checked" if pol["tripwires"].get("enabled", True) else ""} style="width:auto"> Enabled (built-in lists for sentinel / CSAM terms / malware intent)</label>
-<label>Extra patterns — one Python regex per line, matched case-insensitively against normalised text</label><textarea name="extra">{esc(extra)}</textarea></div>
-<div class="card"><h2 style="margin-top:0">Diagnostics</h2><label><input type="checkbox" name="store_snippet" {"checked" if pol.get("audit", {}).get("store_snippet") else ""} style="width:auto"> Store a 160-character snippet of <b>flagged output</b> in <code>proxy/audit/veto-snippets.jsonl</code> (root-only)</label>
-<div class="mut">Off by default: logs never contain content. Turn on temporarily to diagnose false positives, then turn off. Never applies to S4 or CSAM-tripwire vetoes. Toggling is audited and alerted.</div></div>
-<p class="mut">Last change: {esc(pol.get("updated") or "never")} by {esc(pol.get("updated_by") or "—")}. Saving is logged and alerted.</p>
-<button type="submit">Save policy</button></form>"""
+<div class="card"><h2 style="margin-top:0">Classifier (Llama Guard 3)</h2><label>Guard model (installed models containing "guard")</label><select name="guard_model">{opts}</select>
+<div class="mut" style="margin-top:6px">Runs on every request and every response (streaming buffered). Cannot be disabled; if unreachable, requests are refused. Do not select 8B while a ~26 GB main model is resident — they evict each other.</div></div>
+<div class="card"><h2 style="margin-top:0">Blocked categories</h2><table><tr><th>Block</th><th>Code</th><th>Category</th><th>Class</th><th></th></tr>{rows}</table><div class="mut">Illegal and protected-class content never passes; adult content may. Unchecking an "illegal" class is allowed but audited and alerted.</div></div>
+<div class="card"><h2 style="margin-top:0">Lexical tripwires</h2><label><input type="checkbox" name="tripwires" {"checked" if pol["tripwires"].get("enabled", True) else ""}> Enabled (built-in lists for sentinel / CSAM terms / malware intent)</label><label>Extra patterns — one Python regex per line</label><textarea name="extra">{esc(extra)}</textarea></div>
+<div class="card"><h2 style="margin-top:0">Diagnostics</h2><label><input type="checkbox" name="store_snippet" {"checked" if pol.get("audit", {}).get("store_snippet") else ""}> Store a 160-character snippet of <b>flagged output</b> (root-only file)</label><div class="mut">Off by default: logs never contain content. Never applies to S4 or CSAM-tripwire vetoes. Toggling is audited and alerted.</div></div>
+<p class="mut">Last change: {esc(pol.get("updated") or "never")} by {esc(pol.get("updated_by") or "—")}.</p><button type="submit">Save policy</button></form>"""
     return page("safety", "policy", "VetoGuard policy", "What the safety gate blocks. Administrator only; every change is audited.", body, msg, ok)
 
 
 def p_audit():
-    veto, vctl = paginate(tail_jsonl(VETO_AUDIT, 5000), "v")
-    hub, hctl = paginate(tail_jsonl(HUB_AUDIT, 5000), "h")
-    vrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))}</td><td>{esc(e.get("detail", ""))[:80]}</td><td>{esc(e.get("model"))}</td><td>{esc(e.get("key_alias"))}</td></tr>' for e in veto) or '<tr><td colspan="6" class="mut">none</td></tr>'
-    hrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("event"))}</td><td>{esc(", ".join(f"{k}={v}" for k, v in e.items() if k not in ("ts", "event", "actor")))[:120]}</td></tr>' for e in hub) or '<tr><td colspan="3" class="mut">none</td></tr>'
-    snips = tail_jsonl("/app/audit/veto-snippets.jsonl", 500)
-    srows = ""
+    snips = tail_jsonl(SNIPPETS, 500); srows = ""
     if snips:
         sp, sctl = paginate(snips, "n")
         srows = '<div class="card"><h2 style="margin-top:0">Flagged-output snippets (diagnostics)</h2>' + sctl + '<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Key</th><th>Snippet</th></tr>' + "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))} {esc(e.get("detail", ""))}</td><td>{esc(e.get("key_alias"))}</td><td><code>{esc(e.get("snippet", ""))}</code></td></tr>' for e in sp) + '</table></div>'
-    body = srows + f'<div class="card"><h2 style="margin-top:0">Vetoes</h2>{vctl}<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Detail</th><th>Model</th><th>Key</th></tr>{vrows}</table>{vctl}</div><div class="card"><h2 style="margin-top:0">Admin actions</h2>{hctl}<table><tr><th>Time</th><th>Event</th><th>Fields</th></tr>{hrows}</table>{hctl}</div><p class="mut">Logs never contain message content. Files: proxy/audit/veto-audit.jsonl, proxy/audit/hub-audit.jsonl (root-only on the host).</p>'
-    return page("safety", "audit", "Audit log", "Every veto and every administrative action.", body)
+    veto, vctl = paginate(tail_jsonl(VETO_AUDIT, 5000), "v"); hub, hctl = paginate(tail_jsonl(HUB_AUDIT, 5000), "h")
+    vrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))}</td><td>{esc(e.get("detail", ""))[:90]}</td><td>{esc(e.get("model"))}</td><td>{esc(e.get("key_alias"))}</td></tr>' for e in veto) or '<tr><td colspan="6" class="mut">none</td></tr>'
+    hrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("actor"))}</td><td>{esc(e.get("event"))}</td><td>{esc(", ".join(f"{k}={v}" for k, v in e.items() if k not in ("ts", "event", "actor")))[:120]}</td></tr>' for e in hub) or '<tr><td colspan="4" class="mut">none</td></tr>'
+    body = srows + f'<div class="card"><h2 style="margin-top:0">Vetoes</h2>{vctl}<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Category / detail</th><th>Model</th><th>Key</th></tr>{vrows}</table>{vctl}</div><div class="card"><h2 style="margin-top:0">Admin actions</h2>{hctl}<table><tr><th>Time</th><th>Actor</th><th>Event</th><th>Fields</th></tr>{hrows}</table>{hctl}</div><p class="mut">Logs never contain message content. Files: proxy/audit/veto-audit.jsonl, proxy/audit/hub-audit.jsonl (root-only on the host).</p>'
+    return page("safety", "audit", "Audit log", "Every veto (what tripped, who, when) and every administrative action.", body)
 
 
 def p_alerts(msg="", ok=True):
     body = f"""<form method="post" action="/hub/api/alerts">{csrf_field()}<div class="card"><label>Webhook URL (Discord, Slack, or any endpoint accepting JSON POST)</label><input name="webhook" value="{esc(state().get("webhook", ""))}" placeholder="https://…">
-<div class="mut" style="margin-top:6px">Every admin action and policy change is posted here. Leave blank to disable. Sent as {{"text","content"}} so Discord and Slack both render it.</div>
+<div class="mut" style="margin-top:6px">Every admin action and every illegal/protected-class veto (S1–S4, S9–S11, CSAM/malware/extra tripwires) is posted here — codes, names, key alias and time only. Leave blank to disable.</div>
 <div class="row" style="margin-top:12px"><button name="action" value="save">Save</button><button class="ghost" name="action" value="test">Send test</button></div></div></form>"""
     return page("safety", "alerts", "Alerts", "Where administrative and safety events are pushed.", body, msg, ok)
 
 
 def p_installed(msg="", ok=True):
     exposed = {m.get("litellm_params", {}).get("model", "").replace("ollama/", ""): m.get("model_name") for m in exposed_models()}
-    rows = ""
-    models, mctl = paginate(installed_models(), "m")
+    rows = ""; models, mctl = paginate(installed_models(), "m")
     for m in models:
         n = m["name"]; size = m.get("size", 0) / 2**30
         exp = exposed.get(n) or exposed.get(n.replace(":latest", ""))
-        act = '<span class="tag">guard model</span>' if m["is_guard"] else (
-            f'<span class="tag ok">exposed as {esc(exp)}</span>' if exp else
-            f'<form class="inline" method="post" action="/hub/api/models/expose">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input name="public" placeholder="public name" style="width:150px" value="{esc(n.split(":")[0].split("/")[-1])}"> <button class="ghost">Expose</button></form>')
-        ld = (f'<form class="inline" method="post" action="/hub/api/models/unload">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Unload</button></form>' if m["loaded"]
-              else f'<form class="inline" method="post" action="/hub/api/models/load">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Load</button></form>')
+        act = '<span class="tag">guard model</span>' if m["is_guard"] else (f'<span class="tag ok">exposed as {esc(exp)}</span>' if exp else f'<form class="inline" method="post" action="/hub/api/models/expose">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input name="public" placeholder="public name" style="width:150px" value="{esc(n.split(":")[0].split("/")[-1])}"> <button class="ghost">Expose</button></form>')
+        ld = (f'<form class="inline" method="post" action="/hub/api/models/unload">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Unload</button></form>' if m["loaded"] else f'<form class="inline" method="post" action="/hub/api/models/load">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><button class="ghost">Load</button></form>')
         rm = "" if exp or m["loaded"] else f'<form class="inline" method="post" action="/hub/api/models/remove">{csrf_field()}<input type="hidden" name="model" value="{esc(n)}"><input type="hidden" name="confirm" value="{esc(n)}"><button class="danger">Remove</button></form>'
         rows += f'<tr><td>{esc(n)}</td><td>{size:.1f} GiB</td><td>{"<span class=ok>resident</span>" if m["loaded"] else "<span class=mut>on disk</span>"}</td><td>{act}</td><td>{ld} {rm}</td></tr>'
-    body = f'<div class="card">{mctl}<table><tr><th>Model</th><th>Size</th><th>State</th><th>Exposure</th><th></th></tr>{rows or "<tr><td colspan=5 class=mut>none</td></tr>"}</table></div><p class="mut">"Expose" registers the model in LiteLLM under a public name so Open WebUI and API keys can use it — through VetoGuard. Guard models are never exposable. A model that is exposed or resident cannot be removed.</p>'
+    body = f'<div class="card">{mctl}<table><tr><th>Model</th><th>Size</th><th>State</th><th>Exposure</th><th></th></tr>{rows or "<tr><td colspan=5 class=mut>none</td></tr>"}</table></div><p class="mut">"Expose" registers the model in LiteLLM under a public name (through VetoGuard). Guard models are never exposable. Unload before removing.</p>'
     return page("models", "installed", "Installed models", "What is in the shared model store, and what apps can see.", body, msg, ok)
 
 
@@ -513,74 +657,92 @@ def p_pull(msg="", ok=True):
         jobs = sorted(JOBS.items(), key=lambda kv: kv[1]["started"], reverse=True)
     jobs, jctl = paginate(jobs, "j", 10)
     rows = "".join(f'<tr><td>{esc(j["model"])}</td><td>{esc(j["status"])}</td><td>{(j["completed"] / j["total"] * 100) if j["total"] else 0:.0f}%</td><td class="mut">{esc(j["started"][:19])}</td></tr>' for _, j in jobs) or '<tr><td colspan="4" class="mut">no pulls yet</td></tr>'
-    body = f"""<form method="post" action="/hub/api/models/pull">{csrf_field()}<div class="card"><label>Model to pull (Ollama library name, e.g. <code>qwen2.5:14b</code>, <code>llama-guard3:8b</code>)</label><div class="row"><input name="model" placeholder="name:tag" required pattern="[a-z0-9][a-z0-9._/:-]*"><button>Pull</button></div>
-<div class="mut" style="margin-top:6px">Pulls run through <b>modeld</b>, the only container with both internet access and the model store. The inference engine never fetches anything itself.</div></div></form>
+    body = f"""<form method="post" action="/hub/api/models/pull">{csrf_field()}<div class="card"><label>Model to pull (Ollama library name)</label><div class="row"><input name="model" placeholder="name:tag" required pattern="[a-z0-9][a-z0-9._/:-]*"><button>Pull</button></div><div class="mut" style="margin-top:6px">Pulls run through <b>modeld</b>, the only container with both internet access and the model store.</div></div></form>
 <div class="card"><h2 style="margin-top:0">Jobs</h2>{jctl}<table><tr><th>Model</th><th>Status</th><th>Progress</th><th>Started</th></tr>{rows}</table><p class="mut">Refresh the page for progress.</p></div>"""
-    return page("models", "pull", "Pull a model", "Download into the shared store, behind the scenes, for every app on the box.", body, msg, ok)
+    return page("models", "pull", "Pull a model", "Download into the shared store for every app on the box.", body, msg, ok)
 
 
 def p_exposed(msg="", ok=True):
-    rows = ""
-    ex, ectl = paginate(exposed_models(), "e")
+    rows = ""; ex, ectl = paginate(exposed_models(), "e")
     for m in ex:
         mid = str(m.get("model_info", {}).get("id", "")); pub = m.get("model_name"); up = m.get("litellm_params", {}).get("model")
         src = "hub" if len(mid) >= 8 and "-" in mid else "config.yaml (console)"
         rm = f'<form class="inline" method="post" action="/hub/api/models/unexpose">{csrf_field()}<input type="hidden" name="id" value="{esc(mid)}"><input type="hidden" name="public" value="{esc(pub)}"><button class="danger">Unexpose</button></form>' if src == "hub" else '<span class="mut">console</span>'
         rows += f'<tr><td>{esc(pub)}</td><td>{esc(up)}</td><td>{esc(src)}</td><td>{rm}</td></tr>'
-    body = f'<div class="card">{ectl}<table><tr><th>Public name</th><th>Upstream</th><th>Defined in</th><th></th></tr>{rows or "<tr><td colspan=4 class=mut>none</td></tr>"}</table></div><p class="mut">Public names are what API keys and Open WebUI address. Everything listed routes through VetoGuard.</p>'
-    return page("models", "exposed", "Exposed to apps", "Models LiteLLM currently serves.", body, msg, ok)
+    body = f'<div class="card">{ectl}<table><tr><th>Public name</th><th>Upstream</th><th>Defined in</th><th></th></tr>{rows or "<tr><td colspan=4 class=mut>none</td></tr>"}</table></div>'
+    return page("models", "exposed", "Exposed to apps", "Models LiteLLM currently serves — all through VetoGuard.", body, msg, ok)
 
 
 def p_keys(msg="", ok=True, newkey=None):
     st, j = litellm("GET", "/key/list?return_full_object=true&page=1&size=100")
-    keys = [k for k in (j.get("keys", []) if isinstance(j, dict) else []) if k.get("key_alias")]
-    keys, kctl = paginate(keys, "k")
-    rows = "".join(f'<tr><td>{esc(k.get("key_alias"))}</td><td>{esc(", ".join(k.get("models") or []) or "all exposed")}</td><td>{esc(k.get("rpm_limit"))}/{esc(k.get("tpm_limit"))}</td><td class="mut">{esc((k.get("created_at") or "")[:19])}</td><td><form class="inline" method="post" action="/hub/api/keys/revoke">{csrf_field()}<input type="hidden" name="alias" value="{esc(k.get("key_alias"))}"><button class="danger">Revoke</button></form></td></tr>' for k in keys if k.get("key_alias")) or '<tr><td colspan="5" class="mut">none</td></tr>'
-    pubs = [m.get("model_name") for m in exposed_models()]
-    opts = "".join(f'<option value="{esc(p)}">{esc(p)}</option>' for p in pubs)
+    keys = [k for k in (j.get("keys", []) if isinstance(j, dict) else []) if k.get("key_alias")]; keys, kctl = paginate(keys, "k")
+    rows = "".join(f'<tr><td>{esc(k.get("key_alias"))}</td><td>{esc(", ".join(k.get("models") or []) or "all exposed")}</td><td>{esc(k.get("rpm_limit"))}/{esc(k.get("tpm_limit"))}</td><td class="mut">{esc((k.get("created_at") or "")[:19])}</td><td><form class="inline" method="post" action="/hub/api/keys/revoke">{csrf_field()}<input type="hidden" name="alias" value="{esc(k.get("key_alias"))}"><button class="danger">Revoke</button></form></td></tr>' for k in keys) or '<tr><td colspan="5" class="mut">none</td></tr>'
+    opts = "".join(f'<option value="{esc(p)}">{esc(p)}</option>' for p in (m.get("model_name") for m in exposed_models()))
     banner = f'<div class="card"><b>New key — shown once, store it now:</b><br><span class="key">{esc(newkey)}</span></div>' if newkey else ""
     body = f"""{banner}<div class="card">{kctl}<table><tr><th>Alias</th><th>Models</th><th>rpm/tpm</th><th>Created</th><th></th></tr>{rows}</table></div>
-<form method="post" action="/hub/api/keys/mint">{csrf_field()}<div class="card"><h2 style="margin-top:0">Mint a key</h2>
-<div class="row"><div><label>Alias (client name)</label><input name="alias" required pattern="[a-z0-9][a-z0-9._-]+" placeholder="home-assistant"></div>
-<div><label>Models</label><select name="models" multiple size="3">{opts}</select></div>
-<div><label>rpm</label><input name="rpm" type="number" value="60" min="1" style="width:100px"></div><div><label>tpm</label><input name="tpm" type="number" value="200000" min="1000" style="width:130px"></div>
-<button>Mint</button></div><div class="mut" style="margin-top:6px">Keys are per client, model-scoped and rate-limited. The master key never leaves the console/hub.</div></div></form>"""
+<form method="post" action="/hub/api/keys/mint">{csrf_field()}<div class="card"><h2 style="margin-top:0">Mint a key</h2><div class="row"><div><label>Alias (client name)</label><input name="alias" required pattern="[a-z0-9][a-z0-9._-]+" placeholder="home-assistant"></div><div><label>Models</label><select name="models" multiple size="3">{opts}</select></div><div><label>rpm</label><input name="rpm" type="number" value="60" min="1" style="width:100px"></div><div><label>tpm</label><input name="tpm" type="number" value="200000" min="1000" style="width:130px"></div><button>Mint</button></div></div></form>"""
     return page("access", "keys", "API keys", "Credentials for other services using the OpenAI-compatible API at /v1.", body, msg, ok)
+
+
+def p_account(msg="", ok=True):
+    u = users().get(getattr(REQ, "user", "admin"), {})
+    body = f"""<div class="card"><h2 style="margin-top:0">Password</h2><form method="post" action="/hub/account/password">{csrf_field()}<label>Current password</label><input name="current" type="password" autocomplete="current-password" required><label>New password</label><input name="new" type="password" autocomplete="new-password" required minlength="14"><label>Confirm</label><input name="confirm" type="password" autocomplete="new-password" required minlength="14"><div class="mut" style="margin-top:6px">≥ 14 chars; 3 of 4 classes; no spaces; no "admin"/"aegis"/"password". Stored as argon2id (64 MiB, t=3). Changing it signs out other sessions.</div><div style="margin-top:12px"><button>Change password</button></div></form></div>
+<div class="card"><h2 style="margin-top:0">Multi-factor authentication</h2><p>Status: <b class="{"ok" if u.get("totp") else "bad"}">{"enrolled" if u.get("totp") else "NOT enrolled"}</b> · last updated {esc(u.get("updated", ""))[:19]}</p>
+<form method="post" action="/hub/account/mfa-reset">{csrf_field()}<label>Current password</label><input name="current" type="password" required><label>Current authenticator code</label><input name="code" inputmode="numeric" required><div style="margin-top:12px"><button class="ghost">Re-enrol MFA (new secret)</button></div></form>
+<p class="mut">Lost the authenticator? Console only: <code>scripts/hub-reset-admin.sh</code> resets the password and MFA and prints a one-time bootstrap password to the container log.</p></div>"""
+    return page("access", "account", "Admin account", "Your credential. Passwords are never stored — only argon2id hashes; the TOTP secret is encrypted at rest.", body, msg, ok)
 
 
 def p_certs():
     dom = current_domain(); certs = [probe_cert(LAN_IP)] + ([probe_cert(LAN_IP, dom)] if dom else [])
     rows = "".join(f'<tr><td>{esc(c["host"])}</td><td>{esc(c.get("issuer", ""))}</td><td>{esc(", ".join(c.get("san", [])))}</td><td>{esc(c.get("not_after", ""))}</td><td class="{"warn" if c.get("days", 99) < 14 else "ok"}">{c.get("days", "")}</td><td class="bad">{esc(c.get("error", ""))}</td></tr>' for c in certs)
-    body = f'<div class="card"><table><tr><th>Host</th><th>Issuer</th><th>SANs</th><th>Expires</th><th>Days</th><th></th></tr>{rows}</table></div><p class="mut">Caddy renews automatically at two-thirds of lifetime. The internal CA root (caddy/data/caddy/pki/authorities/local/root.crt) can be installed on client devices to remove browser warnings for the LAN address.</p>'
+    body = f'<div class="card"><table><tr><th>Host</th><th>Issuer</th><th>SANs</th><th>Expires</th><th>Days</th><th></th></tr>{rows}</table></div><p class="mut">Caddy renews automatically at two-thirds of lifetime.</p>'
     return page("gateway", "certs", "Certificates", "Live TLS state of every endpoint Caddy serves.", body)
 
 
 def p_hostname(msg="", ok=True):
     dom = current_domain()
-    body = f"""<form method="post" action="/hub/api/hostname">{csrf_field()}<div class="card"><h2 style="margin-top:0">Public hostname via Cloudflare DNS-01</h2>
-<p class="mut">The box stays private. Caddy proves ownership by writing a TXT record with a scoped Cloudflare token, then obtains a Let's Encrypt certificate. No inbound ports. Your DNS A record should point at the LAN IP with the proxy <b>off</b> (DNS only).</p>
-<label>Hostname</label><input name="hostname" value="{esc(dom or "")}" placeholder="ai.example.com" pattern="[a-z0-9.-]+">
-<label>Cloudflare API token (Zone → DNS → Edit, scoped to the zone). Leave blank to keep the stored one.</label><input name="token" type="password" autocomplete="off">
-<div class="row" style="margin-top:12px"><button name="action" value="apply">Apply</button><button class="danger" name="action" value="remove" formnovalidate>Remove hostname</button></div>
-<div class="mut" style="margin-top:8px">Current: <b>{esc(dom or "none")}</b>. The token is stored only in the root-only site file Caddy reads; it is never shown again.</div></div></form>"""
+    body = f"""<form method="post" action="/hub/api/hostname">{csrf_field()}<div class="card"><h2 style="margin-top:0">Public hostname via Cloudflare DNS-01</h2><p class="mut">The box stays private. Caddy proves ownership with a scoped Cloudflare token and obtains a Let's Encrypt certificate. No inbound ports.</p>
+<label>Hostname</label><input name="hostname" value="{esc(dom or "")}" placeholder="ai.example.com" pattern="[a-z0-9.-]+"><label>Cloudflare API token (leave blank to keep the stored one)</label><input name="token" type="password" autocomplete="off">
+<div class="row" style="margin-top:12px"><button name="action" value="apply">Apply</button><button class="danger" name="action" value="remove" formnovalidate>Remove hostname</button></div><div class="mut" style="margin-top:8px">Current: <b>{esc(dom or "none")}</b>.</div></div></form>"""
     return page("gateway", "hostname", "Public hostname", "The one piece of Caddy configuration the hub may write.", body, msg, ok)
 
 
 def p_isolation():
-    try:
-        cf = open(CADDYFILE, encoding="utf-8").read()
-    except OSError as e:
-        cf = f"(unreadable: {e})"
-    try:
-        comp = open(COMPOSE_VIEW, encoding="utf-8").read()
-    except OSError as e:
-        comp = f"(unreadable: {e})"
+    try: cf = open(CADDYFILE, encoding="utf-8").read()
+    except OSError as e: cf = f"(unreadable: {e})"
+    try: comp = open(COMPOSE_VIEW, encoding="utf-8").read()
+    except OSError as e: comp = f"(unreadable: {e})"
     nets = "\n".join(l for l in comp.splitlines() if re.match(r"^(networks:|  [a-z0-9_-]+:$|    networks:|    network_mode|      internal:|    ports:)", l) or re.match(r"^    - \"\d", l))
-    body = f'<p class="mut">This is the isolation layer. It is shown so you can verify it; changing it requires the console and root.</p><div class="card"><h2 style="margin-top:0">caddy/Caddyfile</h2><pre>{esc(cf)}</pre></div><div class="card"><h2 style="margin-top:0">docker-compose.yml — network wiring</h2><pre>{esc(nets)}</pre><details><summary class="mut">full compose file</summary><pre>{esc(comp)}</pre></details></div>'
+    body = f'<p class="mut">This is the isolation layer. Shown so you can verify it; changing it requires the console and root.</p><div class="card"><h2 style="margin-top:0">caddy/Caddyfile</h2><pre>{esc(cf)}</pre></div><div class="card"><h2 style="margin-top:0">docker-compose.yml — network wiring</h2><pre>{esc(nets)}</pre><details><summary class="mut">full compose file</summary><pre>{esc(comp)}</pre></details></div>'
     return page("gateway", "isolation", "Isolation (read-only)", "Interconnects, routes, auth and capabilities — view only.", body)
 
 
 # ---------------------------------------------------------------- actions ------------------
+def act_ops(form):
+    action = form.get("action", ""); targets = [t for t in form.getlist("t") if t in SERVICES]
+    if action not in ("start", "stop", "restart"):
+        return p_services("Unknown action.", False)
+    if not targets:
+        return p_services("Select at least one container.", False)
+    prot = [t for t in targets if SERVICES[t][2]]
+    if action == "stop" and prot:
+        return p_services(f"{', '.join(prot)} can only be restarted, never stopped.", False)
+    if os.path.exists(OPS_REQ):
+        return p_services("A request is already pending. Wait for the watchdog response.", False)
+    rid = secrets.token_hex(4)
+    req = {"id": rid, "ts": now(), "action": action, "targets": targets, "requested_by": getattr(REQ, "user", "admin")}
+    tmp = OPS_REQ + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(req, f)
+        os.replace(tmp, OPS_REQ)
+    except OSError as e:
+        return p_services(f"Could not write the request: {e}", False)
+    audit("ops_request", action=action, targets=",".join(targets), id=rid)
+    return p_services(f"Requested {action} of {', '.join(targets)} (id {rid}). The watchdog will answer below; refresh in a few seconds.")
+
+
 def act_policy(form):
     pol = policy(); before = {c: v["block"] for c, v in pol["categories"].items()}
     gm = form.get("guard_model", pol["guard"]["model"])
@@ -590,21 +752,17 @@ def act_policy(form):
         pol["categories"][c]["block"] = (f"block_{c}" in form) or c == "S4"
     extra = [l.strip() for l in form.get("extra", "").splitlines() if l.strip()]
     for pat in extra:
-        try:
-            re.compile(pat)
-        except re.error as e:
-            return p_policy(f"Invalid regex {pat!r}: {e}", False)
-    pol["guard"]["model"] = gm
-    pol["tripwires"] = {"enabled": "tripwires" in form, "extra_patterns": extra}
+        try: re.compile(pat)
+        except re.error as e: return p_policy(f"Invalid regex {pat!r}: {e}", False)
+    pol["guard"]["model"] = gm; pol["tripwires"] = {"enabled": "tripwires" in form, "extra_patterns": extra}
     snip = "store_snippet" in form
     if snip != bool(pol.get("audit", {}).get("store_snippet")):
         audit("snippet_logging_" + ("enabled" if snip else "disabled"))
-    pol["audit"] = {"store_snippet": snip}
-    pol["updated"], pol["updated_by"] = now(), "admin"
+    pol["audit"] = {"store_snippet": snip}; pol["updated"], pol["updated_by"] = now(), getattr(REQ, "user", "admin")
     save_json(POLICY_FILE, pol)
     changed = [f"{c}:{'block' if pol['categories'][c]['block'] else 'allow'}" for c in CATEGORIES if before[c] != pol["categories"][c]["block"]]
     audit("policy_saved", guard_model=gm, changed=",".join(changed) or "none", tripwires=pol["tripwires"]["enabled"], extra_patterns=len(extra))
-    return p_policy("Policy saved. LiteLLM picks it up on the next request (no restart).")
+    return p_policy("Policy saved. LiteLLM picks it up within seconds (no restart).")
 
 
 def act_alerts(form):
@@ -631,8 +789,8 @@ def act_expose(form):
         return p_installed("Guard models cannot be exposed.", False)
     if not ALIAS_RE.match(pub):
         return p_installed("Public name must be lowercase letters, digits, dot, dash, underscore.", False)
-    st, j = litellm("POST", "/model/new", {"model_name": pub, "litellm_params": {"model": f"ollama/{m}", "api_base": OLLAMA}})
-    ok = st == 200; audit("model_exposed" if ok else "model_expose_failed", model=m, public=pub, status=st)
+    st, j = litellm("POST", "/model/new", {"model_name": pub, "litellm_params": {"model": f"ollama/{m}", "api_base": OLLAMA}}); ok = st == 200
+    audit("model_exposed" if ok else "model_expose_failed", model=m, public=pub, status=st)
     return p_installed(f"Exposed {m} as {pub}." if ok else f"LiteLLM refused ({st}): {str(j)[:200]}", ok)
 
 
@@ -645,26 +803,23 @@ def act_unexpose(form):
 
 def act_unload(form):
     m = form.get("model", "")
-    if not MODEL_RE.match(m):
-        return p_installed("Invalid model name.", False)
+    if not MODEL_RE.match(m): return p_installed("Invalid model name.", False)
     st, j = http("POST", OLLAMA + "/api/generate", {"model": m, "keep_alive": 0}, timeout=120); ok = st == 200
     audit("model_unloaded" if ok else "model_unload_failed", model=m, status=st)
-    return p_installed(f"Unloaded {m} from memory." if ok else f"Ollama refused ({st}): {str(j)[:160]}", ok)
+    return p_installed(f"Unloaded {m}." if ok else f"Ollama refused ({st}): {str(j)[:160]}", ok)
 
 
 def act_load(form):
     m = form.get("model", "")
-    if not MODEL_RE.match(m):
-        return p_installed("Invalid model name.", False)
+    if not MODEL_RE.match(m): return p_installed("Invalid model name.", False)
     st, j = http("POST", OLLAMA + "/api/generate", {"model": m, "keep_alive": "24h"}, timeout=600); ok = st == 200
     audit("model_loaded" if ok else "model_load_failed", model=m, status=st)
-    return p_installed(f"Loaded {m} into memory." if ok else f"Ollama refused ({st}): {str(j)[:160]}", ok)
+    return p_installed(f"Loaded {m}." if ok else f"Ollama refused ({st}): {str(j)[:160]}", ok)
 
 
 def act_remove(form):
     m = form.get("model", "")
-    if form.get("confirm") != m or not MODEL_RE.match(m):
-        return p_installed("Confirmation mismatch.", False)
+    if form.get("confirm") != m or not MODEL_RE.match(m): return p_installed("Confirmation mismatch.", False)
     st, j = http("DELETE", OLLAMA + "/api/delete", {"name": m}, timeout=60); ok = st == 200
     audit("model_removed" if ok else "model_remove_failed", model=m, status=st)
     return p_installed(f"Removed {m}." if ok else f"Ollama refused ({st}): {str(j)[:200]}", ok)
@@ -672,12 +827,9 @@ def act_remove(form):
 
 def act_mint(form):
     alias = form.get("alias", "").strip().lower(); models = form.getlist("models")
-    try:
-        rpm, tpm = int(form.get("rpm", 60)), int(form.get("tpm", 200000))
-    except ValueError:
-        return p_keys("rpm/tpm must be integers.", False)
-    if not ALIAS_RE.match(alias):
-        return p_keys("Alias must be lowercase letters, digits, dot, dash, underscore.", False)
+    try: rpm, tpm = int(form.get("rpm", 60)), int(form.get("tpm", 200000))
+    except ValueError: return p_keys("rpm/tpm must be integers.", False)
+    if not ALIAS_RE.match(alias): return p_keys("Alias must be lowercase letters, digits, dot, dash, underscore.", False)
     st, j = litellm("POST", "/key/generate", {"key_alias": alias, "models": models, "rpm_limit": rpm, "tpm_limit": tpm, "metadata": {"minted_by": "hub", "at": now()}})
     ok = st == 200 and isinstance(j, dict) and j.get("key")
     audit("key_minted" if ok else "key_mint_failed", alias=alias, models=",".join(models), rpm=rpm, tpm=tpm, status=st)
@@ -691,12 +843,50 @@ def act_revoke(form):
     return p_keys(f"Revoked {alias}." if ok else f"LiteLLM refused ({st}).", ok)
 
 
+def act_password(form):
+    user = getattr(REQ, "user", "admin"); u = users(); rec = u.get(user)
+    cur, new, conf = form.get("current", ""), form.get("new", ""), form.get("confirm", "")
+    forced = form.get("forced") == "1"
+    render = p_force_password if forced else p_account
+    if not rec:
+        return render("No such account.", False)
+    try:
+        PH.verify(rec["hash"], cur)
+    except VerifyMismatchError:
+        audit("password_change_rejected", reason="current password incorrect"); return render("Current password is incorrect.", False)
+    if new != conf: return render("New password and confirmation do not match.", False)
+    why = password_policy(new)
+    if why: return render(f"Rejected: {why}.", False)
+    if hmac.compare_digest(cur, new): return render("New password must differ from the current one.", False)
+    rec["hash"] = PH.hash(new); rec["must_change"] = False; rec["updated"] = now(); rec["session_epoch"] = rec.get("session_epoch", 0) + 1
+    u[user] = rec; save_users(u); audit("password_changed")
+    if forced:
+        return None  # caller continues the login flow
+    return p_account("Password changed. Other sessions have been signed out.")
+
+
+def act_mfa_reset(form):
+    user = getattr(REQ, "user", "admin"); u = users(); rec = u.get(user)
+    try:
+        PH.verify(rec["hash"], form.get("current", ""))
+    except (VerifyMismatchError, TypeError, KeyError):
+        audit("mfa_reset_rejected"); return p_account("Current password is incorrect.", False)
+    try:
+        sec = fernet().decrypt(rec["totp"].encode()).decode()
+    except (InvalidToken, AttributeError):
+        return p_account("MFA secret unreadable; use the console reset script.", False)
+    c = totp_verify(sec, form.get("code", ""), rec.get("totp_last", 0))
+    if c is None:
+        audit("mfa_reset_rejected"); return p_account("Authenticator code incorrect.", False)
+    rec["totp"] = None; rec["updated"] = now(); rec["session_epoch"] = rec.get("session_epoch", 0) + 1; u[user] = rec; save_users(u)
+    audit("mfa_reset")
+    return None  # caller redirects to login, which forces enrolment
+
+
 def act_hostname(form):
     if form.get("action") == "remove":
-        try:
-            os.unlink(DOMAIN_FILE)
-        except FileNotFoundError:
-            pass
+        try: os.unlink(DOMAIN_FILE)
+        except FileNotFoundError: pass
         ok, m = caddy_reload(); audit("hostname_removed", ok=ok, detail=m)
         return p_hostname(f"Removed. {m}", ok)
     host = form.get("hostname", "").strip().lower(); token = form.get("token", "").strip()
@@ -704,8 +894,7 @@ def act_hostname(form):
         audit("hostname_rejected", hostname=host); return p_hostname("Rejected: not a valid public DNS name.", False)
     if not token:
         try:
-            cur = open(DOMAIN_FILE, encoding="utf-8").read()
-            token = re.search(r"dns cloudflare (\S+)", cur).group(1)
+            token = re.search(r"dns cloudflare (\S+)", open(DOMAIN_FILE, encoding="utf-8").read()).group(1)
         except Exception:  # noqa: BLE001
             return p_hostname("A Cloudflare API token is required the first time.", False)
     if not CF_TOKEN_RE.match(token):
@@ -717,82 +906,21 @@ def act_hostname(form):
     os.chmod(tmp, 0o600); os.replace(tmp, DOMAIN_FILE)
     ok, m = caddy_reload()
     if not ok:
-        if prev is None:
-            os.unlink(DOMAIN_FILE)
-        else:
-            open(DOMAIN_FILE, "w", encoding="utf-8").write(prev)
+        if prev is None: os.unlink(DOMAIN_FILE)
+        else: open(DOMAIN_FILE, "w", encoding="utf-8").write(prev)
         caddy_reload()
     audit("hostname_applied" if ok else "hostname_apply_failed", hostname=host, detail=m)
     s = state(); s["hostname"] = host if ok else s.get("hostname", ""); save_json(STATE_FILE, s)
-    return p_hostname(f"Applied {host}. Caddy will obtain the certificate via DNS-01 within a minute or two; check Certificates. {m}" if ok else f"Failed and rolled back: {m}", ok)
+    return p_hostname(f"Applied {host}. Caddy will obtain the certificate via DNS-01 within a minute or two. {m}" if ok else f"Failed and rolled back: {m}", ok)
 
 
-
-def p_password(msg="", ok=True):
-    body = f"""<form method="post" action="/hub/api/password">{csrf_field()}<div class="card"><h2 style="margin-top:0">Change the administrator password</h2>
-<p class="mut">This is the credential Caddy checks before anything reaches the hub. Rotating it writes a new bcrypt hash to the root-only auth file and reloads Caddy; your browser will prompt again.</p>
-<label>Current password</label><input name="current" type="password" autocomplete="current-password" required>
-<label>New password</label><input name="new" type="password" autocomplete="new-password" required minlength="14">
-<label>Confirm new password</label><input name="confirm" type="password" autocomplete="new-password" required minlength="14">
-<div class="mut" style="margin-top:8px">Policy: at least 14 characters; at least three of: lowercase, uppercase, digit, symbol; no spaces; must not contain "admin", "aegis" or "password". bcrypt cost 14.</div>
-<div class="row" style="margin-top:12px"><button>Change password</button></div></div></form>"""
-    return page("access", "password", "Admin password", "Rotate the hub administrator credential without the console.", body, msg, ok)
-
-
-def _password_policy(pw: str) -> str | None:
-    if len(pw) < 14: return "too short (minimum 14 characters)"
-    if len(pw) > 128: return "too long (maximum 128)"
-    if any(ch.isspace() for ch in pw): return "must not contain spaces"
-    classes = sum([any(c.islower() for c in pw), any(c.isupper() for c in pw), any(c.isdigit() for c in pw), any(not c.isalnum() for c in pw)])
-    if classes < 3: return "needs at least three of: lowercase, uppercase, digit, symbol"
-    low = pw.lower()
-    if any(w in low for w in ("admin", "aegis", "password", "qwerty", "123456")): return "contains a forbidden word"
-    return None
-
-
-def _current_hash() -> str | None:
-    try:
-        m = re.search(r"^\s*admin\s+(\S+)\s*$", open(HUB_AUTH_FILE, encoding="utf-8").read(), re.M)
-        return m.group(1) if m else None
-    except OSError:
-        return None
-
-
-def act_password(form):
-    import bcrypt
-    cur, new, conf = form.get("current", ""), form.get("new", ""), form.get("confirm", "")
-    h = _current_hash()
-    if not h or not bcrypt.checkpw(cur.encode(), h.encode()):
-        audit("admin_password_change_rejected", reason="current password incorrect")
-        return p_password("Current password is incorrect.", False)
-    if new != conf:
-        return p_password("New password and confirmation do not match.", False)
-    why = _password_policy(new)
-    if why:
-        return p_password(f"Rejected: {why}.", False)
-    if bcrypt.checkpw(new.encode(), h.encode()):
-        return p_password("New password must differ from the current one.", False)
-    newh = bcrypt.hashpw(new.encode(), bcrypt.gensalt(rounds=14)).decode()
-    prev = open(HUB_AUTH_FILE, encoding="utf-8").read()
-    tmp = HUB_AUTH_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(f"# Hub administrator credential. Managed from /hub (Access -> Admin password). bcrypt. Rotated {now()}\nbasic_auth {{\n    admin {newh}\n}}\n")
-    os.chmod(tmp, 0o600); os.replace(tmp, HUB_AUTH_FILE)
-    ok, m = caddy_reload()
-    if not ok:
-        open(HUB_AUTH_FILE, "w", encoding="utf-8").write(prev); caddy_reload()
-        audit("admin_password_change_failed", detail=m)
-        return p_password(f"Caddy refused the new credential; previous password kept. {m}", False)
-    audit("admin_password_changed", detail=m)
-    return p_password("Password changed. Caddy reloaded — your browser will ask for the new password on the next request. HUB_ADMIN_PASSWORD in .env is now stale; this file is the source of truth.")
-
-
-ACTIONS = {"/hub/api/policy": act_policy, "/hub/api/alerts": act_alerts, "/hub/api/models/pull": act_pull,
-           "/hub/api/models/expose": act_expose, "/hub/api/models/unexpose": act_unexpose, "/hub/api/models/remove": act_remove, "/hub/api/models/unload": act_unload, "/hub/api/models/load": act_load,
-           "/hub/api/keys/mint": act_mint, "/hub/api/keys/revoke": act_revoke, "/hub/api/password": act_password, "/hub/api/hostname": act_hostname}
+ACTIONS = {"/hub/api/ops": act_ops, "/hub/api/policy": act_policy, "/hub/api/alerts": act_alerts, "/hub/api/models/pull": act_pull,
+           "/hub/api/models/expose": act_expose, "/hub/api/models/unexpose": act_unexpose, "/hub/api/models/remove": act_remove,
+           "/hub/api/models/unload": act_unload, "/hub/api/models/load": act_load,
+           "/hub/api/keys/mint": act_mint, "/hub/api/keys/revoke": act_revoke, "/hub/api/hostname": act_hostname}
 PAGES = {("overview", "dashboard"): p_dashboard, ("overview", "services"): p_services, ("safety", "policy"): p_policy,
          ("safety", "audit"): p_audit, ("safety", "alerts"): p_alerts, ("models", "installed"): p_installed,
-         ("models", "pull"): p_pull, ("models", "exposed"): p_exposed, ("access", "keys"): p_keys, ("access", "password"): p_password,
+         ("models", "pull"): p_pull, ("models", "exposed"): p_exposed, ("access", "keys"): p_keys, ("access", "account"): p_account,
          ("gateway", "certs"): p_certs, ("gateway", "hostname"): p_hostname, ("gateway", "isolation"): p_isolation}
 
 
@@ -806,43 +934,144 @@ class Form(dict):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "AegisHub/2"
+    server_version = "AegisHub/3"
 
-    def log_message(self, *a):  # Caddy keeps the access log
+    def log_message(self, *a):
         pass
 
-    def _send(self, code, body, ctype="text/html; charset=utf-8"):
-        data = body.encode()
+    def _send(self, code, body, ctype="text/html; charset=utf-8", cookie=None, location=None):
+        data = body.encode() if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype); self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store"); self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cache-Control", "no-store"); self.send_header("X-Frame-Options", "DENY"); self.send_header("Referrer-Policy", "no-referrer")
+        if cookie: self.send_header("Set-Cookie", cookie)
+        if location: self.send_header("Location", location)
         self.end_headers(); self.wfile.write(data)
+
+    def _redirect(self, to, cookie=None):
+        self._send(303, "", "text/plain", cookie=cookie, location=to)
+
+    def _cookie(self, value: str, max_age: int) -> str:
+        return f"aegis_hub={value}; Path=/hub; HttpOnly; Secure; SameSite=Strict; Max-Age={max_age}"
+
+    def _session(self) -> str | None:
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "aegis_hub":
+                d = unsign(v)
+                if d and d.get("kind") == "session":
+                    rec = users().get(d.get("u"), {})
+                    if rec and d.get("epoch", 0) == rec.get("session_epoch", 0):
+                        return d["u"]
+        return None
+
+    def _pre(self, user: str, stage: str) -> str:
+        return sign({"kind": "pre", "u": user, "stage": stage, "exp": time.time() + 300})
+
+    def _login_ok(self, user: str):
+        rec = users()[user]
+        tok = sign({"kind": "session", "u": user, "epoch": rec.get("session_epoch", 0), "exp": time.time() + SESSION_TTL, "n": secrets.token_hex(8)})
+        audit("login_ok", user=user, ip=client_ip(self)); clear_fail("u:" + user)
+        return self._redirect("/hub/overview/dashboard", cookie=self._cookie(tok, SESSION_TTL))
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
-        REQ.q, REQ.path = urllib.parse.parse_qs(u.query), u.path
-        p = u.path.rstrip("/")
+        REQ.q, REQ.path, REQ.user = urllib.parse.parse_qs(u.query), u.path, None
+        p = u.path.rstrip("/") or "/hub"
+        if p == "/hub/login":
+            return self._send(200, p_login())
+        if p == "/hub/logout":
+            return self._redirect("/hub/login", cookie=self._cookie("", 0))
+        user = self._session()
+        if not user:
+            return self._redirect("/hub/login")
+        REQ.user = user
+        if users().get(user, {}).get("must_change"):
+            return self._send(200, p_force_password())
         if p == "/hub":
-            return self._send(200, p_dashboard())
+            return self._redirect("/hub/overview/dashboard")
         if p == "/hub/api/status":
-            dom = current_domain()
-            return self._send(200, json.dumps({"services": service_status(), "lan": probe_cert(LAN_IP), "domain": dom,
-                                               "public": probe_cert(LAN_IP, dom) if dom else None, "policy": policy()}, indent=1), "application/json")
-        if p == "/hub/api/jobs":
-            with JOBS_LOCK:
-                return self._send(200, json.dumps(JOBS), "application/json")
+            dom = current_domain(); cst, cts = container_status()
+            return self._send(200, json.dumps({"containers": cst, "status_ts": cts, "lan": probe_cert(LAN_IP), "domain": dom, "public": probe_cert(LAN_IP, dom) if dom else None, "policy": policy()}, indent=1), "application/json")
         parts = p.split("/")
         if len(parts) == 4 and (parts[2], parts[3]) in PAGES:
             return self._send(200, PAGES[(parts[2], parts[3])]())
         self._send(404, "not found", "text/plain")
 
     def do_POST(self):
-        REQ.q, REQ.path = {}, urllib.parse.urlparse(self.path).path
-        p = urllib.parse.urlparse(self.path).path
+        u = urllib.parse.urlparse(self.path)
+        REQ.q, REQ.path, REQ.user = {}, u.path, None
+        p = u.path
         n = int(self.headers.get("Content-Length", "0"))
         form = Form(self.rfile.read(min(n, 65536)).decode())
         if form.get("csrf") != CSRF:
             return self._send(403, "invalid or expired form token — reload the page", "text/plain")
+        ip = client_ip(self)
+        # ---- login flow (no session) ----
+        if p == "/hub/login":
+            user, pw = form.get("user", "").strip().lower(), form.get("password", "")
+            if locked("ip:" + ip, 20, 900) or locked("u:" + user, 5, 300):
+                audit("login_locked", user=user, ip=ip); return self._send(429, p_login("Too many attempts. Try again later.", False))
+            rec = users().get(user) if USER_RE.match(user) else None
+            try:
+                if not rec: raise VerifyMismatchError
+                PH.verify(rec["hash"], pw)
+            except VerifyMismatchError:
+                fail("ip:" + ip); fail("u:" + user); audit("login_failed", user=user, ip=ip); time.sleep(0.5)
+                return self._send(401, p_login("Invalid username or password.", False))
+            if not rec.get("totp"):
+                sec = base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+                return self._send(200, p_enrol(self._pre(user, "enrol"), sec, user))
+            return self._send(200, p_totp(self._pre(user, "totp")))
+        if p in ("/hub/login/totp", "/hub/login/enrol"):
+            d = unsign(form.get("pre", ""))
+            if not d or d.get("kind") != "pre":
+                return self._send(401, p_login("Session expired; sign in again.", False))
+            user = d["u"]; u_all = users(); rec = u_all.get(user)
+            if not rec:
+                return self._send(401, p_login("Invalid session.", False))
+            if locked("ip:" + ip, 20, 900) or locked("u:" + user, 5, 300):
+                audit("login_locked", user=user, ip=ip); return self._send(429, p_login("Too many attempts. Try again later.", False))
+            if p == "/hub/login/enrol" and d.get("stage") == "enrol":
+                sec = form.get("secret", "")
+                if not re.fullmatch(r"[A-Z2-7]{32}", sec):
+                    return self._send(400, p_login("Invalid enrolment.", False))
+                c = totp_verify(sec, form.get("code", ""), 0)
+                if c is None:
+                    fail("u:" + user); audit("mfa_enrol_failed", user=user, ip=ip)
+                    return self._send(401, p_enrol(self._pre(user, "enrol"), sec, user, "Code did not match — check the clock on your device and try again.", False))
+                rec["totp"] = fernet().encrypt(sec.encode()).decode(); rec["totp_last"] = c; rec["updated"] = now(); u_all[user] = rec; save_users(u_all)
+                REQ.user = user; audit("mfa_enrolled", user=user, ip=ip)
+                return self._login_ok(user)
+            if p == "/hub/login/totp" and d.get("stage") == "totp":
+                try: sec = fernet().decrypt(rec["totp"].encode()).decode()
+                except (InvalidToken, AttributeError): return self._send(500, p_login("MFA secret unreadable; use the console reset script.", False))
+                c = totp_verify(sec, form.get("code", ""), rec.get("totp_last", 0))
+                if c is None:
+                    fail("ip:" + ip); fail("u:" + user); audit("mfa_failed", user=user, ip=ip); time.sleep(0.5)
+                    return self._send(401, p_totp(self._pre(user, "totp"), "Code incorrect or already used.", False))
+                rec["totp_last"] = c; u_all[user] = rec; save_users(u_all); REQ.user = user
+                return self._login_ok(user)
+            return self._send(400, p_login("Invalid step.", False))
+        # ---- everything else needs a session ----
+        user = self._session()
+        if not user:
+            return self._redirect("/hub/login")
+        REQ.user = user
+        if users().get(user, {}).get("must_change") and p != "/hub/account/password":
+            return self._send(200, p_force_password())
+        if p == "/hub/account/password":
+            out = act_password(form)
+            if out is None:
+                return self._login_ok(user)   # forced change completed -> new epoch session
+            rec = users().get(user, {}); tok = sign({"kind": "session", "u": user, "epoch": rec.get("session_epoch", 0), "exp": time.time() + SESSION_TTL, "n": secrets.token_hex(8)})
+            return self._send(200, out, cookie=self._cookie(tok, SESSION_TTL))
+        if p == "/hub/account/mfa-reset":
+            out = act_mfa_reset(form)
+            if out is None:
+                return self._redirect("/hub/login", cookie=self._cookie("", 0))
+            return self._send(200, out)
         fn = ACTIONS.get(p)
         if not fn:
             return self._send(404, "not found", "text/plain")
@@ -854,8 +1083,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    os.makedirs(SITES_DIR, exist_ok=True); os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    if not SECRET or len(SECRET) < 32:
+        raise SystemExit("HUB_SECRET_KEY (>= 32 chars) is required")
+    for d in (SITES_DIR, STATE_DIR, os.path.dirname(OPS_REQ)):
+        os.makedirs(d, exist_ok=True)
+    if "--reset-admin" in sys.argv:
+        bootstrap_admin(reset=True); raise SystemExit(0)
+    if "--totp-now" in sys.argv:   # console helper for the acceptance suite
+        rec = users().get("admin", {})
+        print(totp_now(fernet().decrypt(rec["totp"].encode()).decode()) if rec.get("totp") else "not-enrolled"); raise SystemExit(0)
     if not os.path.exists(POLICY_FILE):
         save_json(POLICY_FILE, DEFAULT_POLICY)
+    bootstrap_admin()
     threading.Thread(target=_veto_watcher, name="veto-watcher", daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", 9000), Handler).serve_forever()

@@ -1,12 +1,12 @@
 # Aegis Hub — admin control centre
 
-`https://<LAN_IP>/hub` · user `admin` · password: `HUB_ADMIN_PASSWORD` in `.env` (basic-auth enforced by Caddy).
+`https://<LAN_IP>/hub` · user `admin`. **Own login, not basic-auth:** argon2id password hashes (64 MiB, t=3), mandatory TOTP (RFC 6238; secret Fernet-encrypted at rest with `HUB_SECRET_KEY`), HMAC-signed HttpOnly/Secure/SameSite=Strict session cookies (12 h), lockout (5 failures/user → 5 min; 20/IP → 15 min), every login/failure audited. No password is ever stored anywhere: first start prints a one-time bootstrap password to the container log and forces a change + MFA enrolment; `scripts/hub-reset-admin.sh` does the same from the console if the authenticator is lost.
 Dark theme. Fixed left navigation with collapsible categories (the active one open), one level of sub-pages; the right pane scrolls independently. Every table paginates (10/25/50/100 per page, prev/next) via URL query parameters.
 
 | Category | Page | Can change | Notes |
 |---|---|---|---|
 | Overview | Dashboard | — | services by network, safety posture, VRAM residency, certificates, recent vetoes |
-| | Services | — | health of every container; starting/stopping is console-only |
+| | Services | start / stop / restart (checked containers) | real container status from the host **watchdog**; caddy and hub can only be restarted; one request at a time; every watchdog response (log + errors) listed |
 | Safety | VetoGuard policy | guard model, blocked categories, tripwires, extra regexes, **diagnostics snippet toggle (default off)** | **S4 is locked on**; classifier and fail-closed cannot be disabled; every save is audited + alerted |
 | | Audit log | — | last 150 vetoes and 100 admin actions; never contains content |
 | | Alerts | webhook URL | Discord/Slack/generic JSON; "Send test" |
@@ -14,13 +14,14 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 | | Pull | pull | via `modeld` — the only container with both internet and the model store. Apps never fetch their own |
 | | Exposed to apps | unexpose (hub-created only) | models from `config.yaml` are console-managed |
 | Access | API keys | mint / revoke | per-client, model-scoped, rate-limited; key shown once |
-| | Admin password | rotate | requires current password; ≥ 14 chars, 3 of 4 classes, no spaces, no "admin"/"aegis"/"password"; bcrypt cost 14 written to `caddy/sites-enabled/hub-auth.conf`, Caddy reloaded; audited + alerted. `.env` `HUB_ADMIN_PASSWORD` becomes stale after the first rotation — the file is the source of truth |
+| | Admin account | change password; re-enrol MFA | argon2id; policy ≥ 14 chars / 3 of 4 classes; changing the password signs out other sessions |
 | Gateway | Certificates | — | live TLS probe of every served host |
 | | Public hostname | hostname + Cloudflare token | writes exactly one templated site file; Let's Encrypt via DNS-01, no inbound ports |
 | | Isolation | — | **read-only** view of the Caddyfile and compose network wiring |
 
 ## Privilege model
-- Caddy basic-auth is the administrator boundary. There is one admin identity by design. The credential is a bcrypt hash in `caddy/sites-enabled/hub-auth.conf`, imported by the Caddyfile; a missing file makes Caddy refuse to start (fail-closed). First install seeds it with `scripts/seed-hub-auth.sh`; afterwards it is rotated only from the hub.
+- The hub's own login is the administrator boundary (see top). One admin identity by design until the identity layer lands (roadmap).
+- **Container control has no Docker socket in any container.** The hub writes exactly one `ops/requests/request.json`; `aegis-watchdog` (a root systemd service on the host, `ops/aegis-watchdog.py`) validates it against an allow-list, refuses `stop` for caddy/hub, orders dependents (caddy→hub, litellm-db→litellm, ollama→litellm, prometheus→grafana), executes with the docker CLI, writes `ops/responses/<ts>-<id>.json`, archives the request, and publishes `status.json` every 5 s. Only one request can be pending.
 - The hub shares Caddy's network namespace: it can reach the Caddy admin API, LiteLLM (with the master
   key), Ollama (read + delete) and `modeld` (pulls). No other container can reach any of those admin surfaces.
 - The hub's filesystem is read-only except: `proxy/policy/` (policy JSON), `caddy/sites-enabled/`
