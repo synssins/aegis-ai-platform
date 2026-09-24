@@ -21,7 +21,7 @@ hub ──► modeld (mgmt, egress) ── pulls into the shared model store ─
 | `backend` | **yes** | litellm, ollama, litellm-db, caddy(+hub) | No egress, unreachable from the LAN. Ollama is addressable only by LiteLLM (inference) and the hub (list/delete). |
 | `mgmt` | no | caddy(+hub), modeld | `modeld` is a pull-only Ollama with internet access and the model store. Only the hub talks to it. |
 | `monitoring` | yes | prometheus, node-exporter, dcgm-exporter, grafana | Grafana is also on `edge` for Caddy. |
-| `apps` | yes | fish-speech, comfyui (+edge) | Framework only; profile-gated. |
+| `apps` | yes | fish-speech, comfyui, caddy | Generators are reachable from Caddy only — never from Open WebUI (`edge`). Profile-gated. |
 | `tools` (reserved) | yes | future MCP/tool servers | No backend access; per-tool egress policy. |
 
 ## Services

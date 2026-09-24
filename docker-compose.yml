@@ -30,7 +30,7 @@ services:
       - ./caddy/sites-enabled:/etc/caddy/sites-enabled:ro
       - ./caddy/data:/data
       - ./caddy/config:/config
-    networks: [edge, backend, mgmt, monitoring]     # monitoring: the hub (caddy netns) reads Prometheus for /status and Metrics
+    networks: [edge, backend, mgmt, monitoring, apps]     # monitoring: the hub (caddy netns) reads Prometheus for /status and Metrics
     read_only: true
     tmpfs: [/tmp]
     cap_add: [NET_BIND_SERVICE]
@@ -229,7 +229,7 @@ services:
     volumes:
       - ./audio/voices:/app/voices
       - ./audio/checkpoints:/app/checkpoints
-    networks: [apps, edge]
+    networks: [apps]                                  # reachable from Caddy only — never from Open WebUI (edge)
     deploy:
       resources:
         reservations:
@@ -249,7 +249,7 @@ services:
     volumes:
       - ./comfyui/checkpoints:/root/ComfyUI/models/checkpoints
       - ./comfyui/loras:/root/ComfyUI/models/loras
-    networks: [apps, edge]
+    networks: [apps]                                  # reachable from Caddy only — never from Open WebUI (edge)
     deploy:
       resources:
         reservations:
