@@ -2,6 +2,11 @@
 
 All significant changes to the platform are recorded here. Every entry must name the files touched, the reason, who/what made the change, and how it was verified. Security-relevant changes must link an audit record in `docs/audits/`.
 
+## 2026-09-24 (evening, final) — stock images policy; first-run wizard; hub image CI
+
+- **Images:** operator policy is to ride on upstream containers, not forks. Caddy now uses `caddybuilds/caddy-cloudflare:2.11.4` (digest `sha256:62639363ceb0…`, module `dns.providers.cloudflare` verified); the local `caddy/build` is retired. The hub is our own app; `.github/workflows/hub-image.yml` publishes `ghcr.io/<owner>/aegis-hub` so deployments pull it.
+- **Hub first run is a browser wizard** (create admin → enrol MFA), replacing the bootstrap-password-in-logs flow the operator rejected. `scripts/hub-reset-admin.sh` is recovery only: it removes the administrator and the wizard reappears. Window note recorded in `docs/MIGRATION.md`.
+
 ## 2026-09-24 (evening, continued) — GPU loss root-caused and fixed: CDI device injection
 
 - **Root cause (both incidents, 15:12 and 16:10):** the legacy NVIDIA runtime hook grants GPU device access through cgroup rules that a host `systemctl daemon-reload` (or any package/unit install) resets for running containers → `NVML: Unknown Error` → Ollama falls back to CPU silently. The 16:10 trigger was the watchdog's own unit install.

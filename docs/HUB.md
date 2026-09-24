@@ -1,6 +1,6 @@
 # Aegis Hub — admin control centre
 
-`https://<LAN_IP>/hub` · user `admin`. **Own login, not basic-auth:** argon2id password hashes (64 MiB, t=3), mandatory TOTP (RFC 6238; secret Fernet-encrypted at rest with `HUB_SECRET_KEY`), HMAC-signed HttpOnly/Secure/SameSite=Strict session cookies (12 h), lockout (5 failures/user → 5 min; 20/IP → 15 min), every login/failure audited. No password is ever stored anywhere: first start prints a one-time bootstrap password to the container log and forces a change + MFA enrolment; `scripts/hub-reset-admin.sh` does the same from the console if the authenticator is lost.
+`https://<LAN_IP>/hub` · user `admin`. **Own login, not basic-auth:** argon2id password hashes (64 MiB, t=3), mandatory TOTP (RFC 6238; secret Fernet-encrypted at rest with `HUB_SECRET_KEY`), HMAC-signed HttpOnly/Secure/SameSite=Strict session cookies (12 h), lockout (5 failures/user → 5 min; 20/IP → 15 min), every login/failure audited. No password is ever stored or printed anywhere: on first run (no administrator yet) `/hub` shows a **setup wizard** — choose the admin username, set a policy-checked password, enrol MFA — all in the browser. Recovery is console-only: `scripts/hub-reset-admin.sh` removes the administrator so the wizard runs again.
 Dark theme. Fixed left navigation with collapsible categories (the active one open), one level of sub-pages; the right pane scrolls independently. Every table paginates (10/25/50/100 per page, prev/next) via URL query parameters.
 
 | Category | Page | Can change | Notes |

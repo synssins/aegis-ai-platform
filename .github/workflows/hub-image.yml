@@ -1,0 +1,40 @@
+name: hub image
+
+# Builds and publishes the Aegis hub image so deployments pull it instead of building locally.
+# Tags: vX.Y.Z on git tags, plus `main` on every push to main. Image: ghcr.io/<owner>/aegis-hub
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths: ["caddy/hub/**", ".github/workflows/hub-image.yml"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/aegis-hub
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: caddy/hub/build
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true

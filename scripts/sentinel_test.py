@@ -192,6 +192,8 @@ class Suite:
                  "strict-transport-security" in hl and "x-content-type-options" in hl and "server" not in hl)
         st, h, _ = http("GET", f"{self.base}/hub/overview/dashboard")
         self.rec("2.7", "edge", "/hub without a session redirects to login", "303 -> /hub/login", f"{st} {h.get('Location', '')}", st == 303 and "/hub/login" in h.get("Location", ""))
+        st, h, _ = http("GET", f"{self.base}/hub/setup")
+        self.rec("2.7b", "hub", "first-run wizard unavailable once an administrator exists", "303 -> /hub/login (or 303 -> /hub/setup only while unconfigured)", f"{st} {h.get('Location', '')}", st == 303)
         H = self.hub_login()
         if H:
             st, _, b = http("GET", f"{self.base}/hub/api/status", headers=H)

@@ -8,9 +8,10 @@ Auth (replaces Caddy basic-auth):
     HUB_SECRET_KEY; replay of a used code is rejected;
   * sessions are HMAC-signed, HttpOnly, Secure, SameSite=Strict cookies scoped to /hub, 12 h;
   * lockout: 5 failures per user => 5 min; 20 failures per client IP => 15 min; all audited;
-  * bootstrap: no user store => a random admin password is generated, printed ONCE to the container
-    log, and the first login forces a password change and MFA enrolment.
-  * console recovery: `python3 /app/hub.py --reset-admin` inside the container (see scripts/hub-reset-admin.sh).
+  * first run: no administrator exists => /hub serves a setup wizard (choose the admin username, set a
+    policy-checked password, enrol MFA) entirely in the browser. Nothing is printed or stored in files.
+  * console recovery: `python3 /app/hub.py --reset-admin` REMOVES the administrator, which makes the
+    wizard reappear (scripts/hub-reset-admin.sh). No bootstrap passwords exist anywhere.
 
 Control (via the host watchdog, never a Docker socket in a container):
   * the hub writes exactly one /app/ops/requests/request.json; the watchdog executes and answers in
@@ -281,15 +282,15 @@ def password_policy(pw: str) -> str | None:
     return None
 
 
-def bootstrap_admin(reset: bool = False) -> None:
-    u = users()
-    if "admin" in u and not reset:
-        return
-    pw = secrets.token_urlsafe(18)
-    u["admin"] = {"hash": PH.hash(pw), "totp": None, "totp_last": 0, "must_change": True, "created": now(), "updated": now()}
-    save_users(u)
-    print(f"\n==== AEGIS HUB {'RESET' if reset else 'BOOTSTRAP'} ====\ninitial admin password (shown once, change it at first login): {pw}\n=================================\n", flush=True)
-    audit("admin_reset" if reset else "admin_bootstrap", user="admin")
+def reset_admin() -> None:
+    """Console recovery: remove every account so the first-run wizard runs again."""
+    save_users({})
+    print("All hub accounts removed. Open /hub in a browser to run the setup wizard (create admin, enrol MFA).", flush=True)
+    audit("admin_reset_wizard_rearmed")
+
+
+def setup_needed() -> bool:
+    return not users()
 
 
 def sign(payload: dict) -> str:
@@ -530,6 +531,19 @@ def csrf_field():
 
 
 # ---------------------------------------------------------------- auth pages ---------------
+def p_setup(msg="", ok=True):
+    body = ("<p class=\"mut\">No administrator exists yet. Create the administrator account now; you will then enrol a second factor. "
+            "Passwords are stored only as argon2id hashes.</p>"
+            "<form method=\"post\" action=\"/hub/setup\">" + csrf_field() +
+            "<label>Administrator username</label><input name=\"user\" value=\"admin\" pattern=\"[a-z0-9][a-z0-9._-]+\" required autofocus>"
+            "<label>Password</label><input name=\"password\" type=\"password\" autocomplete=\"new-password\" required minlength=\"14\">"
+            "<label>Confirm password</label><input name=\"confirm\" type=\"password\" autocomplete=\"new-password\" required minlength=\"14\">"
+            "<div class=\"mut\" style=\"margin-top:6px\">At least 14 characters; three of lowercase, uppercase, digit, symbol; no spaces; "
+            "not containing &quot;admin&quot;, &quot;aegis&quot; or &quot;password&quot;.</div>"
+            "<div style=\"margin-top:14px\"><button>Create administrator and continue to MFA</button></div></form>")
+    return plain_page("First-run setup", body, msg, ok)
+
+
 def p_login(msg="", ok=True):
     return plain_page("Sign in", f'<form method="post" action="/hub/login">{csrf_field()}<label>Username</label><input name="user" autocomplete="username" required autofocus><label>Password</label><input name="password" type="password" autocomplete="current-password" required><div style="margin-top:14px"><button>Continue</button></div></form>', msg, ok)
 
@@ -689,7 +703,7 @@ def p_account(msg="", ok=True):
     body = f"""<div class="card"><h2 style="margin-top:0">Password</h2><form method="post" action="/hub/account/password">{csrf_field()}<label>Current password</label><input name="current" type="password" autocomplete="current-password" required><label>New password</label><input name="new" type="password" autocomplete="new-password" required minlength="14"><label>Confirm</label><input name="confirm" type="password" autocomplete="new-password" required minlength="14"><div class="mut" style="margin-top:6px">≥ 14 chars; 3 of 4 classes; no spaces; no "admin"/"aegis"/"password". Stored as argon2id (64 MiB, t=3). Changing it signs out other sessions.</div><div style="margin-top:12px"><button>Change password</button></div></form></div>
 <div class="card"><h2 style="margin-top:0">Multi-factor authentication</h2><p>Status: <b class="{"ok" if u.get("totp") else "bad"}">{"enrolled" if u.get("totp") else "NOT enrolled"}</b> · last updated {esc(u.get("updated", ""))[:19]}</p>
 <form method="post" action="/hub/account/mfa-reset">{csrf_field()}<label>Current password</label><input name="current" type="password" required><label>Current authenticator code</label><input name="code" inputmode="numeric" required><div style="margin-top:12px"><button class="ghost">Re-enrol MFA (new secret)</button></div></form>
-<p class="mut">Lost the authenticator? Console only: <code>scripts/hub-reset-admin.sh</code> resets the password and MFA and prints a one-time bootstrap password to the container log.</p></div>"""
+<p class="mut">Lost the authenticator or password? Console only: <code>scripts/hub-reset-admin.sh</code> removes the administrator; the setup wizard then runs again in the browser.</p></div>"""
     return page("access", "account", "Admin account", "Your credential. Passwords are never stored — only argon2id hashes; the TOTP secret is encrypted at rest.", body, msg, ok)
 
 
@@ -979,6 +993,10 @@ class Handler(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         REQ.q, REQ.path, REQ.user = urllib.parse.parse_qs(u.query), u.path, None
         p = u.path.rstrip("/") or "/hub"
+        if setup_needed():
+            return self._send(200, p_setup()) if p == "/hub/setup" else self._redirect("/hub/setup")
+        if p == "/hub/setup":
+            return self._redirect("/hub/login")
         if p == "/hub/login":
             return self._send(200, p_login())
         if p == "/hub/logout":
@@ -1008,6 +1026,24 @@ class Handler(BaseHTTPRequestHandler):
         if form.get("csrf") != CSRF:
             return self._send(403, "invalid or expired form token — reload the page", "text/plain")
         ip = client_ip(self)
+        # ---- first-run wizard (only while no account exists) ----
+        if p == "/hub/setup":
+            if not setup_needed():
+                return self._redirect("/hub/login")
+            user, pw, conf = form.get("user", "").strip().lower(), form.get("password", ""), form.get("confirm", "")
+            if not USER_RE.match(user):
+                return self._send(400, p_setup("Username: lowercase letters, digits, dot, dash, underscore.", False))
+            if pw != conf:
+                return self._send(400, p_setup("Password and confirmation do not match.", False))
+            why = password_policy(pw)
+            if why:
+                return self._send(400, p_setup(f"Rejected: {why}.", False))
+            save_users({user: {"hash": PH.hash(pw), "totp": None, "totp_last": 0, "must_change": False, "created": now(), "updated": now(), "session_epoch": 0}})
+            REQ.user = user; audit("admin_created_by_wizard", user=user, ip=ip)
+            sec = base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+            return self._send(200, p_enrol(self._pre(user, "enrol"), sec, user))
+        if setup_needed():
+            return self._redirect("/hub/setup")
         # ---- login flow (no session) ----
         if p == "/hub/login":
             user, pw = form.get("user", "").strip().lower(), form.get("password", "")
@@ -1088,12 +1124,11 @@ if __name__ == "__main__":
     for d in (SITES_DIR, STATE_DIR, os.path.dirname(OPS_REQ)):
         os.makedirs(d, exist_ok=True)
     if "--reset-admin" in sys.argv:
-        bootstrap_admin(reset=True); raise SystemExit(0)
+        reset_admin(); raise SystemExit(0)
     if "--totp-now" in sys.argv:   # console helper for the acceptance suite
         rec = users().get("admin", {})
         print(totp_now(fernet().decrypt(rec["totp"].encode()).decode()) if rec.get("totp") else "not-enrolled"); raise SystemExit(0)
     if not os.path.exists(POLICY_FILE):
         save_json(POLICY_FILE, DEFAULT_POLICY)
-    bootstrap_admin()
     threading.Thread(target=_veto_watcher, name="veto-watcher", daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", 9000), Handler).serve_forever()

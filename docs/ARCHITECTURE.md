@@ -27,7 +27,7 @@ hub ──► modeld (mgmt, egress) ── pulls into the shared model store ─
 ## Services
 | Service | Image (pinned) | Hardening |
 |---|---|---|
-| caddy | `aegis/caddy:2.11.4-cloudflare` (local build: caddy 2.11.4 + caddy-dns/cloudflare) | `read_only`, `cap_drop ALL` + `NET_BIND_SERVICE`, admin API localhost-only |
+| caddy | `caddybuilds/caddy-cloudflare:2.11.4` (upstream community build; source open; no local fork) | `read_only`, `cap_drop ALL` + `NET_BIND_SERVICE`, admin API localhost-only |
 | hub | `aegis/hub:3` (python:3.12-alpine + argon2-cffi + cryptography) | own auth (argon2id + TOTP + signed cookies + lockout); `network_mode: service:caddy`; read-only fs; writes only policy / site file / state / audit / one ops request; CSRF on every POST |
 | aegis-watchdog (host systemd) | `ops/aegis-watchdog.py` | root on the host, outside Docker; file-driven allow-listed start/stop/restart with dependency ordering; publishes container status |
 | modeld | `ollama/ollama:0.34.3`, no GPU | `mgmt` only; shares `llm/gguf` |

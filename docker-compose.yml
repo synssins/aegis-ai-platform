@@ -18,7 +18,7 @@ x-hardened: &hardened
 services:
   caddy:
     <<: *hardened
-    image: aegis/caddy:2.11.4-cloudflare          # caddy/build/Dockerfile — caddy:2.11.4 + caddy-dns/cloudflare
+    image: caddybuilds/caddy-cloudflare:2.11.4     # upstream community build of caddy:2.11.4 + caddy-dns/cloudflare (no local fork)
     container_name: caddy
     ports: ["80:80", "443:443"]
     environment:
