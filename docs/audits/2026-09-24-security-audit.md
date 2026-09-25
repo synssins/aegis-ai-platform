@@ -5,6 +5,13 @@ pass). The full report, including open items, is held privately by the operator.
 fixed on branch `security/stopgap-fixes-zero-retention` and how each fix is tested. Open items are described only at
 a high level until they are fixed.
 
+## Status
+- Branch `security/stopgap-fixes-zero-retention` pushed to origin on 2026-09-24 (commit `7a04d17`); not merged, not
+  deployed.
+- Per the review policy (`docs/TESTING.md` → Review policy) this work is **not final until Gemini (`agy`) reviews the
+  diff and a round ends clean**. A second Claude agent reviewed it before commit; its findings were fixed.
+- Live verification pending: `scripts/sentinel_test.py` phase 10 after deployment.
+
 ## Fixed
 
 | ID | Severity | Finding | Fix | Tests |

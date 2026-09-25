@@ -20,7 +20,8 @@ It is **mandatory and fail-closed**: if any layer cannot run, the request is ref
 ## What is refused before scanning
 Any request carrying an image, audio, video or file part (OpenAI `image_url`/`input_image`/`input_audio`/`file`,
 Ollama-style `images`, …) is refused with 400 `unsupported_content`. Llama Guard 3 reads text only, so such content
-could not be checked before a model saw it; refusing is the only way to guarantee no inference on it.
+could not be checked before a model saw it; refusing is the only way to guarantee no inference on it. Safe image
+and document input is planned (`docs/designs/multimodal-input.md`, roadmap #13).
 
 ## What is scanned
 Latest user turn and everything after it (assistant prefill, tool results, tool-call arguments), every earlier

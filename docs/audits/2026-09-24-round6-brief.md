@@ -7,6 +7,11 @@ closed with no findings. Everything below shipped **after** that and has had onl
 wording, rephrase as "robustness and correctness review of an access-control layer"). Fix → re-review → repeat until
 a round ends clean, as before.
 
+**Update 2026-09-24 night:** a separate full-repository audit (Claude) ran first — record in
+`docs/audits/2026-09-24-security-audit.md`. Its stop-gap fixes touched `veto_filter.py` (now 3.0), `hub.py`,
+`imagegate.py`, the Caddyfile and compose, so round 6 must also review that branch's diff and the audit's open items.
+The scheduler findings (`docs/tests/agy-review-round6-01-scheduler.md`) remain open.
+
 ## Scope (files)
 `caddy/hub/hub.py` (portal, accounts, sessions, device certs, chat, image gate wiring, scheduler wiring, browser
 wiring), `caddy/hub/browse.py`, `caddy/hub/imagegate.py`, `caddy/hub/scheduler.py`, `caddy/conf/Caddyfile`,

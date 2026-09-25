@@ -57,8 +57,13 @@ must say whether the current round is clean; unreviewed work is presented as unr
 `docs/tests/agy-vetoguard-review-*.md` record each round of external adversarial review of VetoGuard and what
 was fixed. Findings that were false positives are noted as such. New classes become suite assertions.
 
+Full-repository audit 2026-09-24 (Claude): `docs/audits/2026-09-24-security-audit.md` — stop-gaps on branch
+`security/stopgap-fixes-zero-retention` with offline tests (`tests/`) and suite phase 10; awaiting `agy` review.
+
 ## Manual checks worth doing after changes
 - `/status` shows both GPUs with VRAM and the expected resident models.
 - A benign request through the API returns 200; a request containing the sentinel returns 400 `veto_triggered`.
 - Hub → Safety → Audit log shows the sentinel vetoes as *clearable* (no lock icon).
+- A request with an image or file part returns 400 `unsupported_content` (until multimodal input ships).
+- `/tts/` without a session redirects to login; `/comfy/api/queue` returns 403 even for an images account.
 - Portal chat (`/portal/chat` with a `chat`-granted account): the model menu lists only resident, exposed models; a benign message streams; a message containing the sentinel shows *Refused by the safety gate* and the veto audit names `portal-<user>`; `curl` to `/chat/api/stream` with a `system` role or a non-resident model is refused with 400.

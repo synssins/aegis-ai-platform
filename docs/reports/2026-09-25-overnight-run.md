@@ -1,5 +1,8 @@
 # Overnight run report — 2026-09-24/25
 
+> Historical record. Superseded details: the classifier is now Llama Guard 3 **8B**; `VETO_GUARD_IGNORE_CATEGORIES`
+> no longer exists (categories are set in the hub); see `docs/CHANGELOG.md` and `docs/audits/2026-09-24-security-audit.md`.
+
 **Scope agreed:** container-level hardening only; no host-level (sudoers/sshd/firewall), no new GPU workloads, no internet exposure. Executor: Claude Code. Architect review: Gemini rev 1.
 
 ## Outcome
