@@ -169,6 +169,13 @@ so such content could not be checked before a model saw it. The lexical tripwire
 malware intent, plus admin-added regexes) runs before the classifier. The classifier runs on input and on output (streaming is buffered and released only
 after classification). If the guard model is unreachable the request is refused — this is not configurable.
 
+## Images and documents in chat (portal)
+Off by default. Safety → VetoGuard policy → *Images and documents in chat* has three switches: images, documents,
+adult images. When on, the portal chat shows a **+** button and accepts pasted images; attachments go with the new
+turn only (the browser history keeps file names, never the data), images only to models Ollama reports as
+vision-capable. The hub validates format and size; the gateway's media gate (`docs/SAFETY.md`) re-checks everything.
+Open WebUI uploads stay off (it stores files before any check).
+
 ## Retention (zero retention for vetoed content)
 - A veto stores **metadata only** in `proxy/audit/veto-audit.jsonl`: time, stage, reason/category, call id, key alias, model, device fingerprint. Never the request, the output, or matched text. There is no evidence store and no snippet diagnostics (removed 2026-09-24, operator decision: prevent entirely rather than retain; see `docs/EVIDENCE.md`).
 - Entries are flagged **immutable** when their category is in the immutable set (default S4, S3, S10, S11 — S4 always) or they came from the child-safety tripwire. **Clear log** removes only non-immutable entries; immutable ones expire after `immutable_days` (minimum 90, default 730). Clearing is itself audited with counts.

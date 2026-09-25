@@ -2,6 +2,23 @@
 
 All significant changes to the platform are recorded here. Every entry must name the files touched, the reason, who/what made the change, and how it was verified. Security-relevant changes must link an audit record in `docs/audits/`.
 
+## 2026-09-24 (night) — Multimodal input, phase 1 (branch `feature/multimodal-input`, off by default, for testing)
+
+Design and research: `docs/designs/multimodal-input.md` (how OpenAI, Anthropic, Google, Azure, AWS and Meta handle
+image/document input; open image-safety classifiers; CSAM hash-matching access and US legal duties; document-parsing
+risks). Made by Claude at the operator's request; **not yet reviewed by Gemini**; not for production until the
+design's section 5 decision is made.
+
+- `proxy/media_gate.py` (new) + VetoGuard 3.1 wiring: images re-encoded and judged on the safety pool (hard S4 rule),
+  descriptions and visible text classified with the message; PDF/DOCX/text extracted at the gateway with embedded
+  images judged, hostile files refused, file parts replaced by delimited text. Policy `media` switches, all off.
+- `proxy/build/Dockerfile` (new): LiteLLM + Pillow 12.3.0, pypdf 6.19.0, python-docx 1.2.0; compose builds it and
+  mounts the gate.
+- Hub: policy card *Images and documents in chat*; portal chat **+** button and image paste; attachments validated
+  (`chat_parts`), new turn only, vision-capable models only; browser history keeps names only.
+- Tests: `tests/test_media_gate.py` (16), portal attachment tests; jsdom run of the chat page (attach, approve,
+  veto: no image data stored).
+
 ## 2026-09-24 (night) — Security audit stop-gaps; zero retention of vetoed content
 
 Audit record: `docs/audits/2026-09-24-security-audit.md`. Made by Claude at the operator's request; verified with the

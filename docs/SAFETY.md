@@ -17,11 +17,22 @@ It is **mandatory and fail-closed**: if any layer cannot run, the request is ref
    stage, fail-closed behaviour, category S4 (always blocked, audit entries always immutable), the child-safety
    tripwire list (always on), the refusal of non-text content, and zero retention of vetoed content.
 
-## What is refused before scanning
-Any request carrying an image, audio, video or file part (OpenAI `image_url`/`input_image`/`input_audio`/`file`,
-Ollama-style `images`, …) is refused with 400 `unsupported_content`. Llama Guard 3 reads text only, so such content
-could not be checked before a model saw it; refusing is the only way to guarantee no inference on it. Safe image
-and document input is planned (`docs/designs/multimodal-input.md`, roadmap #13).
+## Images and documents (media gate — off by default)
+Llama Guard 3 reads text only, so non-text content is refused unless an administrator switches on images and/or
+documents (Safety → VetoGuard policy). When on, `proxy/media_gate.py` runs first, in memory, and nothing is stored:
+- **Images** (PNG/JPEG/WebP as data URLs, user turns only, ≤ 4 per request, ≤ 8 MB, ≤ 24 MP): decoded and re-encoded
+  as a fresh PNG (metadata and trailing payloads dropped, long side ≤ 1568 px); judged by the image classifier on the
+  safety pool; **a possible minor with any sexual/nudity signal is refused as S4**, illegal content refused, adult
+  content refused unless explicitly allowed; the image's description and any visible text are then classified by
+  Llama Guard together with the user's words. The model receives the re-encoded copy that was judged.
+- **Documents** (PDF, DOCX, UTF-8 text; ≤ 10 MB, ≤ 200 pages, ≤ 150k characters): text extracted at the gateway,
+  embedded images judged as above, macros/embedded objects/encrypted files/zip bombs refused; the file is replaced by
+  the extracted text, delimited as untrusted data. The model never parses the file.
+- Audio, video, SVG, HEIC, animated images, remote URLs and file references are always refused (400
+  `unsupported_content`). Classifier missing or unreadable → 503 (fail closed).
+- Known limits: the image classifier is a prompted vision model (a dedicated guard ensemble and known-image hash
+  matching are planned) — see `docs/designs/multimodal-input.md`, including the legal decision required before
+  enabling images for real users.
 
 ## What is scanned
 Latest user turn and everything after it (assistant prefill, tool results, tool-call arguments), every earlier

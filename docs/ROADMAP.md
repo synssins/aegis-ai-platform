@@ -19,7 +19,7 @@ Ordered by dependency, not by desire. Each item names its safety precondition.
  **Done** — by operator decision the hub holds the master key; mitigations: edge basic-auth, Caddy-namespace-only reachability, read-only fs, CSRF, audit + alert on every action |
 
 | 12 | **Security audit 2026-09-24 — open items** (`docs/audits/2026-09-24-security-audit.md`): full-history classification; classifier identity pinning + dedicated classifier engine; setup-wizard hardening; single sign-on with MFA for every front end (overlaps #9); hub privilege split; egress/container/supply-chain hardening; Open WebUI storage outside the gate; ComfyUI route allow-list + per-user workflow storage | Stop-gaps shipped on branch `security/stopgap-fixes-zero-retention` (pushed, not merged) |
-| 13 | **Multimodal input (images and documents in chat)** — planning; design `docs/designs/multimodal-input.md` | Today every image/audio/file part is refused (zero-inference rule). Requires: gateway-side media gate (sanitise → classify → rewrite), hash matching decision, zero retention preserved, Gemini review of the design before code |
+| 13 | **Multimodal input (images and documents in chat)** — phase 1 built on branch `feature/multimodal-input` (switched off by default; for testing); design `docs/designs/multimodal-input.md` | Today every image/audio/file part is refused (zero-inference rule). Requires: gateway-side media gate (sanitise → classify → rewrite), hash matching decision, zero retention preserved, Gemini review of the design before code |
 
 ## Next session (plan as of 2026-09-24 night)
 **Security audit (Claude, 2026-09-24 evening):** full-repository adversarial audit; stop-gap fixes and zero retention of

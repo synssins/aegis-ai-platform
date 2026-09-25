@@ -134,6 +134,7 @@ DEFAULT_POLICY = {"guard": {"model": "llama-guard3:8b", "chunk_chars": 6000, "ch
                   "categories": {c: {"block": c in DEFAULT_BLOCK} for c in CATEGORIES},
                   "tripwires": {"enabled": True, "extra_patterns": []},
                   "images": {"classifier_model": "gemma3:27b", "gallery_review": False, "extra_nodes": []},
+                  "media": {"images": False, "documents": False, "allow_adult_images": False, "image_classifier": "gemma3:27b"},
                   "scheduler": {"admin_hold_min": 10, "wide_idle_min": 20, "pinned": []}, "updated": None, "updated_by": None}
 
 SERVICES = {  # name -> (purpose, network, protected)
@@ -470,6 +471,7 @@ def policy() -> dict:
     p = load_json(POLICY_FILE, None) or json.loads(json.dumps(DEFAULT_POLICY))
     p.setdefault("images", json.loads(json.dumps(DEFAULT_POLICY["images"]))); p["images"].setdefault("extra_nodes", [])
     p.setdefault("scheduler", json.loads(json.dumps(DEFAULT_POLICY["scheduler"])))
+    p.setdefault("media", json.loads(json.dumps(DEFAULT_POLICY["media"])))
     for c in CATEGORIES:
         p.setdefault("categories", {}).setdefault(c, {"block": c in DEFAULT_BLOCK})
     p["categories"]["S4"]["block"] = True
@@ -555,6 +557,44 @@ def exposed_models() -> list[dict]:
 
 PORTAL_RPM, PORTAL_TPM = 60, 200000       # per-user portal key limits (LiteLLM enforces)
 CHAT_MAX_BODY = 256 * 1024
+CHAT_MAX_BODY_MEDIA = 24 * 2**20        # only when images/documents are switched on (Caddy caps request bodies at 32 MB)
+CHAT_MAX_ATTACH = 4
+CHAT_IMAGE_URL_RE = re.compile(r"^data:image/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$")
+CHAT_DOC_URL_RE = re.compile(r"^data:(application/pdf|application/vnd\.openxmlformats-officedocument\.wordprocessingml\.document|text/plain|text/markdown|text/csv|application/json);base64,[A-Za-z0-9+/=]+$")
+
+
+def chat_parts(content, media: dict, vision: bool) -> tuple[list | None, str]:
+    """Validate the NEW user turn's attachments (portal chat). The gateway (VetoGuard media gate) re-checks everything;
+    this only gives users a clear message early and keeps the relay's shape strict. Returns (parts, error)."""
+    if not isinstance(content, list) or not 1 <= len(content) <= CHAT_MAX_ATTACH + 1:
+        return None, "bad attachments"
+    out, n = [], 0
+    for p in content:
+        t = p.get("type") if isinstance(p, dict) else None
+        if t == "text" and isinstance(p.get("text"), str):
+            out.append({"type": "text", "text": p["text"][:32000]}); continue
+        n += 1
+        if t == "image_url":
+            url = (p.get("image_url") or {}).get("url") if isinstance(p.get("image_url"), dict) else None
+            if not media.get("images"):
+                return None, "images are switched off"
+            if not vision:
+                return None, "the selected model cannot see images"
+            if not isinstance(url, str) or len(url) > 12 * 2**20 or not CHAT_IMAGE_URL_RE.match(url):
+                return None, "images must be PNG, JPEG or WebP up to 8 MB"
+            out.append({"type": "image_url", "image_url": {"url": url}}); continue
+        if t == "file":
+            f = p.get("file") if isinstance(p.get("file"), dict) else {}
+            url, name = f.get("file_data"), str(f.get("filename") or "document")[:80]
+            if not media.get("documents"):
+                return None, "documents are switched off"
+            if not isinstance(url, str) or len(url) > 14 * 2**20 or not CHAT_DOC_URL_RE.match(url):
+                return None, "documents must be PDF, DOCX or plain text up to 10 MB"
+            out.append({"type": "file", "file": {"filename": name, "file_data": url}}); continue
+        return None, "unsupported attachment"
+    if n > CHAT_MAX_ATTACH or not any(p["type"] == "text" for p in out):
+        return None, "bad attachments"
+    return out, ""
 
 
 def portal_models() -> list[dict]:
@@ -602,7 +642,7 @@ def portal_key(user: str) -> str | None:
 CHAT_HTML = r"""<div class="chat"><aside class="clist"><button id="newc" class="ghost">+ New chat</button><div id="convs"></div></aside>
 <section class="cmain"><header class="ctop"><select id="model" title="Models an administrator has loaded and exposed"></select><span id="mstate" class="mut"></span></header>
 <div id="msgs" class="cmsgs"><div class="cempty mut">Pick a model and ask something. Every request passes the safety gate; there are no settings to change.</div></div>
-<form id="cform" class="cform"><textarea id="inp" rows="1" placeholder="Message… (Enter to send, Shift+Enter for a new line)" required></textarea><button id="send">Send</button><button id="stop" type="button" class="danger" hidden>Stop</button></form></section></div>
+<form id="cform" class="cform"><div id="atts" class="atts"></div><button id="attach" type="button" class="ghost" title="Attach an image or a document (checked by the safety gate; never stored)" hidden>+</button><input id="file" type="file" hidden multiple accept="image/png,image/jpeg,image/webp,application/pdf,.docx,.txt,.md,.csv,.json"><textarea id="inp" rows="1" placeholder="Message… (Enter to send, Shift+Enter for a new line)" required></textarea><button id="send">Send</button><button id="stop" type="button" class="danger" hidden>Stop</button></form></section></div>
 <script>
 (()=>{const CSRF="__CSRF__",USER="__USER__",LS="aegis_chat_"+USER;const $=s=>document.querySelector(s);
 const esc=t=>t.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -614,24 +654,39 @@ t=t.split(/\n{2,}/).map(p=>p.trim()).filter(Boolean).map(p=>/^<(ul|ol|h\d)/.test
 return t.replace(/\u0000(\d+)\u0000/g,(m,i)=>f[+i]);}
 let store;try{store=JSON.parse(localStorage.getItem(LS)||"{}")}catch(e){store={}}store.convs=store.convs||[];
 const save=()=>{try{localStorage.setItem(LS,JSON.stringify({...store,convs:store.convs.map(c=>({...c,msgs:c.msgs.filter(m=>!m.pending)})).filter(c=>c.msgs.length)}))}catch(e){}};  // zero retention: a turn is stored only once the safety gate has released its answer
-let cur=null,ctrl=null;
+let cur=null,ctrl=null,MEDIA={images:false,documents:false},VISION={},atts=[];
+const IMG=["image/png","image/jpeg","image/webp"],DOC={"application/pdf":1,"application/vnd.openxmlformats-officedocument.wordprocessingml.document":1,"text/plain":1,"text/markdown":1,"text/csv":1,"application/json":1};
+const docMime=f=>f.type||({md:"text/markdown",csv:"text/csv",txt:"text/plain",json:"application/json",docx:"application/vnd.openxmlformats-officedocument.wordprocessingml.document",pdf:"application/pdf"})[(f.name.split(".").pop()||"").toLowerCase()]||"";
+function renderAtts(){$("#atts").innerHTML=atts.map((a,i)=>`<span class="att">${a.kind==="image"?"🖼":"📄"} ${esc(a.name)} <a data-i="${i}" title="remove">×</a></span>`).join("")}
+function note(t){$("#msgs").insertAdjacentHTML("beforeend",'<div class="m assistant"><div class="veto">'+esc(t)+'</div></div>')}
+function addFile(f){const mime=docMime(f),img=IMG.includes(mime),doc=!!DOC[mime];
+if(img&&!MEDIA.images||doc&&!MEDIA.documents||!img&&!doc){note(f.name+": this kind of attachment is not accepted.");return}
+if(img&&!VISION[$("#model").value]){note("The selected model cannot see images; pick a model marked 'sees images'.");return}
+if(atts.length>=4){note("At most 4 attachments per message.");return}
+if(f.size>(img?8:10)*2**20){note(f.name+" is too large ("+(img?8:10)+" MB maximum).");return}
+const r=new FileReader();r.onload=()=>{const url=String(r.result).replace(/^data:[^;,]*/,"data:"+mime);atts.push({kind:img?"image":"file",name:f.name.slice(0,80),mime,url});renderAtts()};r.readAsDataURL(f)}
 function conv(){if(!cur){cur={id:Date.now().toString(36),title:"New chat",msgs:[],model:$("#model").value};store.convs.unshift(cur);}return cur}
 function renderList(){$("#convs").innerHTML=store.convs.map(c=>`<div class="citem${cur&&c.id===cur.id?" on":""}" data-id="${c.id}"><span>${esc(c.title)}</span><a class="cdel" title="delete" data-id="${c.id}">×</a></div>`).join("")}
 function renderMsgs(){const box=$("#msgs");if(!cur||!cur.msgs.length){box.innerHTML='<div class="cempty mut">Pick a model and ask something. Every request passes the safety gate; there are no settings to change.</div>';return}
-box.innerHTML=cur.msgs.map(m=>`<div class="m ${m.role}">${m.role==="assistant"?md(m.content||"…"):"<p>"+esc(m.content).replace(/\n/g,"<br>")+"</p>"}${m.note?`<div class="veto">${esc(m.note)}</div>`:""}</div>`).join("");box.scrollTop=box.scrollHeight}
+box.innerHTML=cur.msgs.map(m=>`<div class="m ${m.role}">${m.role==="assistant"?md(m.content||"…"):"<p>"+esc(m.content).replace(/\n/g,"<br>")+"</p>"}${m.attach&&m.attach.length?`<div class="mut">${m.attach.map(n=>"📎 "+esc(n)).join(" · ")}</div>`:""}${m.note?`<div class="veto">${esc(m.note)}</div>`:""}</div>`).join("");box.scrollTop=box.scrollHeight}
 $("#convs").addEventListener("click",e=>{const d=e.target.closest(".cdel");if(d){store.convs=store.convs.filter(c=>c.id!==d.dataset.id);if(cur&&cur.id===d.dataset.id)cur=null;save();renderList();renderMsgs();return}
 const it=e.target.closest(".citem");if(it){cur=store.convs.find(c=>c.id===it.dataset.id);if(cur.model)$("#model").value=cur.model;renderList();renderMsgs()}});
 $("#newc").onclick=()=>{cur=null;renderList();renderMsgs();$("#inp").focus()};
 async function models(){const r=await fetch("/chat/api/models",{headers:{"X-CSRF":CSRF}});const j=await r.json();const sel=$("#model");const last=store.model;
-sel.innerHTML=j.models.map(m=>`<option value="${esc(m.name)}">${esc(m.name)}${m.resident?"":m.protected?" — busy ("+esc(m.protected)+")":" — loads on request (~20 s)"}</option>`).join("");
+MEDIA=j.media||MEDIA;VISION={};j.models.forEach(m=>VISION[m.name]=!!m.vision);$("#attach").hidden=!(MEDIA.images||MEDIA.documents);
+sel.innerHTML=j.models.map(m=>`<option value="${esc(m.name)}">${esc(m.name)}${m.vision&&MEDIA.images?" — sees images":""}${m.resident?"":m.protected?" — busy ("+esc(m.protected)+")":" — loads on request (~20 s)"}</option>`).join("");
 if(!sel.options.length){sel.innerHTML='<option value="">no model loaded</option>';$("#mstate").textContent="Ask an administrator to load a model.";$("#send").disabled=true}
 else{if(last&&[...sel.options].some(o=>o.value===last))sel.value=last;$("#mstate").textContent=sel.options.length+" available";$("#send").disabled=false}}
 $("#model").onchange=()=>{store.model=$("#model").value;if(cur)cur.model=store.model;save()};
+$("#attach").onclick=()=>$("#file").click();$("#file").onchange=e=>{[...e.target.files].forEach(addFile);e.target.value=""};
+$("#atts").addEventListener("click",e=>{const x=e.target.closest("a[data-i]");if(x){atts.splice(+x.dataset.i,1);renderAtts()}});
+$("#inp").addEventListener("paste",e=>{const fs=[...(e.clipboardData&&e.clipboardData.files||[])];if(fs.length&&(MEDIA.images||MEDIA.documents)){e.preventDefault();fs.forEach(addFile)}});
 async function send(text){const c=conv();c.model=$("#model").value;if(!c.model)return;const fresh=c.msgs.length===0;if(fresh)c.title=text.slice(0,40);
-const u={role:"user",content:text,pending:true},a={role:"assistant",content:"",pending:true};c.msgs.push(u,a);let vetoed=false,approved=false;renderList();renderMsgs();
+const sent=atts;atts=[];renderAtts();
+const u={role:"user",content:text,attach:sent.map(x=>x.name),pending:true},a={role:"assistant",content:"",pending:true};c.msgs.push(u,a);let vetoed=false,approved=false;renderList();renderMsgs();
 const REFUSED="Refused by the safety gate. The refusal was logged; your message was not kept.";
 $("#send").hidden=true;$("#stop").hidden=false;ctrl=new AbortController();
-try{const r=await fetch("/chat/api/stream",{method:"POST",signal:ctrl.signal,headers:{"Content-Type":"application/json","X-CSRF":CSRF},body:JSON.stringify({model:c.model,messages:c.msgs.filter(m=>m!==a).map(m=>({role:m.role,content:m.content}))})});
+try{const r=await fetch("/chat/api/stream",{method:"POST",signal:ctrl.signal,headers:{"Content-Type":"application/json","X-CSRF":CSRF},body:JSON.stringify({model:c.model,messages:c.msgs.filter(m=>m!==a).map(m=>m===u&&sent.length?{role:"user",content:[{type:"text",text:m.content},...sent.map(x=>x.kind==="image"?{type:"image_url",image_url:{url:x.url}}:{type:"file",file:{filename:x.name,file_data:x.url}})]}:{role:m.role,content:m.content+(m.attach&&m.attach.length&&m!==u?"\n[Attachments shared earlier were not kept: "+m.attach.join(", ")+"]":"")})})});
 if(!r.ok){let t="";try{t=(await r.json()).error||""}catch(e){}vetoed=/veto|unsupported/i.test(t);a.note=vetoed?REFUSED:r.status===409?t:"Request failed ("+r.status+(t?": "+t:"")+").";renderMsgs();return}
 const rd=r.body.getReader(),dec=new TextDecoder();let buf="";
 for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;
@@ -643,7 +698,7 @@ if(ch){approved=true;a.content+=ch;renderMsgs()}}}}
 catch(e){if(e.name!=="AbortError"){a.note="Connection lost.";}}
 finally{ctrl=null;$("#send").hidden=false;$("#stop").hidden=true;
 if(vetoed||!approved){const note=a.note||"No answer.";c.msgs.splice(c.msgs.indexOf(u),2);if(!c.msgs.length){store.convs=store.convs.filter(x=>x!==c);if(cur===c)cur=null}
-if(!vetoed&&!$("#inp").value)$("#inp").value=text;save();renderList();renderMsgs();
+if(!vetoed&&!$("#inp").value){$("#inp").value=text;atts=sent;renderAtts()}save();renderList();renderMsgs();
 if(cur===c||cur===null)$("#msgs").insertAdjacentHTML("beforeend",'<div class="m assistant"><div class="veto">'+esc(note)+'</div></div>');return}
 u.pending=false;a.pending=false;save();renderMsgs()}}
 $("#cform").onsubmit=e=>{e.preventDefault();const t=$("#inp").value.trim();if(!t||ctrl)return;$("#inp").value="";send(t)};
@@ -653,14 +708,14 @@ models().catch(()=>{$("#mstate").textContent="model list unavailable"});renderLi
 </script>"""
 
 CHAT_CSS = """
-.chat{flex:1;min-width:0;display:flex}.clist{width:220px;flex:none;border-right:1px solid var(--line);background:#121212;display:flex;flex-direction:column;padding:12px;gap:6px;overflow-y:auto}
+.chat{flex:1;min-width:0;display:flex}.atts{display:flex;flex-wrap:wrap;gap:6px;width:100%}.att{background:#262626;border-radius:6px;padding:3px 8px;font-size:12px}.att a{cursor:pointer;color:var(--mut);margin-left:4px}.clist{width:220px;flex:none;border-right:1px solid var(--line);background:#121212;display:flex;flex-direction:column;padding:12px;gap:6px;overflow-y:auto}
 .citem{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-radius:8px;cursor:pointer;color:#cfcfcf;font-size:13px}.citem span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.citem:hover{background:#1a1a1a}.citem.on{background:#262626;color:#fff}.cdel{color:var(--mut);padding:0 4px}.cdel:hover{color:var(--bad)}
 .cmain{flex:1;min-width:0;display:flex;flex-direction:column}.ctop{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}.ctop select{max-width:320px}
 .cmsgs{flex:1;overflow-y:auto;padding:18px 20px;display:flex;flex-direction:column;gap:12px}.cempty{margin:auto;text-align:center;max-width:420px}
 .m{max-width:820px;padding:10px 14px;border-radius:12px;line-height:1.5;word-wrap:break-word}.m.user{align-self:flex-end;background:#2a2a2a}.m.assistant{align-self:flex-start;background:var(--card);border:1px solid var(--line)}
 .m p{margin:0 0 8px}.m p:last-child{margin:0}.m pre{background:#0d0d0d;padding:10px;border-radius:8px;overflow-x:auto}.m code{font-size:13px}.m ul,.m ol{margin:4px 0 8px 20px}
 .veto{margin-top:8px;color:var(--bad);font-size:13px}
-.cform{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--line)}.cform textarea{flex:1;resize:none;min-height:42px;max-height:180px}
+.cform{display:flex;flex-wrap:wrap;gap:8px;padding:12px 16px;border-top:1px solid var(--line)}.cform textarea{flex:1;resize:none;min-height:42px;max-height:180px}
 @media (max-width:760px){.chat{flex-direction:column;min-height:80vh}.clist{width:auto;flex-direction:row;flex-wrap:wrap;border-right:0;border-bottom:1px solid var(--line)}.citem{max-width:200px}}"""
 
 
@@ -1069,6 +1124,11 @@ def p_policy(msg="", ok=True):
 <label style="margin-top:8px"><input type="checkbox" name="gallery_review" {"checked" if pol["images"].get("gallery_review") else ""}> Administrator review of user galleries (Safety → Galleries); the portal tells users when this is on</label>
 <label style="margin-top:8px">Additional allowed node classes (one per line). Built in: {esc(", ".join(sorted(imagegate.DEFAULT_ALLOWED_NODES)))}. Classes that rewrite, load or generate text are refused.</label><textarea name="extra_nodes">{esc(chr(10).join(pol["images"].get("extra_nodes", [])))}</textarea>
 <div class="mut" style="margin-top:6px">Every workflow: only allowed node classes · prompt texts through VetoGuard · model files checked against their NSFW attribute (Models → Store) · every output classified; illegal/minor content is destroyed and nothing about it is kept except a metadata-only audit entry (zero retention); NSFW without the grant is destroyed; an unreadable verdict destroys (fail closed). Previews are disabled in ComfyUI.</div></div>
+<div class="card"><h2 style="margin-top:0">Images and documents in chat (portal and API)</h2>
+<label><input type="checkbox" name="media_images" {"checked" if pol["media"].get("images") else ""}> Allow images — each is re-encoded, judged by the image classifier above (a possible minor with any sexual signal is always refused as S4), and its description and visible text go through Llama Guard with the message</label>
+<label><input type="checkbox" name="media_documents" {"checked" if pol["media"].get("documents") else ""}> Allow documents (PDF, DOCX, plain text) — text is extracted at the gateway, embedded images are judged, the model receives text only</label>
+<label><input type="checkbox" name="media_adult" {"checked" if pol["media"].get("allow_adult_images") else ""}> Allow adult images (nudity / sexual / gore) — off = refused</label>
+<div class="mut" style="margin-top:6px">Off by default. Nothing is stored. Before enabling images for real users read docs/designs/multimodal-input.md section 5 (known-image hash matching and legal duties). Open WebUI uploads stay off: Open WebUI stores files before any check.</div></div>
 <div class="card"><h2 style="margin-top:0">Chat-model scheduling (administrators first)</h2><div class="row"><div><label>Administrator hold (minutes)</label><input name="admin_hold_min" type="number" min="0" value="{pol["scheduler"].get("admin_hold_min", 10)}"></div><div><label>Wide chat mode auto-revert after idle (minutes)</label><input name="wide_idle_min" type="number" min="2" value="{pol["scheduler"].get("wide_idle_min", 20)}"></div></div>
 <div class="mut" style="margin-top:6px">Users never load models: when a user picks an exposed model that is not resident, the scheduler loads it on the chat pool, evicting other chat models — except one that is pinned (Models → Installed), one an administrator used within the hold, or one still answering. Administrators' requests always win. The safety pool is never touched.</div></div>
 <div class="card"><h2 style="margin-top:0">Classifier (Llama Guard 3)</h2><label>Classifier model (installed models named *guard*, *shield* or *guardian*)</label><select name="guard_model">{opts}</select>
@@ -1393,6 +1453,10 @@ def act_policy(form):
     if extra_nodes != pol["images"].get("extra_nodes", []):
         audit("image_nodes_changed", nodes=",".join(extra_nodes)[:200])
     pol["images"] = {"classifier_model": im, "gallery_review": "gallery_review" in form, "extra_nodes": extra_nodes}
+    media = {"images": "media_images" in form, "documents": "media_documents" in form, "allow_adult_images": "media_adult" in form, "image_classifier": im or DEFAULT_POLICY["media"]["image_classifier"]}
+    if media != pol.get("media"):
+        audit("media_policy_changed", **{k: v for k, v in media.items()})
+    pol["media"] = media
     try:
         sc = {"admin_hold_min": max(0, int(form.get("admin_hold_min", 10))), "wide_idle_min": max(2, int(form.get("wide_idle_min", 20))), "pinned": pol["scheduler"].get("pinned", [])}
     except ValueError:
@@ -2374,8 +2438,15 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(msgs, list) or not 1 <= len(msgs) <= 64:
             return self._send(400, '{"error":"bad conversation"}', "application/json")
         clean, total = [], 0
-        for m in msgs:
-            if not isinstance(m, dict) or m.get("role") not in ("user", "assistant") or not isinstance(m.get("content"), str):
+        for i, m in enumerate(msgs):
+            if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+                return self._send(400, '{"error":"bad conversation"}', "application/json")
+            if isinstance(m.get("content"), list) and i == len(msgs) - 1 and m["role"] == "user":     # attachments: new turn only
+                parts, why = chat_parts(m["content"], policy()["media"], "vision" in model_caps(pm["engine_model"]))
+                if parts is None:
+                    return self._send(400, json.dumps({"error": why}), "application/json")
+                total += sum(len(p.get("text", "")) for p in parts); clean.append({"role": "user", "content": parts}); continue
+            if not isinstance(m.get("content"), str):
                 return self._send(400, '{"error":"bad conversation"}', "application/json")
             c = m["content"][:32000]; total += len(c); clean.append({"role": m["role"], "content": c})
         if total > 200000 or clean[-1]["role"] != "user":
@@ -2389,7 +2460,7 @@ class Handler(BaseHTTPRequestHandler):
                 audit("portal_chat_refused", user=user, model=model, why=why[:160])
                 return self._send(409, json.dumps({"error": why}), "application/json")
         scheduler.note_use(pm["engine_model"], is_admin(user), True)
-        audit("portal_chat", user=user, model=model, turns=len(clean), ip=client_ip(self), fingerprint=self._fp() or "none")
+        audit("portal_chat", user=user, model=model, turns=len(clean), attachments=sum(1 for p in (clean[-1]["content"] if isinstance(clean[-1]["content"], list) else []) if p["type"] != "text"), ip=client_ip(self), fingerprint=self._fp() or "none")
         req = urllib.request.Request(LITELLM + "/v1/chat/completions", data=json.dumps({"model": model, "messages": clean, "stream": True}).encode(), method="POST",
                                      headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}", "Accept": "text/event-stream"})
         self.send_response(200)
@@ -2475,7 +2546,10 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/chat/api/models":
             if not flags_of(users().get(user, {})).get("chat"):
                 return self._send(403, '{"error":"chat is not granted"}', "application/json")
-            return self._send(200, json.dumps({"models": portal_models()}), "application/json")
+            ms = portal_models(); med = policy()["media"]
+            for m in ms:
+                m["vision"] = "vision" in model_caps(m["engine_model"])
+            return self._send(200, json.dumps({"models": ms, "media": {"images": bool(med.get("images")), "documents": bool(med.get("documents"))}}), "application/json")
         if p.startswith("/hub") and not is_admin(user):
             audit("admin_refused", user=user, path=p); return self._send(403, plain_page("Admin only", '<p>This area is for administrators. <a href="/portal">Back to the portal</a>.</p>'))
         if p == "/hub":
@@ -2562,7 +2636,11 @@ class Handler(BaseHTTPRequestHandler):
             REQ.user = user; rec = users().get(user, {})
             if rec.get("must_change") or getattr(REQ, "limited", False) or not flags_of(rec).get("chat"):
                 return self._send(403, '{"error":"chat is not granted"}', "application/json")
-            raw = self.rfile.read(min(n, CHAT_MAX_BODY))
+            med = policy()["media"]
+            cap = CHAT_MAX_BODY_MEDIA if p == "/chat/api/stream" and (med.get("images") or med.get("documents")) else CHAT_MAX_BODY
+            if n > cap:
+                return self._send(413, '{"error":"message too large"}', "application/json")
+            raw = self.rfile.read(n)
             if p == "/chat/api/stream":
                 return self._chat_stream(user, raw)
             return self._send(404, '{"error":"unknown"}', "application/json")

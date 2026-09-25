@@ -1,6 +1,11 @@
 """
-VetoGuard rev 3.0 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
+VetoGuard rev 3.1 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
 driven by an admin-editable policy file (hot-reloaded) that only the hub may write.
+
+rev 3.1 (multimodal input, phase 1 — docs/designs/multimodal-input.md): when the policy's "media" switches are on, images
+  and documents in user turns go through proxy/media_gate.py first (re-encode, image verdict on the safety pool with a
+  hard S4 rule, document text extraction); the checked copies replace the originals and the images' descriptions and
+  visible text join the text Llama Guard classifies. Switches off (default) = rev 3.0 behaviour: all media refused.
 
 rev 3.0 (security audit 2026-09-24, stop-gap fixes):
   * ZERO RETENTION. Vetoed content is never written anywhere: the sealed-evidence store and the optional
@@ -129,6 +134,7 @@ DEFAULT_POLICY = {
     "categories": {c: {"block": c in DEFAULT_BLOCK} for c in LLAMA_GUARD_CATEGORIES},
     "tripwires": {"enabled": True, "extra_patterns": []},
     "retention": {"immutable_categories": ["S4", "S3", "S10", "S11"], "immutable_tripwires": ["csam", "despaced"], "immutable_days": 730},
+    "media": {"images": False, "documents": False},       # images/documents in chat: off unless the hub switches them on
 }
 # Child-safety tripwires are never switchable (the policy's "tripwires.enabled" governs only the others).
 LOCKED_TRIPWIRES = ("csam",)
@@ -199,7 +205,7 @@ class Policy:
                 try:
                     with open(POLICY_PATH, encoding="utf-8") as f:
                         loaded = json.load(f)
-                    for k in ("guard", "tripwires", "retention"):
+                    for k in ("guard", "tripwires", "retention", "media"):
                         if isinstance(loaded.get(k), dict):
                             data[k].update({kk: vv for kk, vv in loaded[k].items() if kk != "evidence"})   # evidence: removed in 3.0
                     if isinstance(loaded.get("categories"), dict):
@@ -364,12 +370,15 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
-def _has_non_text(content: Any, depth: int = 0) -> bool:
-    """True if a content value carries any image / audio / file / video part (Llama Guard 3 cannot read those)."""
+def _has_non_text(content: Any, depth: int = 0, checked: frozenset | set = frozenset()) -> bool:
+    """True if a content value carries any image / audio / file / video part (Llama Guard 3 cannot read those).
+    Parts in `checked` (object ids of image parts the media gate has sanitised and classified in THIS request) are allowed."""
     if depth > 24:
         return True                                   # absurd nesting: treat as unreadable (fail closed)
     if isinstance(content, list):
-        return any(_has_non_text(p, depth + 1) for p in content)
+        return any(_has_non_text(p, depth + 1, checked) for p in content)
+    if isinstance(content, dict) and id(content) in checked:
+        return False
     if isinstance(content, dict):
         if str(content.get("type", "")).strip().lower() in NON_TEXT_PART_TYPES or any(k in content for k in NON_TEXT_KEYS):
             return True
@@ -394,11 +403,11 @@ class SchemaBudgetExceeded(Exception):
 class RequestView:
     """Everything scannable in a request, plus the conversation window for multi-turn classification."""
 
-    def __init__(self, data: dict):
+    def __init__(self, data: dict, checked_media: set | frozenset = frozenset()):
         msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
         self.has_payload = bool(msgs or data.get("prompt") or data.get("input") or data.get("system"))
         # Messages with "images" (Ollama-native shape) or any non-text content part anywhere in the request body.
-        self.non_text = (any(_has_non_text(m.get("content")) or any(m.get(k) for k in ("images", "audio", "files")) for m in msgs)
+        self.non_text = (any(_has_non_text(m.get("content"), 0, checked_media) or any(m.get(k) for k in ("images", "audio", "files")) for m in msgs)
                          or any(_has_non_text(data.get(k)) for k in ("input", "prompt", "system", "contents"))
                          or any(data.get(k) for k in NON_TEXT_TOP_KEYS))
         texts: list[str] = []
@@ -769,16 +778,76 @@ def extract_outputs(response: Any) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Media gate (images and documents; proxy/media_gate.py, mounted next to this file)
+# ---------------------------------------------------------------------------
+def _load_media_gate():
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media_gate.py")
+    spec = importlib.util.spec_from_file_location("aegis_media_gate", path)
+    if not spec or not os.path.exists(path):
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+try:
+    MEDIA = _load_media_gate()
+except Exception as e:  # noqa: BLE001 — without the gate every media part is refused by the non-text rule (fail closed)
+    log.error("media gate not loaded (%s); images and documents will be refused", _short_err(e))
+    MEDIA = None
+
+
+async def _image_verdict(png: bytes) -> str:
+    """Ask the image classifier on the safety pool for a JSON verdict on one sanitised PNG."""
+    cfg = MEDIA.cfg_from(POLICY.data.get("media"))
+    payload = {"model": cfg["image_classifier"], "stream": False, "format": "json",
+               "messages": [{"role": "user", "content": MEDIA.VERDICT_PROMPT, "images": [base64.b64encode(png).decode()]}],
+               "options": {"temperature": 0, "num_predict": 400}}
+    try:
+        async with _sem():
+            r = await _client().post(f"{GUARD_URL}/api/chat", json=payload, timeout=float(POLICY.guard.get("timeout", 60)))
+        r.raise_for_status()
+        return r.json().get("message", {}).get("content") or ""
+    except Exception as e:  # noqa: BLE001
+        raise GuardUnavailable(str(e)) from e
+
+
+def _wants_media(data: dict) -> bool:
+    for m in data.get("messages") or []:
+        if isinstance(m, dict) and isinstance(m.get("content"), list):
+            for p in m["content"]:
+                if isinstance(p, dict) and str(p.get("type", "")).strip().lower() in ("image_url", "input_image", "file", "input_file"):
+                    return True
+    return False
+
+
+MEDIA_STATUS = {"veto_triggered": 400, "unsupported_content": 400, "guard_unavailable": 503, "guard_verdict_unparseable": 503, "media_unavailable": 503}
+
+
+# ---------------------------------------------------------------------------
 # LiteLLM hooks
 # ---------------------------------------------------------------------------
 class VetoGuard(CustomLogger):
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         POLICY.reload()
+        checked_media, media_texts = set(), []
+        if _wants_media(data):
+            if MEDIA is None:
+                audit("pre_call", "media_unavailable", "media gate not loaded", data, user_api_key_dict)
+                _refuse(503, "media_unavailable", "Image and document checking is not available; send text only.")
+            try:
+                checked_media, media_texts = await MEDIA.process(data, POLICY.data.get("media"), _image_verdict)
+            except MEDIA.MediaRefused as e:
+                audit("pre_call", e.reason, cats_str(e.categories) if e.categories else "", data, user_api_key_dict)
+                _refuse(MEDIA_STATUS.get(e.code, 400), e.code, e.message)
         try:
-            view = RequestView(data)
+            view = RequestView(data, checked_media)
         except SchemaBudgetExceeded as e:
             audit("pre_call", "schema_budget_exceeded", str(e), data, user_api_key_dict)
             _refuse(413, "veto_triggered", "Request structure too large to evaluate; refused (fail-closed).")
+        if media_texts:                                   # image descriptions + visible text: judged with the user's words
+            view.all_texts += media_texts; view.new_texts += media_texts
         if view.non_text:
             audit("pre_call", "unsupported_content", "non-text content part (image/audio/file)", data, user_api_key_dict)
             _refuse(400, "unsupported_content", "Images, audio and files cannot be safety-checked on this platform; send text only.")

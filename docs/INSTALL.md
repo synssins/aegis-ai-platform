@@ -61,7 +61,8 @@ browser. Do this promptly: until an administrator exists, anyone on the LAN who 
 
 ## Upgrading
 Pull the repo, read `docs/CHANGELOG.md`, `docker compose config --quiet`, then `docker compose up -d`. Re-run the
-sentinel suite. Model store, databases and audit directories are untouched by upgrades.
+sentinel suite. LiteLLM is built locally (`proxy/build/Dockerfile`: upstream image + the media gate's
+libraries); `docker compose build litellm` after changing it. Model store, databases and audit directories are untouched by upgrades.
 
 ## Rollback
 `git checkout <previous tag> -- docker-compose.yml caddy/conf/Caddyfile proxy/ caddy/hub/hub.py && docker compose up -d`.

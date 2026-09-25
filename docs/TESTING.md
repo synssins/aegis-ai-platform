@@ -27,6 +27,8 @@ classifier replaced by a recording stand-in and neutral marker strings: non-text
 metadata-only audit (no content, no spans, no evidence), fail-closed paths, forward-auth grant matrix (incl.
 invite-code sessions), image-prompt gate (filename suffix, size, text-rewriting nodes), portal chat storage order.
 See `tests/README.md`. Each test fails against the code before the 2026-09-24 fixes.
+`tests/test_media_gate.py` (branch `feature/multimodal-input`) covers images and documents: admission, re-encoding,
+limits, document extraction and hostile files, the hard S4 rule, fail-closed paths and zero retention.
 
 ## Seeing the classifier layer trip (live, benign vocabulary)
 The sentinel is a regex tripwire and never reaches Llama Guard. To watch the *classifier* refuse something in a real

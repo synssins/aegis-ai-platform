@@ -170,3 +170,42 @@ class ZeroRetentionHub(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PortalAttachments(unittest.TestCase):
+    """Multimodal input (design docs/designs/multimodal-input.md): the portal relays attachments only on the new turn,
+    only when switched on, only in accepted formats; the gateway re-checks everything."""
+    IMG = "data:image/png;base64,iVBORw0KGgo="
+    PDF = "data:application/pdf;base64,JVBERi0xLjQ="
+    ON = {"images": True, "documents": True}
+
+    def test_accepts_well_formed_parts(self):
+        parts, why = hub.chat_parts([{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": self.IMG}},
+                                     {"type": "file", "file": {"filename": "a.pdf", "file_data": self.PDF}}], self.ON, True)
+        self.assertEqual(why, "")
+        self.assertEqual([p["type"] for p in parts], ["text", "image_url", "file"])
+
+    def test_refusals(self):
+        cases = [
+            ([{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": self.IMG}}], {"images": False, "documents": True}, True),
+            ([{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": self.IMG}}], self.ON, False),           # model can't see
+            ([{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "https://x/y.png"}}], self.ON, True),     # remote
+            ([{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "data:image/svg+xml;base64,PHN2Zz4="}}], self.ON, True),
+            ([{"type": "text", "text": "hi"}, {"type": "file", "file": {"filename": "x.exe", "file_data": "data:application/x-msdownload;base64,TVo="}}], self.ON, True),
+            ([{"type": "text", "text": "hi"}, {"type": "input_audio", "input_audio": {"data": "AAAA"}}], self.ON, True),
+            ([{"type": "image_url", "image_url": {"url": self.IMG}}], self.ON, True),                                           # no text
+            ([{"type": "text", "text": "hi"}] + [{"type": "image_url", "image_url": {"url": self.IMG}}] * 5, self.ON, True),
+        ]
+        for content, media, vision in cases:
+            with self.subTest(content=[p.get("type") for p in content], media=media, vision=vision):
+                self.assertIsNone(hub.chat_parts(content, media, vision)[0])
+
+    def test_media_switches_default_off(self):
+        self.assertFalse(hub.DEFAULT_POLICY["media"]["images"])
+        self.assertFalse(hub.DEFAULT_POLICY["media"]["documents"])
+        self.assertFalse(hub.DEFAULT_POLICY["media"]["allow_adult_images"])
+
+    def test_portal_never_stores_attachment_data(self):
+        js = hub.CHAT_HTML
+        self.assertIn("attach:sent.map(x=>x.name)", js, "history keeps names only")
+        self.assertNotIn("attach:sent,", js)

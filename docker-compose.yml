@@ -114,7 +114,8 @@ services:
 
   litellm:
     <<: *hardened
-    image: ghcr.io/berriai/litellm:main-stable
+    image: aegis/litellm-media:1                  # proxy/build/Dockerfile = upstream LiteLLM + Pillow, pypdf, python-docx (media gate)
+    build: {context: proxy/build}
     container_name: litellm
     command: --config /app/config/config.yaml --port 4000
     environment:
@@ -130,6 +131,7 @@ services:
     volumes:
       - ./proxy/config.yaml:/app/config/config.yaml:ro
       - ./proxy/veto_filter.py:/app/custom_logger/veto_filter.py:ro
+      - ./proxy/media_gate.py:/app/custom_logger/media_gate.py:ro   # images/documents in chat (off unless the hub enables them)
       - ./proxy/policy:/app/policy:ro
       - ./proxy/audit:/app/audit
     networks: [edge, backend]
