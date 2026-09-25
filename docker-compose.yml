@@ -53,7 +53,6 @@ services:
       - AEGIS_INTEL_GPUS=Arc Pro B60:24576:images,Arc Pro B60:24576:intel   # Intel cards are invisible to DCGM; declared with their role (images = ComfyUI, intel = Ollama pool)
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
       - HUB_SECRET_KEY=${HUB_SECRET_KEY}
-      - VETO_EVIDENCE_KEY=${VETO_EVIDENCE_KEY}      # evidence handoff export (re-encrypts one record with a fresh key)
       - GRAFANA_ENABLED=${GRAFANA_ENABLED:-0}
     volumes:
       - ./caddy/hub/hub.py:/app/hub.py:ro
@@ -68,7 +67,6 @@ services:
       - ./caddy/hub/state:/app/state
       - ./proxy/policy:/app/policy
       - ./proxy/audit:/app/audit
-      - ./proxy/evidence:/app/evidence
       - ./ops/requests:/app/ops/requests          # hub writes ONE request.json; the host watchdog consumes it
       - ./ops/responses:/app/ops/responses:ro     # watchdog results + status.json
     network_mode: "service:caddy"
@@ -105,6 +103,9 @@ services:
       - ENABLE_WEB_SEARCH=false
       - ENABLE_PERSISTENT_CONFIG=false
       - ENABLE_COMMUNITY_SHARING=false
+      # Audit C1/M2: images and files are refused at the gateway anyway; don't let Open WebUI accept or store them either.
+      # (Open WebUI permission setting; confirm the name against the pinned version's docs.)
+      - USER_PERMISSIONS_CHAT_FILE_UPLOAD=false
       - SCARF_NO_ANALYTICS=true
       - DO_NOT_TRACK=true
     volumes:
@@ -125,10 +126,8 @@ services:
       - VETO_GUARD_URL=http://ollama:11434              # classifier pool = the T4s (dedicated to safety); fail-closed if unreachable
       - VETO_POLICY_PATH=/app/policy/veto-policy.json
       - VETO_AUDIT_PATH=/app/audit/veto-audit.jsonl
-      - VETO_EVIDENCE_DIR=/app/evidence
-      - VETO_EVIDENCE_KEY=${VETO_EVIDENCE_KEY}
+      - VETO_GUARD_MODEL=${VETO_GUARD_MODEL:-llama-guard3:8b}   # used only until the hub writes a policy file
     volumes:
-      - ./proxy/evidence:/app/evidence
       - ./proxy/config.yaml:/app/config/config.yaml:ro
       - ./proxy/veto_filter.py:/app/custom_logger/veto_filter.py:ro
       - ./proxy/policy:/app/policy:ro

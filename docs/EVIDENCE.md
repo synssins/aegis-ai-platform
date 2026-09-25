@@ -1,71 +1,34 @@
-# Evidence records — for operators and for law enforcement
+# Evidence records — retired (zero retention)
 
-This page explains what a sealed evidence record is, how it is protected, and how a recipient opens and verifies
-one. It uses only public, standard building blocks so that nothing here requires trusting this project's code.
+**Decision (2026-09-24, operator):** when prohibited content is attempted, the platform prevents it and keeps nothing
+about it. It is better to prevent entirely than to capture data. There are no evidence records, no snippets, no
+perceptual hashes and no prompt copies for vetoed requests or destroyed images.
 
-## What is captured, and when
-A record is created only when the safety gate refuses a request or a response for the **serious class** —
-by default Llama Guard category **S4** (see the Llama Guard 3 model card,
-<https://github.com/meta-llama/PurpleLlama/blob/main/Llama-Guard3/8B/MODEL_CARD.md>) or a CSAM lexical
-tripwire. Each record contains:
+Scope: VetoGuard, the hub (portal, image gate) and LiteLLM. Open WebUI keeps its own chat history (including refused messages) — a known open item; the portal chat does not.
 
-| Field | Meaning |
-|---|---|
-| `id`, `ts` | record id and UTC timestamp |
-| `stage`, `reason`, `detail`, `categories` | which gate fired (input/output), why, category codes with names |
-| `matches` | for tripwire hits: the pattern and the **exact matched text span** |
-| `request` | the full request as received: messages/prompt/input/system/tool schemas |
-| `output` | the model's text output, if the veto was on the output side |
-| `model`, `call_id`, `key_alias` | which model, the proxy call id, and the API key alias (a cryptographic identity: the key had to be presented) |
-| `client_ip`, `user_agent`, `device_fingerprint` | network claims (spoofable) and, when device certificates are in use, the SHA-256 fingerprint of the client certificate (not spoofable without the device's private key) |
-| `prev_hash`, `hash` | tamper-evidence chain (below) |
+What remains after a veto is a **metadata-only** audit entry in `proxy/audit/veto-audit.jsonl`: time, stage
+(`pre_call`, `post_call`, `image_output`, …), reason/category code, call id, key alias, model and device fingerprint.
+S4 entries (and child-safety tripwire hits) are immutable until they expire (default 730 days, minimum 90).
 
-**Images:** for image generation, a flagged image is deleted immediately and never stored, encrypted or not.
-Evidence for images is the prompt, metadata, verdict and a perceptual hash (PDQ,
-<https://github.com/facebook/ThreatExchange/tree/main/pdq>) that lets investigators match against known material
-without the platform holding contraband.
+## Upgrading from a version that kept evidence
+Versions up to VetoGuard 2.9 wrote encrypted records to `proxy/evidence/` (full request and output), optional
+160-character output snippets to `proxy/audit/veto-snippets.jsonl`, failed-request rows to LiteLLM's
+`LiteLLM_ErrorLogs` table, and up to 120 characters of an unreadable classifier answer into the audit log. After
+upgrading:
 
-## How records are protected at rest
-- Encrypted with **Fernet** (public spec: <https://github.com/fernet/spec/blob/master/Spec.md> — AES-128-CBC with
-  HMAC-SHA256, implemented by the `cryptography` package, <https://cryptography.io/en/latest/fernet/>). Key:
-  SHA-256 of the platform's `VETO_EVIDENCE_KEY`, base64url-encoded.
-- **Hash-chained:** `hash = SHA-256(prev_hash + canonical_json(record without prev_hash/hash))`, canonical JSON
-  being `json.dumps(record, sort_keys=True, ensure_ascii=False)`. The first record's `prev_hash` is `GENESIS`.
-  Removing or altering any record breaks every later link.
-- Stored root-only in `proxy/evidence/`; a plaintext `index.jsonl` holds metadata only (no content). The admin UI
-  lists ids and hashes and never decrypts.
-- Retention: minimum 90 days, default 730; expiry is audited.
+1. On the console: `scripts/evidence-purge.sh` (runs as root; asks you to type `PURGE`) — overwrites and deletes
+   the evidence and snippet files, empties `LiteLLM_ErrorLogs`, and scrubs the old classifier-answer field.
+   Then recreate the litellm container so its old container log is discarded.
+2. Remove `VETO_EVIDENCE_KEY` from `.env`.
+3. Check backups and filesystem snapshots of `proxy/` and remove the old records there too; overwriting cannot
+   guarantee erasure on SSDs or copy-on-write filesystems.
 
-## Handing a record to law enforcement
-From the hub (Safety → Audit log → *Export for handoff*): the record is re-encrypted with a **fresh, single-use
-Fernet key**; the operator downloads `<id>.aegis-evidence` and is shown the key **once**. File and key must
-travel by **separate channels**. The export and the download are recorded in the administrative audit log.
+If you are under a legal preservation obligation for any existing record, take advice before step 1.
 
-### Opening a handoff bundle (recipient)
-Requirements: Python 3 and the `cryptography` package (`pip install cryptography`).
-```
-python3 evidence-open.py <id>.aegis-evidence --out <id>.json
-```
-The tool prompts for the key, decrypts, recomputes the record hash and compares it with the hash embedded in the
-bundle and in the platform's chain, and prints `integrity: VERIFIED` or `FAILED`. `evidence-open.py` is in this
-repository under `scripts/` and is ~25 lines: it can be read in full before use.
-
-Bundle format (`aegis-evidence-handoff-v1`):
-```json
-{"format": "aegis-evidence-handoff-v1", "id": "...", "exported": "...", "exported_by": "...",
- "chain_hash": "<sha256>", "prev_hash": "<sha256|GENESIS>", "chain_verified_at_export": true,
- "ciphertext": "<Fernet token of the record JSON>"}
-```
-Verifying by hand without the tool: base64url-decode nothing — the Fernet token is opened with the key using any
-Fernet implementation; then `sha256(prev_hash + json.dumps(record_without_prev_hash_and_hash, sort_keys=True,
-ensure_ascii=False))` must equal `hash` and `chain_hash`.
-
-### Bulk export (console)
-`scripts/evidence-export.sh <id|all> <outdir>` decrypts inside the platform, verifies the whole chain, and writes
-plaintext JSON + `CHAIN-VERIFICATION.txt` + `SHA256SUMS` into a 0700 directory.
-
-## Notes for the operator
-- Keep an offline copy of `VETO_EVIDENCE_KEY`. Without it, records are unreadable.
-- Retention of prompt text for the serious class is standard practice for platforms; confirm the specifics for
-  your jurisdiction with counsel before relying on it.
-- Treat exported bundles as sensitive material.
+## What changed in the code
+- `proxy/veto_filter.py` 3.0: `write_evidence`, `snippet`, matched-span capture and the evidence key are gone;
+  `audit()` takes metadata only; unreadable classifier answers are recorded only as verdict words or a length.
+- `caddy/hub/imagegate.py`: `seal_evidence` and `phash` removed; destroyed images leave only the audit entry.
+- `caddy/hub/hub.py`: evidence export/download and snippet views removed; old policy keys are dropped on read.
+- `proxy/config.yaml`: `disable_error_logs: true`, so LiteLLM's database keeps no failed-request text either.
+- `docker-compose.yml`: no evidence mount or key in any container.

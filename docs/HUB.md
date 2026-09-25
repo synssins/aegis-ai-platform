@@ -8,8 +8,8 @@ Dark theme. Fixed left navigation with collapsible categories (the active one op
 | Overview | Dashboard | — | services by network, safety posture, VRAM residency, certificates, recent vetoes |
 | | Metrics | — | GPU utilisation/VRAM/temperature/power per card, CPU, memory, disk, resident models, service health — Prometheus, server-rendered sparklines (last hour), auto-refresh |
 | | Services | start / stop / restart (checked containers) | real container status from the host **watchdog**; caddy and hub can only be restarted; one request at a time; every watchdog response (log + errors) listed |
-| Safety | VetoGuard policy | **classifier model (the one place it is chosen — saving loads it and unloads other guards)**, blocked categories, tripwires, extra regexes, **retention & evidence** (immutable categories, days; evidence categories, days), diagnostics snippet toggle (default off) | **S4 is locked on**; classifier and fail-closed cannot be disabled; every save is audited + alerted |
-| | Audit log | **Clear log** (clearable entries only) | vetoes with immutable flag (🔒) and evidence-record marker; every admin action; sealed-evidence index (ids, times, categories, hashes — never content) |
+| Safety | VetoGuard policy | **classifier model (the one place it is chosen — saving loads it and unloads other guards)**, blocked categories, tripwires (the child-safety list is always on), extra regexes, **retention** (immutable audit categories, days) — zero retention: no evidence store, no content snippets | **S4 is locked on**; classifier and fail-closed cannot be disabled; every save is audited + alerted |
+| | Audit log | **Clear log** (clearable entries only) | vetoes with immutable flag (🔒); every admin action — metadata only, never content |
 | | Alerts | webhook URL | Discord/Slack/generic JSON; "Send test" |
 | Models | Installed | expose / load / unload / remove; "Set as classifier" for guard-family models | expose = register in LiteLLM under a public name (through VetoGuard) — on the native chat API with real tool calls when the model advertises `tools`, text-only otherwise (capability tags shown); guard models never exposable and not loaded/unloaded by hand — their residency follows the policy choice; the active classifier cannot be removed |
 | | Browse | Hugging Face + CivitAI browser (⚙ at the top right holds the registry keys and the NSFW toggle): source tabs, search, type/sort filters, list/detail/S/M/L views, local detail view with link to the source page, hardware-fit badges, **Buzz** badge for CivitAI early access, download to `comfyui/<kind>/` or pull GGUF into Ollama | previews proxied through the hub; NSFW never fetched unless the toggle is on (needs a CivitAI key, audited); `.safetensors`/`.gguf` only, SHA-256 verified when published, pickles refused; every download audited |
@@ -64,16 +64,22 @@ network path from the chat UI. Uploads are off until an input-image gate exists;
 Three gates on every workflow, all in `caddy/hub/imagegate.py` + `hub.py` (`_comfy_prompt`, `gate_worker`):
 
 1. **Prompt gate** — every text input in the workflow goes through LiteLLM/VetoGuard as the user's own key
-   (`portal-<user>`, one token, surface `image_prompt`): tripwires → Llama Guard → veto = 400 and the usual audit /
-   evidence. Nothing is queued if this fails.
+   (`portal-<user>`, one token, surface `image_prompt`): tripwires → Llama Guard → veto = 400 and the usual metadata-only
+   audit. Nothing is queued if this fails. Text is checked in full (over 60,000 characters is refused, never
+   truncated); a value is treated as a model file only when it is *exactly* a model file name; workflows containing
+   node classes outside an allow-list are refused (core text-to-image, img2img, upscale, LoRA and ControlNet nodes are
+   built in; administrators can add image-only classes in Safety → VetoGuard policy). Classes that rewrite, load or
+   generate text are refused even if added, since they could change the text after the check. Through the gate,
+   ComfyUI's queue/interrupt/jobs/logs/model-listing/add-on routes are refused, and its shared workflow and settings
+   store is read-only (the ComfyUI UI may show an error when saving a workflow or a setting).
 2. **File gate** — every string input that names a file in `comfyui/` is checked against the per-file attribute
    (Models → Image model store): NSFW needs the `images_nsfw` grant; unclassified is administrators only (they
    classify it there). `object_info` is filtered the same way, so users never see files they cannot use.
 3. **Output gate** — when ComfyUI finishes, the hub classifies each image with the vision model chosen in Safety →
    VetoGuard policy (default `gemma3:27b`; must be resident or generation is refused up front). Verdict JSON:
    `nsfw, sexual_content, minor_present, sexual_minor, illegal, violence_gore`. Sexualised minor / illegal →
-   image overwritten and unlinked, immutable veto-audit entry (S4/S3), sealed evidence (prompt texts, files,
-   verdict, 64-bit DCT perceptual hash — **never the image**), alert. NSFW without the grant → destroyed, clearable
+   image overwritten and unlinked, immutable metadata-only veto-audit entry (S4/S3), alert — **nothing else is kept**
+   (zero retention: no prompt copies, no hashes, no image). NSFW without the grant → destroyed, clearable
    audit (S12). Unreadable verdict or classifier error → destroyed (fail closed). Approved images are copied to
    `gallery/<user>/` and the output file wiped; `/comfy/view` serves only from the user's gallery (long-polls the
    gate for up to 25 s so the ComfyUI canvas shows the result).
@@ -85,8 +91,8 @@ instance (`comfyui`, profile `apps-nvidia`) exists for smaller models; the hub t
 Measured: SDXL 1024² ≈ 24 s cold (6.5 GB load) and a few seconds warm; 4x model upscale of 1024² ≈ 10 s.
 
 **Uploads (input images) are gated too.** `/comfy/upload/image` is handled by the hub: the file is classified by
-the same vision model *before* ComfyUI can read it; illegal → destroyed + immutable audit + sealed evidence (never
-the image); NSFW without the grant → destroyed; clean → stored as `<user>-<id>-<name>` in `comfyui/input/`, owned by
+the same vision model *before* ComfyUI can read it; illegal → destroyed + immutable metadata-only audit (nothing
+else kept); NSFW without the grant → destroyed; clean → stored as `<user>-<id>-<name>` in `comfyui/input/`, owned by
 that account. `LoadImage` choosers list only the account's own uploads; a workflow that names someone else's input
 file is refused; `/comfy/view?type=input` serves only your own. Other upload endpoints (masks) stay 403.
 
@@ -122,7 +128,7 @@ the network alias `chatpool`, which follows whichever container runs. Wide rever
 The portal's **Chat** section is the hub's own chat, not Open WebUI. Deliberately minimal: no user settings — a model picker, a message box, and a conversation list kept in the user's browser (localStorage; nothing stored server-side). Rules, all enforced server-side in `caddy/hub/hub.py` (`_chat_stream`):
 
 - **Model menu = exposed ∩ resident.** A model appears only if an administrator exposed it (Models → Exposed) *and* it is loaded right now. Users never load or unload anything; a request for any other model is refused (400).
-- **Every turn goes through LiteLLM as the user's own virtual key** (`portal-<user>`, minted on first use with rpm/tpm limits, Fernet-encrypted in the account record, never sent to the browser). VetoGuard therefore gates every portal message exactly like the API, and vetoes/evidence name the user via the key alias. A veto shows the user *"Refused by the safety gate. This request has been logged."* — no categories.
+- **Every turn goes through LiteLLM as the user's own virtual key** (`portal-<user>`, minted on first use with rpm/tpm limits, Fernet-encrypted in the account record, never sent to the browser). VetoGuard therefore gates every portal message exactly like the API, and vetoes name the user via the key alias. A veto shows the user *"Refused by the safety gate. The refusal was logged; your message was not kept."* — no categories.
 - **No steering fields.** Only `user`/`assistant` roles (no system prompt), bounded sizes (64 turns, 32k chars each, 200k total), no `options`, `keep_alive`, `num_gpu`, tools or images pass through. The browser sends `{model, messages}` and nothing else is honoured.
 - Requires a session with the `chat` grant and the page's CSRF token in `X-CSRF`; routes: `GET /chat/api/models`, `POST /chat/api/stream` (SSE relay). Each request is audited (`portal_chat`: user, model, turns, IP, device fingerprint — never content). Deleting a user deletes their key.
 - **Open WebUI** remains available under the same grant as its own section ("Open WebUI", framed at `/`) for documents, voice and workspaces; it too can only speak to LiteLLM.
@@ -131,7 +137,7 @@ The portal's **Chat** section is the hub's own chat, not Open WebUI. Deliberatel
 `/` = portal for a browser's top-level navigation (Caddy matches `Sec-Fetch-Dest: document`), Open WebUI for everything else — Open WebUI cannot run under a sub-path, so it owns the root namespace and the portal frames it at `/` same-origin. `/portal`, `/login`, `/account` = portal; `/hub` = admin; `/grafana/` = Grafana; `/status`; `/v1`. The LAN address serves Open WebUI at `/` directly. The hostname site is generated by the hub (`caddy/sites-enabled/`); the shared layout is the `(site)` snippet in `caddy/conf/Caddyfile`.
 
 ## Device identity (hard identifiers)
-IP addresses and user agents are claims; a certificate is proof of possession of a key. Caddy *requests* a client certificate on every site (optional — connections without one still work) and forwards only the TLS-derived fingerprint to the hub and LiteLLM, discarding any client-supplied header of the same name. The hub issues per-device certificates (Access → Devices), binds admin sessions to the presenting fingerprint, can require a known device for admin sign-in, and records fingerprints in every login audit; VetoGuard records them in veto audit entries and evidence. Revocation is immediate at the hub (Caddy still completes the TLS handshake in request mode; the hub refuses the session). Implementation note: Caddy's fingerprint placeholder yields SHA-256 of empty input when no certificate is presented; hub and VetoGuard treat that value as "none". Client-auth policies also make Caddy enforce strict SNI/host matching, which would break access by bare IP; `strict_sni_host insecure_off` is set because both sites request the same CA. Verified end to end by test 5.22.
+IP addresses and user agents are claims; a certificate is proof of possession of a key. Caddy *requests* a client certificate on every site (optional — connections without one still work) and forwards only the TLS-derived fingerprint to the hub and LiteLLM, discarding any client-supplied header of the same name. The hub issues per-device certificates (Access → Devices), binds admin sessions to the presenting fingerprint, can require a known device for admin sign-in, and records fingerprints in every login audit; VetoGuard records them in veto audit entries. Revocation is immediate at the hub (Caddy still completes the TLS handshake in request mode; the hub refuses the session). Implementation note: Caddy's fingerprint placeholder yields SHA-256 of empty input when no certificate is presented; hub and VetoGuard treat that value as "none". Client-auth policies also make Caddy enforce strict SNI/host matching, which would break access by bare IP; `strict_sni_host insecure_off` is set because both sites request the same CA. Verified end to end by test 5.22.
 
 **Losing the device that holds the certificate.** The certificate is optional by default: an administrator signs in with password + TOTP from any device, and a session is bound to a certificate only when one was presented. So a dead PC is a non-event unless *Require a device certificate for administrators* was switched on — then no browser without a known certificate can sign in, by design, and recovery is console-only: `scripts/hub-device-recovery.sh` lifts the requirement (audited as `device_requirement_lifted`, actor `console`); sign in, issue a new certificate under Access → Devices, revoke the lost one, re-enable the requirement. Practical rule: before enabling the requirement, issue a **spare** device bundle (Access → Devices → Issue) and keep the `.p12` and its password offline (it is useless without the password and can be revoked at any time). Lost authenticator or password: `scripts/hub-reset-admin.sh` (see Recovery in `docs/OPERATIONS.md`).
 
@@ -151,24 +157,22 @@ IP addresses and user agents are claims; a certificate is proof of possession of
 
 ## Policy semantics (Safety → VetoGuard policy)
 Categories are Llama Guard 3 hazard codes — definitions in the model card: <https://github.com/meta-llama/PurpleLlama/blob/main/Llama-Guard3/8B/MODEL_CARD.md>.
-- **locked:** S4 — always blocked, always immutable, always sealed as evidence; no UI to change it.
+- **locked:** S4 — always blocked, its audit entries always immutable; no UI to change it. The child-safety tripwire list is locked on too.
 - **illegal (blocked by default):** S1, S2, S3, S9.
 - **protected (blocked by default):** S10, S11.
 - **adult/legal (allowed by default):** S5, S6, S7, S8, S12, S13, S14.
 
-**Classifier is mandatory and fail-closed:** if the chosen model is not installed, not loadable or unreachable, every request is refused (503 `guard_unavailable`). If VRAM pressure evicts it, Ollama reloads it on the next request (~20 s once). Load the main model *before* choosing a larger classifier so both fit. The dropdown lists installed models named *guard*, *shield* or *guardian*. Each family needs a **verdict adapter** (how it is asked, how its answer is read); today only Llama Guard has one, so other families are listed but not selectable. If a classifier ever returns an answer the adapter cannot read, the request is **refused** (503 `guard_verdict_unparseable`) and the audit entry records `got='<first 120 chars of the classifier's answer>' expected='…'` — classifier output only, never user content — and the event is alerted.
+**Classifier is mandatory and fail-closed:** if the chosen model is not installed, not loadable or unreachable, every request is refused (503 `guard_unavailable`). If VRAM pressure evicts it, Ollama reloads it on the next request (~20 s once). Load the main model *before* choosing a larger classifier so both fit. The dropdown lists installed models named *guard*, *shield* or *guardian*. Each family needs a **verdict adapter** (how it is asked, how its answer is read); today only Llama Guard has one, so other families are listed but not selectable. If a classifier ever returns an answer the adapter cannot read, the request is **refused** (503 `guard_verdict_unparseable`) and the audit entry records `got='<the answer if it is only verdict words and S-codes, otherwise its length>' expected='…'` — a misbehaving model may echo the user's text, so nothing else is kept — and the event is alerted.
 
-The lexical tripwire (sentinel, CSAM terms, malware intent, plus admin-added regexes) runs before
-the classifier. The classifier runs on input and on output (streaming is buffered and released only
+Requests carrying image, audio or file parts are refused first (400 `unsupported_content`): Llama Guard 3 reads text only,
+so such content could not be checked before a model saw it. The lexical tripwire (sentinel, CSAM terms — always on —,
+malware intent, plus admin-added regexes) runs before the classifier. The classifier runs on input and on output (streaming is buffered and released only
 after classification). If the guard model is unreachable the request is refused — this is not configurable.
 
-## Retention and sealed evidence
-- Every veto entry is flagged **immutable** when its category is in the immutable set (default S4, S3, S10, S11 — S4 always) or it came from a CSAM tripwire. See `docs/EVIDENCE.md` for the evidence path. **Clear log** removes only non-immutable entries; immutable ones expire after `immutable_days` (minimum 90, default 730). Clearing is itself audited with counts.
-- Vetoes in the **evidence** set (default S4 + CSAM tripwires; S4 always) also produce a sealed record in `proxy/evidence/`: full request (and output), timestamp, key alias, client IP and user agent, model, categories with names, and the exact matched spans for tripwire hits. Records are Fernet-encrypted with `VETO_EVIDENCE_KEY` and hash-chained (`prev_hash → hash`), so removal or alteration is detectable. A plaintext `index.jsonl` holds metadata only. The hub lists ids and hashes; it never decrypts. Records expire after `evidence.days` (minimum 90, default 730), audited.
-- **Handoff from the hub:** Safety → Audit log → "Export for handoff" re-encrypts one record with a fresh key, offers the `.aegis-evidence` file for download and shows the key once — send file and key by separate channels; the recipient opens it with `scripts/evidence-open.py` (standalone, needs only `cryptography`). Export and download are audited and alerted.
-- **Bulk export (console):** `scripts/evidence-export.sh <id|all> <outdir>` decrypts inside the LiteLLM container, verifies the whole chain, writes plaintext JSON + `CHAIN-VERIFICATION.txt` + `SHA256SUMS` into a 0700 directory. Keep an offline copy of `VETO_EVIDENCE_KEY`; without it records are unreadable.
-
-**What is sealed today: text only** — request messages/prompt, text output for output-side vetoes, timestamp, key alias, client IP/agent, model, categories, matched spans, chain links. For image generation (roadmap): flagged images are destroyed, never stored; evidence is prompt + metadata + verdict + a perceptual hash. See `docs/designs/portal-and-identity.md`.
+## Retention (zero retention for vetoed content)
+- A veto stores **metadata only** in `proxy/audit/veto-audit.jsonl`: time, stage, reason/category, call id, key alias, model, device fingerprint. Never the request, the output, or matched text. There is no evidence store and no snippet diagnostics (removed 2026-09-24, operator decision: prevent entirely rather than retain; see `docs/EVIDENCE.md`).
+- Entries are flagged **immutable** when their category is in the immutable set (default S4, S3, S10, S11 — S4 always) or they came from the child-safety tripwire. **Clear log** removes only non-immutable entries; immutable ones expire after `immutable_days` (minimum 90, default 730). Clearing is itself audited with counts.
+- Upgrading from a version that kept evidence: run `scripts/evidence-purge.sh` once on the console, and remove `VETO_EVIDENCE_KEY` from `.env`.
 
 ## Guard model choice (measured 2026-09-24 on 2× Tesla T4, Mixtral 8x7B resident)
 | Guard | Placement | 6000-char classification | Mixtral gen | Notes |

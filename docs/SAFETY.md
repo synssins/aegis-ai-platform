@@ -13,9 +13,14 @@ It is **mandatory and fail-closed**: if any layer cannot run, the request is ref
    the request (chunked with overlap, plus the last 8 turns as a real multi-turn conversation) and on the
    response. **Streaming is buffered:** nothing reaches the client until the whole response is classified.
 3. **Policy.** `proxy/policy/veto-policy.json`, written only by the hub, hot-reloaded. Configurable: classifier
-   model, blocked categories, tripwire toggles/extra patterns, retention, evidence, diagnostics. Not
-   configurable: the classifier stage, fail-closed behaviour, and category S4 (always blocked, always immutable,
-   always sealed as evidence).
+   model, blocked categories, tripwire toggles/extra patterns, audit retention. Not configurable: the classifier
+   stage, fail-closed behaviour, category S4 (always blocked, audit entries always immutable), the child-safety
+   tripwire list (always on), the refusal of non-text content, and zero retention of vetoed content.
+
+## What is refused before scanning
+Any request carrying an image, audio, video or file part (OpenAI `image_url`/`input_image`/`input_audio`/`file`,
+Ollama-style `images`, …) is refused with 400 `unsupported_content`. Llama Guard 3 reads text only, so such content
+could not be checked before a model saw it; refusing is the only way to guarantee no inference on it.
 
 ## What is scanned
 Latest user turn and everything after it (assistant prefill, tool results, tool-call arguments), every earlier
@@ -45,20 +50,25 @@ an adapter, or an answer the adapter cannot parse, is refused (`503 guard_no_ada
 
 A conversation whose history contains a vetoed turn stays refused; start a new chat.
 
-## Audit, retention, evidence
+## Audit and retention (zero retention)
 - Every veto: `proxy/audit/veto-audit.jsonl` — time, stage, reason, category codes, model, key alias, device
   fingerprint when present. Never content.
 - Entries in the immutable set (S4 always; S3, S10, S11 and CSAM tripwires by default) cannot be cleared from
   the hub; they expire by time only (minimum 90 days).
-- Vetoes in the evidence set (S4 always; CSAM tripwires always) produce a sealed record — see `docs/EVIDENCE.md`.
-- Optional diagnostics (default off): a 160-character snippet of flagged *output*, never for S4.
+- **VetoGuard, the hub and LiteLLM store nothing about vetoed content** — no request text, no output text, no
+  matched spans, no evidence records, no snippets; LiteLLM's own failed-request log is disabled (`disable_error_logs`);
+  the portal chat keeps a turn in the browser only after the gate has released its answer. Open WebUI keeps its own chat history (including refused messages) — a known open item; the portal chat does not. See
+  `docs/EVIDENCE.md`.
 
 ## Choosing a classifier
 Llama Guard 3 **8B** is materially better than 1B on paraphrased, obfuscated and multilingual content, and it is
-the default recommendation. It needs ~6 GB VRAM beside the main model; load the main model first. The hub's
+the default (compose `VETO_GUARD_MODEL`, hub default policy). It needs ~6 GB VRAM beside the main model; load the main model first. The hub's
 Metrics page and the dashboard show residency; a classifier that is not resident loads on the next request.
 
 ## Limits, honestly
+The classifier sees the newest user turn and everything after it in full, plus the last 8 turns as context (long
+turns cut to their head and tail); older history is checked by the tripwire only. Closing this gap is the next
+planned change (audit 2026-09-24, H1).
 Regex is a tripwire, not a boundary. The classifier is imperfect and English-strongest. Both are logged so the
 policy can be tuned from evidence rather than guesswork. Adversarial reviews and their outcomes are kept in
 `docs/tests/agy-vetoguard-review-*.md`.
@@ -66,8 +76,8 @@ policy can be tuned from evidence rather than guesswork. Adversarial reviews and
 ## Image generation (ComfyUI)
 Same posture as text, applied three times per workflow (see `docs/HUB.md` → Images and Gallery): prompt texts
 through VetoGuard; model files gated by a per-file NSFW attribute against the account's `images_nsfw` grant;
-every output judged by a vision model before anyone can see it. Illegal / minor content is destroyed and sealed
-as evidence **without the image** (prompt, files, verdict, perceptual hash); NSFW without the grant is destroyed;
+every output judged by a vision model before anyone can see it. Illegal / minor content is destroyed and only a
+metadata audit entry remains (zero retention); NSFW without the grant is destroyed;
 an unreadable verdict destroys. ComfyUI is reachable only through the hub's gate, has no egress, and the chat UI
 has no route to it. Known limits: the output classifier is a general vision model, not a hash-matching CSAM
 detector — the prompt gate and the destroy-on-doubt policy are the primary controls; uploads (img2img) pass the

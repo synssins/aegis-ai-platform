@@ -16,26 +16,34 @@
 | Authenticated chat user | prompts, uploads | VetoGuard tripwire + Llama Guard pre/post; no direct engine path; web fetch off |
 | API client | `/v1` | own virtual key, model allow-list, rpm/tpm limits; same VetoGuard path |
 | Compromised web container | lateral | cannot reach ollama (backend internal); cannot reach Caddy admin; no docker socket; no caps |
-| Compromised hub | Caddy admin API, LiteLLM master key, one request file | can only push the read-only Caddyfile + one templated site file; ask the watchdog for allow-listed start/stop/restart (never stop caddy/hub); no Docker socket anywhere in the stack |
+| Compromised hub | Caddy admin API, LiteLLM master key, one request file | **Today this is broad** (audit 2026-09-24, H6): code running in the hub can load any Caddy configuration, write site files the Caddyfile imports, change the safety policy, and reach the model engines. It cannot reach the Docker socket; the watchdog only starts/stops/restarts allow-listed containers (never stops caddy/hub). Splitting the hub and cutting these paths is planned. |
 | Brute force on the hub | login | argon2id, mandatory TOTP with replay protection, per-user and per-IP lockout, audit + alert |
 | Future tool/MCP servers | tool results | treated as untrusted input; scanned like user text; isolated `tools` network |
 | Operator workstation | SSH | (host-level; supervised) key-only auth, scoped sudo |
-| Spoofed network identity | claimed IP / user agent | never trusted as identity: audit and evidence name the **API key alias** (cryptographic) and, once device certificates are enabled, the **client-certificate fingerprint** (requires the device's private key) |
+| Spoofed network identity | claimed IP / user agent | never trusted as identity: the audit names the **API key alias** (cryptographic) and, once device certificates are enabled, the **client-certificate fingerprint** (requires the device's private key) |
 
 ## Why there is no Docker socket in any container
 The Docker socket is root on the host. A container holding it turns any code-execution bug in that container into host compromise — every network split, capability drop and policy file becomes irrelevant. The hub therefore never talks to Docker. It writes one JSON request file; a root service *on the host* (`aegis-watchdog`) reads it, validates it against a fixed allow-list, and acts. The channel is a file in a root-only directory, not a socket or a port, so nothing on any network can reach it.
 
-## Evidence handling
-Sealed evidence records exist so that the most serious category of misuse (child sexual exploitation by default) can be reported with usable detail. They contain the offending request text. They are encrypted at rest, hash-chained, root-only, never rendered in any UI, and exportable only from the console with the chain verified. Treat exported bundles as sensitive material; retention defaults to two years and cannot be set below 90 days.
+## Zero retention of vetoed content
+Operator decision (2026-09-24): prevent entirely rather than capture. When anything is vetoed, nothing about its
+content is stored — not the request, not the output, not matched text, not an image, hash or snippet. The audit log
+keeps metadata only (time, stage, category, key alias, model, device fingerprint). Earlier versions kept sealed
+evidence records; `scripts/evidence-purge.sh` destroys them. See `docs/EVIDENCE.md`. Open WebUI keeps its own chat history (including refused messages) — a known open item; the portal chat does not.
 
 ## Out of scope / known limits
 - The lexical tripwire is evadable by paraphrase; the classifier is the control and is itself imperfect.
-  Tune with `VETO_GUARD_IGNORE_CATEGORIES` only after reviewing the audit log.
+  Tune categories in the hub only after reviewing the audit log.
 - The host can reach container ports via the Docker bridge gateway. Mitigated by strong keys; a
   host-level `OUTPUT` rule is a supervised follow-up.
-- The classifier is only as good as its model; Llama Guard 3 8B is the recommendation and is what runs by default with Gemma 3 27B. See `docs/SAFETY.md`.
+- The classifier is only as good as its model; Llama Guard 3 8B is the default (`VETO_GUARD_MODEL`). See `docs/SAFETY.md`.
 - Image generation (planned) must not be enabled without a prompt-side classifier, an output-side
   multimodal classifier, and its own audit log.
 
 ## Reporting
 Open an issue describing the class of problem. Do not include exploit payloads or harmful content.
+
+## Open items from the 2026-09-24 audit
+Fixed in `docs/audits/2026-09-24-security-audit.md` (stop-gaps). Still open, in planned order: full-history
+classification, classifier identity pinning, setup-wizard hardening, single sign-on with MFA for every front end,
+hub privilege split, and network/supply-chain hardening. Details are kept out of this public file until fixed.

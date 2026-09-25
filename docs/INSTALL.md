@@ -15,14 +15,14 @@ git clone <your fork> /data/ai-unified && cd /data/ai-unified
 cp .env.example .env && chmod 600 .env
 ```
 Fill `.env` — every secret with `openssl rand -hex 32`, `AEGIS_LAN_IP`, `ACME_EMAIL`, `HUB_SECRET_KEY`
-(urlsafe base64 32 bytes), `VETO_EVIDENCE_KEY` (keep an offline copy). See `docs/CONFIG.md`.
+(urlsafe base64 32 bytes). See `docs/CONFIG.md`.
 
 ## 2. Host preparation (root)
 ```
 scripts/install-hooks.sh                                  # pre-commit sanitiser
 sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml # GPUs via CDI; repeat after driver upgrades
 sudo install -m755 ops/aegis-watchdog.py /usr/local/sbin/ && sudo install -m644 ops/aegis-watchdog.service /etc/systemd/system/
-sudo install -d -m700 ops/requests ops/responses ops/archive proxy/audit proxy/evidence proxy/policy caddy/hub/state caddy/sites-enabled caddy/config caddy/data
+sudo install -d -m700 ops/requests ops/responses ops/archive proxy/audit proxy/policy caddy/hub/state caddy/sites-enabled caddy/config caddy/data
 sudo systemctl enable --now aegis-watchdog
 sudo chown root:$USER caddy/conf/Caddyfile proxy/config.yaml proxy/veto_filter.py caddy/hub/hub.py && sudo chmod 640 caddy/conf/Caddyfile proxy/config.yaml proxy/veto_filter.py caddy/hub/hub.py
 ```
@@ -61,7 +61,7 @@ browser. Do this promptly: until an administrator exists, anyone on the LAN who 
 
 ## Upgrading
 Pull the repo, read `docs/CHANGELOG.md`, `docker compose config --quiet`, then `docker compose up -d`. Re-run the
-sentinel suite. Model store, databases, audit and evidence directories are untouched by upgrades.
+sentinel suite. Model store, databases and audit directories are untouched by upgrades.
 
 ## Rollback
 `git checkout <previous tag> -- docker-compose.yml caddy/conf/Caddyfile proxy/ caddy/hub/hub.py && docker compose up -d`.

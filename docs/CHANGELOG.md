@@ -2,6 +2,32 @@
 
 All significant changes to the platform are recorded here. Every entry must name the files touched, the reason, who/what made the change, and how it was verified. Security-relevant changes must link an audit record in `docs/audits/`.
 
+## 2026-09-24 (night) — Security audit stop-gaps; zero retention of vetoed content
+
+Audit record: `docs/audits/2026-09-24-security-audit.md`. Made by Claude at the operator's request; verified with the
+new offline suite (`tests/`, 28 tests; each fix's tests fail on the previous code), a jsdom run of the portal chat
+(approved / output-vetoed / input-vetoed / HTTP error / aborted), a live Caddy 2.11.4 + hub run with mock upstreams
+(24 route checks incl. encoded and dot-segment paths) and a Caddy 2.11.4 config adaptation check of
+route order. Live-stack verification: run `scripts/sentinel_test.py` (new phase 10) after deploying.
+
+- **Zero retention (operator decision: prevent entirely rather than capture):** `proxy/veto_filter.py` 3.0 removes the
+  sealed-evidence store, matched-span capture and flagged-output snippets; the audit keeps metadata only and unreadable
+  classifier answers are recorded as verdict words or a length. `caddy/hub/imagegate.py` drops `seal_evidence`/`phash`;
+  `caddy/hub/hub.py` drops evidence export/download, snippet views and the retention sweeper, and discards legacy policy
+  keys. `docker-compose.yml`: no evidence key or mount in any container. `proxy/config.yaml`: `disable_error_logs: true`.
+  `scripts/evidence-export.sh`, `scripts/evidence-open.py` removed; `scripts/evidence-purge.sh` added (console, one-time).
+  Hub image no longer needs Pillow. `docs/EVIDENCE.md` rewritten.
+- **Non-text content refused (C1):** any image/audio/video/file part is refused before tripwires or classifier run.
+- **Child-safety tripwires locked on; 8B default (H2, partial).**
+- **Forward-auth fixed; ComfyUI cross-user routes refused; `/tts` gated (H3, M5).** `caddy/conf/Caddyfile`, `hub.py`.
+- **Image-prompt gate (H4, partial):** exact model-file matching, oversize refused instead of truncated, node-class
+  allow-list (policy-extendable; text-rewriting/loading classes always refused); destroyed jobs drop their prompt copies.
+- **Portal chat** stores a turn in the browser only after the gate has released its answer.
+- **Independent review** of the diff (second agent) found output-veto storage, purge-as-non-root, node-denylist and
+  media-key gaps; all fixed before commit.
+- Docs updated: SAFETY, SECURITY (incl. an honest compromised-hub row), HUB, TESTING, CONFIG, INSTALL, OPERATIONS,
+  ARCHITECTURE, README.
+
 ## 2026-09-24 (late) — Portal, accounts with grants, subdomain routing
 
 - **Request-driven scheduling with administrator precedence (design phase 2):** new `caddy/hub/scheduler.py` (load-on-request, eviction policy: pinned / admin hold / in-flight; wide/normal mode detection and steps). `hub.py`: portal menu lists every exposed chat model with its state; `_chat_stream` asks the scheduler before forwarding (409 with reason when refused); policy gains `scheduler` (admin hold, wide idle, pinned) with a policy-page card; Models → Installed gains Pin/Unpin and the **chat-pool mode** card; images refused with a clear message in wide mode; administrators' ComfyUI prompts go `front`. `ops/aegis-watchdog.py`: `sequence` action (ordered steps), `ollama-intel-wide` allow-listed, LiteLLM no longer a dependent of the chat pool. `docker-compose.yml`: `ollama-intel-wide` (profile `wide`, both Arcs, spread), network alias `chatpool` on both chat-pool containers, LiteLLM deployments re-pointed at `http://chatpool:11434`. Verified with throwaway accounts: user load-on-request (qwen3-coder loaded in 19 s), admin hold refused a user with the reason, admin precedence evicted, wide mode switched in 15 s with the model spread over both Arcs (20 GB), images refused while wide, back to normal with ComfyUI up in ~40 s.

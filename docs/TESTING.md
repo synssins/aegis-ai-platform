@@ -10,15 +10,23 @@ Runs read-only assertions against the live deployment and writes `docs/tests/<UT
 |---|---|
 | 1 network | inference engine has no egress and is unreachable from the web tier; host binding |
 | 2 edge | API auth, edge allow-list, signup off, security headers, hub login redirect, public status page (and that it leaks nothing) |
-| 3 veto | every evasion class against the neutral sentinel; field coverage; streaming; classifier residency; unparseable-verdict refusal; immutability/evidence gating |
+| 3 veto | every evasion class against the neutral sentinel; field coverage; streaming; classifier residency; unparseable-verdict refusal; immutability; no evidence/snippet code or key (zero retention) |
 | 4 hygiene | keys not in web containers, file ownership/modes, capabilities, internal network |
 | 5 admin plane | hub pages (with a session), CSRF, policy file locks, `modeld` isolation, ComfyUI gate, mounts, watchdog status and a real restart round-trip, self-stop refusal, lockout |
 | 9 images | ComfyUI unreachable without a session, uploads off, previews off, no network path from the chat UI, no egress, attribute registry root-only |
+| 10 audit 2026-09-24 | non-text parts refused; 8B classifier; child-safety tripwires locked; ComfyUI cross-user routes refused at the edge; `/tts` needs a session; LiteLLM keeps no failed-request text |
 | 6–8 | bypass classes found in adversarial reviews (assistant prefill, system/tool schema fields, URL-safe/wrapped base64, confusables, tool-call history, oversized parts, JSON-escaped arguments, …) |
 
 The suite uses only the neutral trigger `[TEST_SENTINEL_BLOCK_ALPHA]` — never harmful content — and reads no
 password from any file (the hub stores argon2id hashes only). `TEST_MODEL` in `.env` selects the model so tests
 never drag a second large model into VRAM.
+
+## Offline regression tests
+`python3.12 -m unittest discover -s tests -v` — no Docker, no GPUs. Runs the real VetoGuard and hub code with the
+classifier replaced by a recording stand-in and neutral marker strings: non-text refusal, locked tripwires, S4 lock,
+metadata-only audit (no content, no spans, no evidence), fail-closed paths, forward-auth grant matrix (incl.
+invite-code sessions), image-prompt gate (filename suffix, size, text-rewriting nodes), portal chat storage order.
+See `tests/README.md`. Each test fails against the code before the 2026-09-24 fixes.
 
 ## Seeing the classifier layer trip (live, benign vocabulary)
 The sentinel is a regex tripwire and never reaches Llama Guard. To watch the *classifier* refuse something in a real

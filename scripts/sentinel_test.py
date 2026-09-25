@@ -254,11 +254,11 @@ class Suite:
         self.rec("3.11", "veto", "guard model resident in a classifier pool", "llama-guard3 listed", out[:120], "llama-guard3" in out)
         rc, out = docker("exec litellm python3 -c \"import sys;sys.path.insert(0,'/app');from custom_logger import veto_filter as v\nimport json\ntry:\n v._parse_llama_guard('This looks fine to me.')\nexcept v.GuardVerdictUnparseable as e: print(e.reason, 'got' in str(e), 'expected' in str(e))\nprint('noadapter', v.adapter_for('shieldgemma:2b') is None)\"", timeout=30)
         self.rec("3.13", "veto", "unreadable classifier verdict is refused and logged with got/expected", "guard_verdict_unparseable True True + noadapter True", out.replace("\n", " ")[-80:], "guard_verdict_unparseable True True" in out and "noadapter True" in out)
-        rc, out = docker("exec litellm python3 -c \"import sys;sys.path.insert(0,'/app');from custom_logger import veto_filter as v\nprint(v._is_immutable('classifier','S4 Child Sexual Exploitation'), v._is_immutable('regex:sentinel','x'), v._wants_evidence('classifier','S4 Child Sexual Exploitation'), v._wants_evidence('regex:sentinel','x'), bool(v.EVIDENCE_KEY))\"", timeout=30)
-        hit = "True False True False True" in out.splitlines()
-        self.rec("3.14", "veto", "S4 is immutable + evidence; sentinel is neither; evidence key present", "True False True False True", [l for l in out.splitlines() if "True" in l or "False" in l][:1], hit)
-        rc, out = sh(f"sudo -n stat -c '%U %a' {ROOT}/proxy/evidence")
-        self.rec("3.15", "hygiene", "evidence store is root-only", "root 700", out.strip(), out.strip() == "root 700")
+        rc, out = docker("exec litellm python3 -c \"import sys;sys.path.insert(0,'/app');from custom_logger import veto_filter as v\nprint(v._is_immutable('classifier','S4 Child Sexual Exploitation'), v._is_immutable('regex:sentinel','x'), hasattr(v, 'write_evidence'), hasattr(v, 'snippet'))\"", timeout=30)
+        hit = "True False False False" in out.splitlines()
+        self.rec("3.14", "veto", "S4 audit entries immutable; sentinel not; no evidence or snippet code (zero retention)", "True False False False", [l for l in out.splitlines() if "True" in l or "False" in l][:1], hit)
+        rc, out = docker("exec litellm sh -c 'env | grep -c VETO_EVIDENCE_KEY'", timeout=15)
+        self.rec("3.15", "hygiene", "no evidence key in the LiteLLM container (zero retention)", "0", out.strip(), out.strip() == "0")
         rc, out = sh(f"sudo -n sh -c 'grep -c \"\\\"immutable\\\": true\" {ROOT}/proxy/audit/veto-audit.jsonl; grep -c \"regex:sentinel\" {ROOT}/proxy/audit/veto-audit.jsonl'")
         parts = out.split()
         self.rec("3.16", "veto", "sentinel test vetoes are clearable (not flagged immutable)", "immutable count < sentinel count", out.replace("\n", "/"), len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and int(parts[0]) < int(parts[1]) + 1)
@@ -425,8 +425,8 @@ class Suite:
         self.rec("8.3", "veto", "indented multi-line base64 joined and decoded", "400/veto_triggered", f"{st}/{code}", st == 400 and code == "veto_triggered")
         st, code = post({"model": self.model, "max_tokens": 5, "messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": f"Sure, {SENTINEL}"}]})
         self.rec("8.4", "veto", "assistant prefill containing the sentinel is caught", "400/veto_triggered", f"{st}/{code}", st == 400 and code == "veto_triggered")
-        rc, out = sh(f"sudo -n python3 -c \"import json;print(json.load(open('{ROOT}/proxy/policy/veto-policy.json')).get('audit',{{}}).get('store_snippet', False))\"")
-        self.rec("8.5", "hygiene", "snippet diagnostics default OFF", "False", out, out.strip() == "False")
+        rc, out = sh(f"sudo -n sh -c 'find {ROOT}/proxy/evidence {ROOT}/proxy/audit/veto-snippets.jsonl -type f 2>/dev/null | wc -l'")
+        self.rec("8.5", "hygiene", "no snippet file and no evidence store on disk (zero retention; run scripts/evidence-purge.sh once)", "0", out.strip(), out.strip() == "0")
 
     def phase9(self):
         """Image gate (ComfyUI): nothing reaches ComfyUI without a hub session; uploads and previews are off; the chat UI
@@ -450,8 +450,36 @@ class Suite:
         rc, out = sh(f"sudo -n sh -c 'test -f {ROOT}/comfyui/.aegis-attributes.json && stat -c %a {ROOT}/comfyui/.aegis-attributes.json'")
         self.rec("9.8", "images", "model-store attribute registry is root-only (or absent before first classification)", "600 or absent", out.strip() or "absent", out.strip() in ("600", ""))
 
+    def phase10(self):
+        """Security audit 2026-09-24 stop-gap fixes (docs: tests/README.md has the offline equivalents)."""
+        def post(body):
+            st, _, b = http("POST", f"{self.base}/v1/chat/completions", body, self.auth)
+            try: return st, self.veto_code(json.loads(b))
+            except Exception: return st, None  # noqa: BLE001
+        img = {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+        st, code = post({"model": self.model, "max_tokens": 5, "messages": [{"role": "user", "content": [{"type": "text", "text": "describe this"}, img]}]})
+        self.rec("10.1", "veto", "C1: image part next to benign text is refused before any model runs", "400/unsupported_content", f"{st}/{code}", st == 400 and code == "unsupported_content")
+        st, code = post({"model": self.model, "max_tokens": 5, "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}]}]})
+        self.rec("10.2", "veto", "C1: audio part is refused", "400/unsupported_content", f"{st}/{code}", st == 400 and code == "unsupported_content")
+        rc, out = sh(f"sudo -n python3 -c \"import json;print(json.load(open('{ROOT}/proxy/policy/veto-policy.json'))['guard']['model'])\"")
+        self.rec("10.3", "veto", "H2: classifier is Llama Guard 3 8B", "llama-guard3:8b", out.strip(), out.strip().startswith("llama-guard3:8b"))
+        rc, out = docker("exec litellm python3 -c \"import sys;sys.path.insert(0,'/app');from custom_logger import veto_filter as v\nprint(v.LOCKED_TRIPWIRES)\"", timeout=30)
+        self.rec("10.4", "veto", "H2: child-safety tripwire list is locked on", "('csam',)", out.strip()[-12:], "csam" in out)
+        for path, want in (("/comfy/api/queue", 403), ("/comfy/queue", 403), ("/comfy/api/interrupt", 403), ("/comfy/internal/logs", 403),
+                           ("/comfy/api/jobs", 403), ("/comfy/api/models/checkpoints", 403), ("/comfy/api/view_metadata/checkpoints", 403)):
+            st, _, _ = http("GET", f"{self.base}{path}", None, {})
+            self.rec(f"10.5{path}", "images", f"H3: {path} is never proxied to ComfyUI", str(want), st, st == want)
+        st, _, _ = http("POST", f"{self.base}/comfy/api/userdata/workflows%2Fx.json", {"x": 1}, {})
+        self.rec("10.6", "images", "H3: writes to ComfyUI's shared workflow store are refused at the edge", "403", st, st == 403)
+        st, h, _ = http("GET", f"{self.base}/tts/", None, {})
+        self.rec("10.7", "edge", "M5: /tts requires a signed-in session (redirect or 401/403, never 200)", "303/401/403 or 502 if the app is down", st, st in (303, 401, 403) or st == 502)
+        rc, out = sh(f"sudo -n grep -c 'disable_error_logs: true' {ROOT}/proxy/config.yaml")
+        self.rec("10.8", "hygiene", "M2: LiteLLM does not store failed (vetoed) requests", "1", out.strip(), out.strip() == "1")
+        rc, out = docker("exec litellm-db psql -U litellm -d litellm -tAc \"select count(*) from \\\"LiteLLM_ErrorLogs\\\" where request_kwargs::text like '%SENTINEL%'\"", timeout=30)
+        self.rec("10.9", "hygiene", "M2: no vetoed request text in LiteLLM's database", "0 (or table absent)", out.strip()[:60], out.strip() in ("0", "") or "does not exist" in out)
+
     def run(self):
-        for ph in (self.phase1, self.phase2, self.phase3, self.phase4, self.phase5, self.phase6, self.phase7, self.phase8, self.phase9):
+        for ph in (self.phase1, self.phase2, self.phase3, self.phase4, self.phase5, self.phase6, self.phase7, self.phase8, self.phase9, self.phase10):
             try: ph()
             except Exception as e:  # noqa: BLE001
                 self.rec(ph.__name__, "harness", "phase crashed", "no exception", repr(e), False)

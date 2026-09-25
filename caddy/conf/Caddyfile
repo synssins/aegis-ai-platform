@@ -73,8 +73,14 @@
         reverse_proxy grafana:3000
     }
 
-    # Apps framework. TTS is plain reverse-proxy when the profile is up.
+    # Apps framework. TTS requires a signed-in session with the "speech" grant (audit M5: it used to be open to anyone).
     handle /tts* {
+        forward_auth localhost:9000 {
+            uri /hub/authz/speech
+            copy_headers X-Aegis-User
+            header_up X-Device-Fingerprint {http.request.tls.client.fingerprint}
+            header_up X-Device-Subject {http.request.tls.client.subject}
+        }
         reverse_proxy fish-speech:7860
     }
     # ComfyUI HARD GATE — see docs/ROADMAP.md #8. Console-only change, after the safety gate is tested.
@@ -91,6 +97,22 @@
     @comfy_upload path /comfy/upload* /comfy/api/upload*
     handle @comfy_upload {
         respond "only gated image uploads are enabled" 403
+    }
+    # Audit H3: ComfyUI's own API knows nothing about Aegis accounts. These routes show or change OTHER users' work
+    # (queued workflows incl. prompt text, interrupt/cancel, job lists, server logs and file listings, model listings the
+    # hub filters, add-on managers that install code). Refused for everyone; history and outputs come through the hub.
+    @comfy_blocked path /comfy/queue* /comfy/api/queue* /comfy/interrupt* /comfy/api/interrupt* /comfy/free* /comfy/api/free* /comfy/jobs* /comfy/api/jobs* /comfy/internal/* /comfy/api/internal/* /comfy/manager/* /comfy/api/manager/* /comfy/customnode/* /comfy/api/customnode/* /comfy/snapshot/* /comfy/api/snapshot/* /comfy/view_metadata* /comfy/api/view_metadata* /comfy/models* /comfy/api/models* /comfy/experiment/* /comfy/api/experiment/* /comfy/embeddings* /comfy/api/embeddings* /comfy/api/assets*
+    handle @comfy_blocked {
+        respond "not available through the Aegis gate" 403
+    }
+    # The saved-workflow store and settings are ONE shared folder for every user: no writes through the gate
+    # (reads remain for the UI to start; per-user workflow storage is a follow-up).
+    @comfy_shared_write {
+        path /comfy/userdata* /comfy/api/userdata* /comfy/settings* /comfy/api/settings* /comfy/users* /comfy/api/users*
+        method POST PUT PATCH DELETE
+    }
+    handle @comfy_shared_write {
+        respond "shared ComfyUI storage is read-only through the Aegis gate" 403
     }
     redir /comfy /comfy/ 308
     handle /comfy/* {

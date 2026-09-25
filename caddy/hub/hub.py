@@ -17,7 +17,8 @@ Control (via the host watchdog, never a Docker socket in a container):
   * the hub writes exactly one /app/ops/requests/request.json; the watchdog executes and answers in
     /app/ops/responses/; caddy/hub can only be restarted, never stopped; one request at a time.
 
-Everything else as v2: VetoGuard policy (S4 locked), audit log + snippets, alerts, models (pull /
+Everything else as v2: VetoGuard policy (S4 locked), audit log (metadata only — zero retention: no evidence
+store, no content snippets), alerts, models (pull /
 load / unload / remove / expose), API keys, certificates, public hostname (Cloudflare DNS-01),
 isolation view. Every state change is audited and alerted. Stdlib + argon2-cffi + cryptography.
 """
@@ -43,7 +44,7 @@ import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import scheduler   # request-driven chat-model loading with administrator precedence; wide/normal chat-pool mode (caddy/hub/scheduler.py)
-import imagegate   # ComfyUI gate: prompt/file/output checks, gallery, image evidence (caddy/hub/imagegate.py, mounted read-only)
+import imagegate   # ComfyUI gate: prompt/file/output checks, gallery (zero retention: no image evidence) (caddy/hub/imagegate.py, mounted read-only)
 import browse   # model browser providers, thumbnail proxy, download jobs (caddy/hub/browse.py, mounted read-only)
 
 from argon2 import PasswordHasher
@@ -77,13 +78,8 @@ DEVICE_VALID_DAYS = 730
 AUDIT_DIR = "/app/audit"
 HUB_AUDIT = os.path.join(AUDIT_DIR, "hub-audit.jsonl")
 VETO_AUDIT = os.path.join(AUDIT_DIR, "veto-audit.jsonl")
-SNIPPETS = os.path.join(AUDIT_DIR, "veto-snippets.jsonl")
-EVIDENCE_DIR = "/app/evidence"
-EVIDENCE_INDEX = os.path.join(EVIDENCE_DIR, "index.jsonl")
-HANDOFF_DIR = os.path.join(EVIDENCE_DIR, "handoff")
-EVIDENCE_KEY = os.environ.get("VETO_EVIDENCE_KEY", "")
-DEFAULT_RETENTION = {"immutable_categories": ["S4", "S3", "S10", "S11"], "immutable_tripwires": ["csam", "despaced"], "immutable_days": 730,
-                     "evidence": {"enabled": True, "categories": ["S4"], "tripwires": ["csam", "despaced"], "days": 730}}
+# Zero retention (2026-09-24): no sealed-evidence store, no flagged-content snippets. Vetoes leave metadata only.
+DEFAULT_RETENTION = {"immutable_categories": ["S4", "S3", "S10", "S11"], "immutable_tripwires": ["csam", "despaced"], "immutable_days": 730}
 OPS_REQ = "/app/ops/requests/request.json"
 OPS_RESP = "/app/ops/responses"
 OPS_STATUS = os.path.join(OPS_RESP, "status.json")
@@ -134,10 +130,10 @@ CATEGORIES = {
     "S13": ("Elections", "adult/legal"), "S14": ("Code interpreter abuse", "adult/legal"),
 }
 DEFAULT_BLOCK = {"S1", "S2", "S3", "S4", "S9", "S10", "S11"}
-DEFAULT_POLICY = {"guard": {"model": "llama-guard3:1b", "chunk_chars": 6000, "chunk_overlap": 600, "max_chunks": 100, "timeout": 60, "concurrency": 2},
+DEFAULT_POLICY = {"guard": {"model": "llama-guard3:8b", "chunk_chars": 6000, "chunk_overlap": 600, "max_chunks": 100, "timeout": 60, "concurrency": 2},
                   "categories": {c: {"block": c in DEFAULT_BLOCK} for c in CATEGORIES},
-                  "tripwires": {"enabled": True, "extra_patterns": []}, "audit": {"store_snippet": False},
-                  "images": {"classifier_model": "gemma3:27b", "gallery_review": False},
+                  "tripwires": {"enabled": True, "extra_patterns": []},
+                  "images": {"classifier_model": "gemma3:27b", "gallery_review": False, "extra_nodes": []},
                   "scheduler": {"admin_hold_min": 10, "wide_idle_min": 20, "pinned": []}, "updated": None, "updated_by": None}
 
 SERVICES = {  # name -> (purpose, network, protected)
@@ -472,59 +468,17 @@ def device_ok(fp: str) -> bool:
 # ---------------------------------------------------------------- domain objects ----------
 def policy() -> dict:
     p = load_json(POLICY_FILE, None) or json.loads(json.dumps(DEFAULT_POLICY))
-    p.setdefault("images", json.loads(json.dumps(DEFAULT_POLICY["images"])))
+    p.setdefault("images", json.loads(json.dumps(DEFAULT_POLICY["images"]))); p["images"].setdefault("extra_nodes", [])
     p.setdefault("scheduler", json.loads(json.dumps(DEFAULT_POLICY["scheduler"])))
     for c in CATEGORIES:
         p.setdefault("categories", {}).setdefault(c, {"block": c in DEFAULT_BLOCK})
     p["categories"]["S4"]["block"] = True
-    p.setdefault("guard", DEFAULT_POLICY["guard"].copy()); p.setdefault("tripwires", {"enabled": True, "extra_patterns": []}); p.setdefault("audit", {"store_snippet": False})
+    p.setdefault("guard", DEFAULT_POLICY["guard"].copy()); p.setdefault("tripwires", {"enabled": True, "extra_patterns": []})
+    p.pop("audit", None)                                   # snippet diagnostics removed (zero retention)
     r = p.setdefault("retention", json.loads(json.dumps(DEFAULT_RETENTION)))
-    r.setdefault("evidence", json.loads(json.dumps(DEFAULT_RETENTION["evidence"])))
-    r["immutable_categories"] = sorted(set(r.get("immutable_categories", [])) | {"S4"}); r["evidence"]["categories"] = sorted(set(r["evidence"].get("categories", [])) | {"S4"}); r["evidence"]["enabled"] = True
+    r.pop("evidence", None)                                # evidence store removed (zero retention)
+    r["immutable_categories"] = sorted(set(r.get("immutable_categories", [])) | {"S4"})
     return p
-
-
-def evidence_index() -> list[dict]:
-    return tail_jsonl(EVIDENCE_INDEX, 5000)
-
-
-def _expire_evidence(days: int) -> int:
-    """Delete sealed records older than `days`; rewrite the index. Returns count removed."""
-    cutoff = time.time() - days * 86400; removed = 0
-    try:
-        keep = []
-        for e in reversed(evidence_index()):
-            path = os.path.join(EVIDENCE_DIR, e["id"] + ".json.enc")
-            try:
-                ts = datetime.fromisoformat(e["ts"]).timestamp()
-            except ValueError:
-                ts = time.time()
-            if ts < cutoff:
-                try: os.unlink(path)
-                except FileNotFoundError: pass
-                removed += 1
-            else:
-                keep.append(e)
-        if removed:
-            tmp = EVIDENCE_INDEX + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.writelines(json.dumps(e) + "\n" for e in keep)
-            os.replace(tmp, EVIDENCE_INDEX)
-    except OSError:
-        pass
-    return removed
-
-
-def _retention_sweeper():
-    while True:
-        try:
-            r = policy()["retention"]
-            n = _expire_evidence(int(r["evidence"].get("days", 730)))
-            if n:
-                audit("evidence_expired", removed=n, days=r["evidence"].get("days"))
-        except Exception:  # noqa: BLE001
-            pass
-        time.sleep(6 * 3600)
 
 
 _CAPS: dict[str, list[str]] = {}
@@ -625,7 +579,7 @@ def portal_models() -> list[dict]:
 
 def portal_key(user: str) -> str | None:
     """The user's own LiteLLM virtual key (alias portal-<user>): minted on first use, Fernet-encrypted in the
-    account record, never sent to the browser. Every request carries it, so vetoes and evidence name the user."""
+    account record, never sent to the browser. Every request carries it, so vetoes name the user (metadata only)."""
     u = users(); rec = u.get(user)
     if not rec:
         return None
@@ -659,7 +613,7 @@ t=t.replace(/^(?:\d+\. .*(?:\n|$))+/gm,b=>"<ol>"+b.trim().split("\n").map(l=>"<l
 t=t.split(/\n{2,}/).map(p=>p.trim()).filter(Boolean).map(p=>/^<(ul|ol|h\d)/.test(p)||/^\u0000/.test(p)?p:"<p>"+p.replace(/\n/g,"<br>")+"</p>").join("");
 return t.replace(/\u0000(\d+)\u0000/g,(m,i)=>f[+i]);}
 let store;try{store=JSON.parse(localStorage.getItem(LS)||"{}")}catch(e){store={}}store.convs=store.convs||[];
-const save=()=>{try{localStorage.setItem(LS,JSON.stringify(store))}catch(e){}};
+const save=()=>{try{localStorage.setItem(LS,JSON.stringify({...store,convs:store.convs.map(c=>({...c,msgs:c.msgs.filter(m=>!m.pending)})).filter(c=>c.msgs.length)}))}catch(e){}};  // zero retention: a turn is stored only once the safety gate has released its answer
 let cur=null,ctrl=null;
 function conv(){if(!cur){cur={id:Date.now().toString(36),title:"New chat",msgs:[],model:$("#model").value};store.convs.unshift(cur);}return cur}
 function renderList(){$("#convs").innerHTML=store.convs.map(c=>`<div class="citem${cur&&c.id===cur.id?" on":""}" data-id="${c.id}"><span>${esc(c.title)}</span><a class="cdel" title="delete" data-id="${c.id}">×</a></div>`).join("")}
@@ -673,18 +627,25 @@ sel.innerHTML=j.models.map(m=>`<option value="${esc(m.name)}">${esc(m.name)}${m.
 if(!sel.options.length){sel.innerHTML='<option value="">no model loaded</option>';$("#mstate").textContent="Ask an administrator to load a model.";$("#send").disabled=true}
 else{if(last&&[...sel.options].some(o=>o.value===last))sel.value=last;$("#mstate").textContent=sel.options.length+" available";$("#send").disabled=false}}
 $("#model").onchange=()=>{store.model=$("#model").value;if(cur)cur.model=store.model;save()};
-async function send(text){const c=conv();c.model=$("#model").value;if(!c.model)return;if(c.msgs.length===0)c.title=text.slice(0,40);
-c.msgs.push({role:"user",content:text});const a={role:"assistant",content:""};c.msgs.push(a);save();renderList();renderMsgs();
+async function send(text){const c=conv();c.model=$("#model").value;if(!c.model)return;const fresh=c.msgs.length===0;if(fresh)c.title=text.slice(0,40);
+const u={role:"user",content:text,pending:true},a={role:"assistant",content:"",pending:true};c.msgs.push(u,a);let vetoed=false,approved=false;renderList();renderMsgs();
+const REFUSED="Refused by the safety gate. The refusal was logged; your message was not kept.";
 $("#send").hidden=true;$("#stop").hidden=false;ctrl=new AbortController();
-try{const r=await fetch("/chat/api/stream",{method:"POST",signal:ctrl.signal,headers:{"Content-Type":"application/json","X-CSRF":CSRF},body:JSON.stringify({model:c.model,messages:c.msgs.slice(0,-1).map(m=>({role:m.role,content:m.content}))})});
-if(!r.ok){let t="";try{t=(await r.json()).error||""}catch(e){}a.note=r.status===409?t:"Request failed ("+r.status+(t?": "+t:"")+").";renderMsgs();return}
+try{const r=await fetch("/chat/api/stream",{method:"POST",signal:ctrl.signal,headers:{"Content-Type":"application/json","X-CSRF":CSRF},body:JSON.stringify({model:c.model,messages:c.msgs.filter(m=>m!==a).map(m=>({role:m.role,content:m.content}))})});
+if(!r.ok){let t="";try{t=(await r.json()).error||""}catch(e){}vetoed=/veto|unsupported/i.test(t);a.note=vetoed?REFUSED:r.status===409?t:"Request failed ("+r.status+(t?": "+t:"")+").";renderMsgs();return}
 const rd=r.body.getReader(),dec=new TextDecoder();let buf="";
 for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;
 while((i=buf.indexOf("\n"))>=0){const line=buf.slice(0,i).trim();buf=buf.slice(i+1);if(!line.startsWith("data:"))continue;const d=line.slice(5).trim();if(d==="[DONE]")continue;let j;try{j=JSON.parse(d)}catch(e){continue}
-if(j.error){a.note=j.error==="veto"?"Refused by the safety gate. This request has been logged.":"The model could not answer ("+(j.message||j.error)+").";if(typeof j.error==="object")a.note="The model could not answer.";renderMsgs();continue}
-const ch=(j.choices&&j.choices[0]&&j.choices[0].delta&&j.choices[0].delta.content)||"";if(ch){a.content+=ch;renderMsgs()}}}}
+if(j.error){vetoed=vetoed||j.error==="veto";a.note=j.error==="veto"?REFUSED:"The model could not answer ("+(j.message||j.error)+").";if(typeof j.error==="object")a.note="The model could not answer.";renderMsgs();continue}
+const c0=j.choices&&j.choices[0],ch=(c0&&c0.delta&&c0.delta.content)||"";
+if((c0&&c0.finish_reason==="content_filter")||ch.indexOf("[Response withheld by policy")>=0){vetoed=true;a.content="";a.note=REFUSED;renderMsgs();continue}
+if(ch){approved=true;a.content+=ch;renderMsgs()}}}}
 catch(e){if(e.name!=="AbortError"){a.note="Connection lost.";}}
-finally{if(!a.content&&!a.note)a.note="No answer.";ctrl=null;$("#send").hidden=false;$("#stop").hidden=true;save();renderMsgs()}}
+finally{ctrl=null;$("#send").hidden=false;$("#stop").hidden=true;
+if(vetoed||!approved){const note=a.note||"No answer.";c.msgs.splice(c.msgs.indexOf(u),2);if(!c.msgs.length){store.convs=store.convs.filter(x=>x!==c);if(cur===c)cur=null}
+if(!vetoed&&!$("#inp").value)$("#inp").value=text;save();renderList();renderMsgs();
+if(cur===c||cur===null)$("#msgs").insertAdjacentHTML("beforeend",'<div class="m assistant"><div class="veto">'+esc(note)+'</div></div>');return}
+u.pending=false;a.pending=false;save();renderMsgs()}}
 $("#cform").onsubmit=e=>{e.preventDefault();const t=$("#inp").value.trim();if(!t||ctrl)return;$("#inp").value="";send(t)};
 $("#stop").onclick=()=>{if(ctrl)ctrl.abort()};
 $("#inp").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();$("#cform").requestSubmit()}});
@@ -1055,7 +1016,7 @@ def p_dashboard(msg="", ok=True):
     g = pol["guard"]["model"]; g_inst = any(m["name"] == g for m in models); g_res = any(m["name"] == g and m["loaded"] for m in models)
     gtag = f'<span class="tag">{esc(g)}</span> ' + ('<span class="bad">NOT INSTALLED — all requests refused</span>' if not g_inst else ('<span class="ok">resident</span>' if g_res else '<span class="warn">not resident (loads on next request)</span>'))
     body = f"""<div class="grid">{tiles}</div><p class="mut">Container status via host watchdog · {esc(cts[:19])}</p>
-<div class="card"><h2 style="margin-top:0">Safety posture</h2>Classifier {gtag} · blocking {len(blocked)} categories: {esc(", ".join(blocked))} · tripwires {"on" if pol["tripwires"].get("enabled") else "OFF"} · <b>fail-closed</b> · streaming buffered · snippets {"ON" if pol.get("audit", {}).get("store_snippet") else "off"}
+<div class="card"><h2 style="margin-top:0">Safety posture</h2>Classifier {gtag} · blocking {len(blocked)} categories: {esc(", ".join(blocked))} · tripwires {"on" if pol["tripwires"].get("enabled") else "OFF"} · <b>fail-closed</b> · streaming buffered · zero retention
 <div class="mut" style="margin-top:6px">Resident in VRAM: {vram}</div></div>
 <div class="card"><h2 style="margin-top:0">Certificates</h2><table><tr><th>Host</th><th>Issuer</th><th>Days left</th></tr>{certrows}</table></div>
 <div class="card"><h2 style="margin-top:0">Recent vetoes</h2><table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Detail</th><th>Key</th></tr>{evrows}</table></div>"""
@@ -1106,40 +1067,32 @@ def p_policy(msg="", ok=True):
     body = f"""<form method="post" action="/hub/api/policy">{csrf_field()}
 <div class="card"><h2 style="margin-top:0">Image gate (ComfyUI)</h2><label>Output classifier — a resident, vision-capable model judges every generated image before anyone sees it</label><select name="image_model">{"".join(f'<option value="{esc(m["name"])}"{" selected" if m["name"] == pol["images"].get("classifier_model") else ""}>{esc(m["name"])}{" — resident" if m.get("loaded") else " — NOT resident (generation refused)"}</option>' for m in installed_models() if "vision" in model_caps(m["name"]))}</select>
 <label style="margin-top:8px"><input type="checkbox" name="gallery_review" {"checked" if pol["images"].get("gallery_review") else ""}> Administrator review of user galleries (Safety → Galleries); the portal tells users when this is on</label>
-<div class="mut" style="margin-top:6px">Every workflow: prompt texts through VetoGuard · model files checked against their NSFW attribute (Models → Store) · every output classified; illegal/minor content is destroyed and sealed as evidence (prompt, files, verdict, perceptual hash — never the image); NSFW without the grant is destroyed; an unreadable verdict destroys (fail closed). Previews are disabled in ComfyUI.</div></div>
+<label style="margin-top:8px">Additional allowed node classes (one per line). Built in: {esc(", ".join(sorted(imagegate.DEFAULT_ALLOWED_NODES)))}. Classes that rewrite, load or generate text are refused.</label><textarea name="extra_nodes">{esc(chr(10).join(pol["images"].get("extra_nodes", [])))}</textarea>
+<div class="mut" style="margin-top:6px">Every workflow: only allowed node classes · prompt texts through VetoGuard · model files checked against their NSFW attribute (Models → Store) · every output classified; illegal/minor content is destroyed and nothing about it is kept except a metadata-only audit entry (zero retention); NSFW without the grant is destroyed; an unreadable verdict destroys (fail closed). Previews are disabled in ComfyUI.</div></div>
 <div class="card"><h2 style="margin-top:0">Chat-model scheduling (administrators first)</h2><div class="row"><div><label>Administrator hold (minutes)</label><input name="admin_hold_min" type="number" min="0" value="{pol["scheduler"].get("admin_hold_min", 10)}"></div><div><label>Wide chat mode auto-revert after idle (minutes)</label><input name="wide_idle_min" type="number" min="2" value="{pol["scheduler"].get("wide_idle_min", 20)}"></div></div>
 <div class="mut" style="margin-top:6px">Users never load models: when a user picks an exposed model that is not resident, the scheduler loads it on the chat pool, evicting other chat models — except one that is pinned (Models → Installed), one an administrator used within the hold, or one still answering. Administrators' requests always win. The safety pool is never touched.</div></div>
 <div class="card"><h2 style="margin-top:0">Classifier (Llama Guard 3)</h2><label>Classifier model (installed models named *guard*, *shield* or *guardian*)</label><select name="guard_model">{opts}</select>
 <div style="margin-top:6px">Status: {gstate}</div>
 <div class="mut" style="margin-top:6px">This is the only place the classifier is chosen. Saving loads it into memory and unloads any other guard model. It runs on every request and every response (streaming buffered), cannot be disabled, and if it is missing or unreachable every request is refused. Load your main model <b>before</b> choosing a larger guard so both fit in VRAM. Verdict adapters decide how a family is asked and how its answer is read; today: Llama Guard (expects "safe" or "unsafe" + S-codes). Recognised families without an adapter (ShieldGemma, Granite Guardian, WildGuard) are listed but cannot be selected. If an answer ever fails to parse, the request is refused and the audit log records what came back and what was expected.</div></div>
 <div class="card"><h2 style="margin-top:0">Blocked categories</h2><table><tr><th>Block</th><th>Code</th><th>Category</th><th>Class</th><th></th></tr>{rows}</table><div class="mut">Illegal and protected-class content never passes; adult content may. Unchecking an "illegal" class is allowed but audited and alerted.</div></div>
-<div class="card"><h2 style="margin-top:0">Lexical tripwires</h2><label><input type="checkbox" name="tripwires" {"checked" if pol["tripwires"].get("enabled", True) else ""}> Enabled (built-in lists for sentinel / CSAM terms / malware intent)</label><label>Extra patterns — one Python regex per line</label><textarea name="extra">{esc(extra)}</textarea></div>
-<div class="card"><h2 style="margin-top:0">Retention &amp; evidence</h2>
-<label>Immutable categories (entries cannot be cleared; they expire by time). S4 is always immutable.</label>{"".join(f'<label style="display:inline-block;margin:4px 14px 4px 0"><input type="checkbox" name="imm_{c}" {"checked" if c in pol["retention"].get("immutable_categories", []) else ""} {"disabled" if c == "S4" else ""}> {c} {esc(CATEGORIES[c][0])}</label>' for c in CATEGORIES)}
+<div class="card"><h2 style="margin-top:0">Lexical tripwires</h2><label><input type="checkbox" name="tripwires" {"checked" if pol["tripwires"].get("enabled", True) else ""}> Enabled (built-in sentinel / malware-intent lists and the extra patterns below)</label><div class="mut">The child-safety term list always runs and cannot be switched off here.</div><label>Extra patterns — one Python regex per line</label><textarea name="extra">{esc(extra)}</textarea></div>
+<div class="card"><h2 style="margin-top:0">Retention</h2>
+<p class="mut">Zero retention: a veto never stores the request, the output or any part of them — only a metadata audit entry (time, stage, category, key alias, model, device fingerprint).</p>
+<label>Immutable categories (audit entries cannot be cleared; they expire by time). S4 is always immutable.</label>{"".join(f'<label style="display:inline-block;margin:4px 14px 4px 0"><input type="checkbox" name="imm_{c}" {"checked" if c in pol["retention"].get("immutable_categories", []) else ""} {"disabled" if c == "S4" else ""}> {c} {esc(CATEGORIES[c][0])}</label>' for c in CATEGORIES)}
 <label>Immutable entries expire after (days, minimum 90)</label><input name="imm_days" type="number" min="90" value="{esc(pol["retention"].get("immutable_days", 730))}" style="width:120px">
-<label>Sealed evidence for categories (S4 always). Full request/output, client IP, matched spans — encrypted, hash-chained, console-only export.</label>{"".join(f'<label style="display:inline-block;margin:4px 14px 4px 0"><input type="checkbox" name="ev_{c}" {"checked" if c in pol["retention"]["evidence"].get("categories", []) else ""} {"disabled" if c == "S4" else ""}> {c} {esc(CATEGORIES[c][0])}</label>' for c in CATEGORIES)}
-<label>Evidence retention (days, minimum 90)</label><input name="ev_days" type="number" min="90" value="{esc(pol["retention"]["evidence"].get("days", 730))}" style="width:120px">
-<div class="mut">CSAM tripwire hits are always immutable and always sealed. Changing retention is audited and alerted.</div></div>
-<div class="card"><h2 style="margin-top:0">Diagnostics</h2><label><input type="checkbox" name="store_snippet" {"checked" if pol.get("audit", {}).get("store_snippet") else ""}> Store a 160-character snippet of <b>flagged output</b> (root-only file)</label><div class="mut">Off by default: logs never contain content. Never applies to S4 or CSAM-tripwire vetoes. Toggling is audited and alerted.</div></div>
+<div class="mut">Child-safety tripwire hits are always immutable. Changing retention is audited and alerted.</div></div>
 <p class="mut">Last change: {esc(pol.get("updated") or "never")} by {esc(pol.get("updated_by") or "—")}.</p><button type="submit">Save policy</button></form>"""
     return page("safety", "policy", "VetoGuard policy", "What the safety gate blocks. Administrator only; every change is audited.", body, msg, ok)
 
 
 def p_audit():
-    snips = tail_jsonl(SNIPPETS, 500); srows = ""
-    if snips:
-        sp, sctl = paginate(snips, "n")
-        srows = '<div class="card"><h2 style="margin-top:0">Flagged-output snippets (diagnostics)</h2>' + sctl + '<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Key</th><th>Snippet</th></tr>' + "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))} {esc(e.get("detail", ""))}</td><td>{esc(e.get("key_alias"))}</td><td><code>{esc(e.get("snippet", ""))}</code></td></tr>' for e in sp) + '</table></div>'
     allv = tail_jsonl(VETO_AUDIT, 5000); veto, vctl = paginate(allv, "v"); hub, hctl = paginate(tail_jsonl(HUB_AUDIT, 5000), "h")
     r = policy()["retention"]
-    vrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))}</td><td>{esc(e.get("detail", ""))[:90]}</td><td>{esc(e.get("model"))}</td><td>{esc(e.get("key_alias"))}</td><td>{"<span class=tag title=\"cannot be cleared; expires by time\">&#128274; immutable</span>" if e.get("immutable") else ""} {("<span class=\"tag warn\" title=\"sealed evidence record\">evidence " + esc(str(e.get("evidence_id"))[:15]) + "…</span>") if e.get("evidence_id") else ""}</td></tr>' for e in veto) or '<tr><td colspan="7" class="mut">none</td></tr>'
+    vrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))}</td><td>{esc(e.get("reason"))}</td><td>{esc(e.get("detail", ""))[:90]}</td><td>{esc(e.get("model"))}</td><td>{esc(e.get("key_alias"))}</td><td>{"<span class=tag title=\"cannot be cleared; expires by time\">&#128274; immutable</span>" if e.get("immutable") else ""}</td></tr>' for e in veto) or '<tr><td colspan="7" class="mut">none</td></tr>'
     n_imm = sum(1 for e in allv if e.get("immutable")); n_clr = len(allv) - n_imm
     clear = f'<form method="post" action="/hub/api/audit/clear" class="inline">{csrf_field()}<input type="hidden" name="confirm" value="clear"><button class="danger">Clear log ({n_clr} clearable)</button></form> <span class="mut">{n_imm} immutable entries stay until {r.get("immutable_days")} days old ({esc(", ".join(r.get("immutable_categories", [])))} · tripwires {esc(", ".join(r.get("immutable_tripwires", [])))}).</span>'
-    ev, ectl = paginate(evidence_index(), "ev", 10)
-    evrows = "".join(f'<tr><td><code>{esc(e.get("id"))}</code></td><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("stage"))} {esc(e.get("reason"))}</td><td>{esc(", ".join(e.get("categories") or []))}</td><td>{esc(e.get("key_alias"))}</td><td class="mut"><code>{esc(str(e.get("hash"))[:16])}…</code></td><td><form class="inline" method="post" action="/hub/api/evidence/handoff">{csrf_field()}<input type="hidden" name="id" value="{esc(e.get("id"))}"><button class="ghost">Export for handoff</button></form></td></tr>' for e in ev) or '<tr><td colspan="7" class="mut">no sealed records</td></tr>'
     hrows = "".join(f'<tr><td class="mut">{esc(e.get("ts", "")[:19])}</td><td>{esc(e.get("actor"))}</td><td>{esc(e.get("event"))}</td><td>{esc(", ".join(f"{k}={v}" for k, v in e.items() if k not in ("ts", "event", "actor")))[:120]}</td></tr>' for e in hub) or '<tr><td colspan="4" class="mut">none</td></tr>'
-    evcard = f'<div class="card"><h2 style="margin-top:0">Sealed evidence records</h2><p class="mut">Captured for {esc(", ".join(r["evidence"].get("categories", [])))} and tripwires {esc(", ".join(r["evidence"].get("tripwires", [])))}: full request/output, timestamp, key, client IP, matched spans — encrypted at rest, hash-chained, never displayed here. Kept {r["evidence"].get("days")} days. Export for law enforcement is console-only: <code>scripts/evidence-export.sh &lt;id|all&gt; &lt;outdir&gt;</code> (verifies the chain).</p>{ectl}<table><tr><th>Record</th><th>Time</th><th>Trigger</th><th>Categories</th><th>Key</th><th>Hash</th><th></th></tr>{evrows}</table><p class="mut">"Export for handoff" re-encrypts one record with a fresh key: you download the file here and the key is shown once — send them to law enforcement by separate channels; they open it with <code>scripts/evidence-open.py</code>. Exports are audited and alerted.</p></div>'
-    body = srows + f'<div class="card"><h2 style="margin-top:0">Vetoes</h2><div style="margin:0 0 8px">{clear}</div>{vctl}<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Category / detail</th><th>Model</th><th>Key</th><th></th></tr>{vrows}</table>{vctl}</div>' + evcard + f'<div class="card"><h2 style="margin-top:0">Admin actions</h2>{hctl}<table><tr><th>Time</th><th>Actor</th><th>Event</th><th>Fields</th></tr>{hrows}</table>{hctl}</div><p class="mut">Logs never contain message content. Files: proxy/audit/veto-audit.jsonl, proxy/audit/hub-audit.jsonl (root-only on the host).</p>'
+    body = f'<div class="card"><h2 style="margin-top:0">Vetoes</h2><div style="margin:0 0 8px">{clear}</div>{vctl}<table><tr><th>Time</th><th>Stage</th><th>Reason</th><th>Category / detail</th><th>Model</th><th>Key</th><th></th></tr>{vrows}</table>{vctl}</div>' + f'<div class="card"><h2 style="margin-top:0">Admin actions</h2>{hctl}<table><tr><th>Time</th><th>Actor</th><th>Event</th><th>Fields</th></tr>{hrows}</table>{hctl}</div><p class="mut">Logs never contain message content. Files: proxy/audit/veto-audit.jsonl, proxy/audit/hub-audit.jsonl (root-only on the host).</p>'
     return page("safety", "audit", "Audit log", "Every veto (what tripped, who, when) and every administrative action.", body)
 
 
@@ -1431,7 +1384,15 @@ def act_policy(form):
         return p_policy(f"{im} is not an installed vision-capable model; the image gate needs one (e.g. gemma3).", False)
     if im != pol["images"].get("classifier_model") or ("gallery_review" in form) != bool(pol["images"].get("gallery_review")):
         audit("image_policy_changed", classifier_model=im, gallery_review="gallery_review" in form)
-    pol["images"] = {"classifier_model": im, "gallery_review": "gallery_review" in form}
+    extra_nodes = [l.strip() for l in form.get("extra_nodes", "").splitlines() if l.strip()]
+    for n in extra_nodes:
+        if not re.fullmatch(r"[A-Za-z0-9 _.+()|-]{1,80}", n):
+            return p_policy(f"Invalid node class name {n!r}.", False)
+        if imagegate.text_transform_nodes({"x": {"class_type": n}}):
+            return p_policy(f"{n} rewrites or loads text after the safety check and cannot be allowed.", False)
+    if extra_nodes != pol["images"].get("extra_nodes", []):
+        audit("image_nodes_changed", nodes=",".join(extra_nodes)[:200])
+    pol["images"] = {"classifier_model": im, "gallery_review": "gallery_review" in form, "extra_nodes": extra_nodes}
     try:
         sc = {"admin_hold_min": max(0, int(form.get("admin_hold_min", 10))), "wide_idle_min": max(2, int(form.get("wide_idle_min", 20))), "pinned": pol["scheduler"].get("pinned", [])}
     except ValueError:
@@ -1439,19 +1400,14 @@ def act_policy(form):
     if sc != pol["scheduler"]:
         audit("scheduler_policy_changed", **{k: v for k, v in sc.items() if k != "pinned"})
     pol["scheduler"] = sc
-    snip = "store_snippet" in form
-    if snip != bool(pol.get("audit", {}).get("store_snippet")):
-        audit("snippet_logging_" + ("enabled" if snip else "disabled"))
-    pol["audit"] = {"store_snippet": snip}
     r = pol.setdefault("retention", json.loads(json.dumps(DEFAULT_RETENTION)))
     try:
-        imm_days, ev_days = max(90, int(form.get("imm_days", 730))), max(90, int(form.get("ev_days", 730)))
+        imm_days = max(90, int(form.get("imm_days", 730)))
     except ValueError:
         return p_policy("Retention days must be integers.", False)
-    new_r = {"immutable_categories": sorted({c for c in CATEGORIES if f"imm_{c}" in form} | {"S4"}), "immutable_tripwires": ["csam", "despaced"], "immutable_days": imm_days,
-             "evidence": {"enabled": True, "categories": sorted({c for c in CATEGORIES if f"ev_{c}" in form} | {"S4"}), "tripwires": ["csam", "despaced"], "days": ev_days}}
+    new_r = {"immutable_categories": sorted({c for c in CATEGORIES if f"imm_{c}" in form} | {"S4"}), "immutable_tripwires": ["csam", "despaced"], "immutable_days": imm_days}
     if new_r != r:
-        audit("retention_changed", immutable=",".join(new_r["immutable_categories"]), immutable_days=imm_days, evidence=",".join(new_r["evidence"]["categories"]), evidence_days=ev_days)
+        audit("retention_changed", immutable=",".join(new_r["immutable_categories"]), immutable_days=imm_days)
     pol["retention"] = new_r
     pol["updated"], pol["updated_by"] = now(), getattr(REQ, "user", "admin")
     save_json(POLICY_FILE, pol)
@@ -1461,41 +1417,6 @@ def act_policy(form):
         activate_guard(gm)
         return p_policy(f"Policy saved. Loading {gm} into memory now (other guard models are being unloaded); refresh in ~20 s to see it resident.")
     return p_policy("Policy saved. LiteLLM picks it up within seconds (no restart).")
-
-
-def act_evidence_handoff(form):
-    rid = form.get("id", "")
-    if not re.fullmatch(r"[0-9TZ]+-[0-9a-f]{8}", rid):
-        return p_audit()
-    src = os.path.join(EVIDENCE_DIR, rid + ".json.enc")
-    if not os.path.exists(src) or not EVIDENCE_KEY:
-        audit("evidence_handoff_failed", id=rid, reason="record missing or evidence key not configured")
-        return page("safety", "audit", "Audit log", "", '<div class="msg bad">Record not found, or the hub has no evidence key.</div>')
-    platform = Fernet(base64.urlsafe_b64encode(hashlib.sha256(EVIDENCE_KEY.encode()).digest()))
-    try:
-        rec = json.loads(platform.decrypt(open(src, "rb").read()))
-    except (InvalidToken, ValueError) as e:
-        audit("evidence_handoff_failed", id=rid, reason=f"decrypt: {type(e).__name__}")
-        return page("safety", "audit", "Audit log", "", '<div class="msg bad">Record could not be decrypted with the platform key.</div>')
-    body = {k: v for k, v in rec.items() if k not in ("prev_hash", "hash")}
-    verified = hashlib.sha256((rec["prev_hash"] + json.dumps(body, sort_keys=True, ensure_ascii=False)).encode()).hexdigest() == rec["hash"]
-    handoff_key = Fernet.generate_key().decode()                      # fresh key, shown once
-    bundle = {"format": "aegis-evidence-handoff-v1", "id": rid, "exported": now(), "exported_by": getattr(REQ, "user", "admin"),
-              "chain_hash": rec["hash"], "prev_hash": rec["prev_hash"], "chain_verified_at_export": verified,
-              "ciphertext": Fernet(handoff_key.encode()).encrypt(json.dumps(rec, sort_keys=True, ensure_ascii=False).encode()).decode(),
-              "open_with": "scripts/evidence-open.py <file> — the key was given to you separately"}
-    os.makedirs(HANDOFF_DIR, exist_ok=True)
-    out = os.path.join(HANDOFF_DIR, rid + ".aegis-evidence")
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(bundle, f, indent=1)
-    os.chmod(out, 0o600)
-    audit("evidence_exported_for_handoff", id=rid, chain_verified=verified)
-    body_html = f'''<div class="card"><h2 style="margin-top:0">Handoff bundle ready — record {esc(rid)}</h2>
-<p>Chain integrity at export: <b class="{"ok" if verified else "bad"}">{"verified" if verified else "FAILED — do not rely on this record"}</b></p>
-<p><a href="/hub/evidence/download/{esc(rid)}"><button>Download {esc(rid)}.aegis-evidence</button></a></p>
-<p><b>Decryption key — shown once. Send it to the recipient by a different channel than the file.</b></p><div class="key">{esc(handoff_key)}</div>
-<p class="mut">The recipient opens the bundle with <code>python3 evidence-open.py {esc(rid)}.aegis-evidence</code> (needs the <code>cryptography</code> package) and is prompted for the key. The export is recorded in the admin audit log.</p></div>'''
-    return page("safety", "audit", "Evidence handoff", "One record, one fresh key, two channels.", body_html)
 
 
 def act_clear_log(form):
@@ -1548,10 +1469,10 @@ GATE_LOCK = threading.Lock()
 VETO_AUDIT = os.path.join(AUDIT_DIR, "veto-audit.jsonl")
 
 
-def veto_audit_image(user: str, reason_codes: list[str], detail: str, action: str, model: str, prompt_id: str, ip: str, fp: str, evidence_id: str | None, immutable: bool) -> None:
+def veto_audit_image(user: str, reason_codes: list[str], detail: str, action: str, model: str, prompt_id: str, ip: str, fp: str, immutable: bool) -> None:
     """Same file and shape as VetoGuard's text vetoes so the audit page, immutability and alerts apply unchanged."""
     rec = {"ts": now(), "stage": "image_output", "reason": "classifier", "detail": detail, "call_id": prompt_id, "model": model, "key_alias": f"portal-{user}",
-           "client_ip": ip, "device_fingerprint": fp or "none", "categories": reason_codes, "action": action, "immutable": immutable, "evidence_id": evidence_id}
+           "client_ip": ip, "device_fingerprint": fp or "none", "categories": reason_codes, "action": action, "immutable": immutable}
     try:
         with open(VETO_AUDIT, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
@@ -1594,12 +1515,17 @@ def image_classifier() -> tuple[str, str | None]:
     return m, None
 
 
+GATE_TEXT_MAX = 60000
+
+
 def gate_text(user: str, texts: list[str]) -> tuple[bool, str]:
     """Run the workflow's text through VetoGuard exactly as a chat turn would go: the user's own key, a resident
-    model, one token. 400 veto -> refused (VetoGuard has audited and, for the serious class, sealed evidence)."""
-    text = "\n".join(t for t in texts if t.strip())[:60000]
+    model, one token. 400 veto -> refused (VetoGuard has written a metadata-only audit entry; nothing else is kept)."""
+    text = "\n".join(t for t in texts if t.strip())
     if not text.strip():
         return True, ""
+    if len(text) > GATE_TEXT_MAX:          # audit H4: refuse, never truncate — text past a cut-off was sent to ComfyUI unchecked
+        return False, f"the workflow carries {len(text)} characters of text; the safety gate checks at most {GATE_TEXT_MAX}"
     key = portal_key(user)
     if not key:
         return False, "the gateway refused to issue your key; tell an administrator"
@@ -1644,9 +1570,16 @@ def gate_worker(pid: str) -> None:
         except Exception as e:  # noqa: BLE001 — anything unexpected: the image never reaches anyone
             imagegate.destroy(src); entry.update(action="destroy_error", why=str(e)[:160])
             audit("image_gate_error", user=job["user"], prompt_id=pid, error=str(e)[:200])
+        if entry["action"] != "keep":
+            entry["verdict"] = None                              # zero retention: not even the classifier's description
         with GATE_LOCK:
             job["results"][fn] = entry
+    destroyed = any(e["action"] != "keep" for e in job["results"].values())
+    if destroyed:                                                # ComfyUI keeps the prompt in its own /history: drop it
+        http("POST", COMFY + "/history", {"delete": [pid]}, timeout=15)
     with GATE_LOCK:
+        if destroyed:
+            job["texts"] = []
         job["status"] = "done"
 
 
@@ -1656,14 +1589,10 @@ def _gate_apply(job, pid, fn, src, res, action, why, codes, entry, model):
             entry["gid"] = gid
             audit("image_kept", user=job["user"], prompt_id=pid, gallery_id=gid, classifier=model, seconds=res["seconds"])
         else:
-            ph = imagegate.phash(src) if action == "destroy_illegal" else None
-            imagegate.destroy(src)
-            ev = None
-            if action == "destroy_illegal":
-                ev = imagegate.seal_evidence(EVIDENCE_KEY, job["user"], job["texts"], job["files"], res["verdict"], codes, why, ph, job["ip"], job["fp"], pid, model)
+            imagegate.destroy(src)                                   # zero retention: nothing about the image is kept
             detail = " ".join(f"{c} {imagegate.LLAMA_GUARD_NAMES.get(c, '')}".strip() for c in codes) + f" — {why}"
-            veto_audit_image(job["user"], codes, detail, action, model, pid, job["ip"], job["fp"], ev, immutable=(action == "destroy_illegal"))
-            audit("image_destroyed", user=job["user"], prompt_id=pid, action=action, codes=",".join(codes), evidence_id=ev, classifier=model, seconds=res["seconds"])
+            veto_audit_image(job["user"], codes, detail, action, model, pid, job["ip"], job["fp"], immutable=(action == "destroy_illegal"))
+            audit("image_destroyed", user=job["user"], prompt_id=pid, action=action, codes=",".join(codes), classifier=model, seconds=res["seconds"])
             if action == "destroy_illegal":
                 alert(f"[aegis-veto] image_output classifier {detail} key=portal-{job['user']} at {now()[:19]}")
 
@@ -2173,7 +2102,7 @@ def act_hostname(form):
     return p_hostname(f"Applied {host}. Caddy will obtain the certificate via DNS-01 within a minute or two. {m}" if ok else f"Failed and rolled back: {m}", ok)
 
 
-ACTIONS = {"/hub/api/ops": act_ops, "/hub/api/audit/clear": act_clear_log, "/hub/api/evidence/handoff": act_evidence_handoff, "/hub/api/policy": act_policy, "/hub/api/alerts": act_alerts, "/hub/api/models/pull": act_pull,
+ACTIONS = {"/hub/api/ops": act_ops, "/hub/api/audit/clear": act_clear_log, "/hub/api/policy": act_policy, "/hub/api/alerts": act_alerts, "/hub/api/models/pull": act_pull,
            "/hub/api/models/expose": act_expose, "/hub/api/models/unexpose": act_unexpose, "/hub/api/models/remove": act_remove,
            "/hub/api/models/unload": act_unload, "/hub/api/models/load": act_load, "/hub/api/models/setguard": act_setguard,
            "/hub/api/keys/mint": act_mint, "/hub/api/keys/revoke": act_revoke, "/hub/api/keys/update": act_keys_update,
@@ -2253,7 +2182,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _comfy_upload(self, user: str, raw: bytes):
         """ComfyUI-compatible /upload/image, gated: the image is classified before ComfyUI can see it; illegal
-        input is destroyed and sealed as evidence (never the image); NSFW input without the grant is destroyed."""
+        input is destroyed and nothing about it is kept (zero retention); NSFW input without the grant is destroyed."""
         import email.parser, email.policy
         ctype = self.headers.get("Content-Type", "")
         if "multipart/form-data" not in ctype:
@@ -2278,13 +2207,10 @@ class Handler(BaseHTTPRequestHandler):
         res = imagegate.classify_image(tmp, model, url)
         action, why, codes = imagegate.decide(res, bool(f.get("images_nsfw")))
         if action != "keep":
-            ph = imagegate.phash(tmp) if action == "destroy_illegal" else None
-            imagegate.destroy(tmp); ev = None
-            if action == "destroy_illegal":
-                ev = imagegate.seal_evidence(EVIDENCE_KEY, user, [f"upload:{name}"], [], res["verdict"], codes, why, ph, ip, fp, "upload", model)
+            imagegate.destroy(tmp)
             detail = " ".join(f"{c} {imagegate.LLAMA_GUARD_NAMES.get(c, '')}".strip() for c in codes) + f" — upload: {why}"
-            veto_audit_image(user, codes, detail, action, model, "upload", ip, fp, ev, immutable=(action == "destroy_illegal"))
-            audit("upload_destroyed", user=user, action=action, codes=",".join(codes), evidence_id=ev)
+            veto_audit_image(user, codes, detail, action, model, "upload", ip, fp, immutable=(action == "destroy_illegal"))
+            audit("upload_destroyed", user=user, action=action, codes=",".join(codes))
             if action == "destroy_illegal":
                 alert(f"[aegis-veto] image_input classifier {detail} key=portal-{user} at {now()[:19]}")
             return self._send(403, json.dumps({"error": "Refused by the safety gate. This request has been logged." if action != "destroy_nsfw" else "Your account does not have the NSFW grant."}), "application/json")
@@ -2320,6 +2246,10 @@ class Handler(BaseHTTPRequestHandler):
         if not ok:
             audit("image_prompt_refused", user=user, why=why, files=",".join(files))
             return self._send(403, json.dumps({"error": why, "node_errors": {}}), "application/json")
+        bad = imagegate.disallowed_nodes(wf, policy()["images"].get("extra_nodes", []))
+        if bad:
+            audit("image_prompt_refused", user=user, why="node classes not allowed", nodes=",".join(bad)[:200])
+            return self._send(403, json.dumps({"error": "This workflow uses node types the safety gate does not allow: " + ", ".join(bad)[:300] + ". An administrator can allow image-only node types in Safety → VetoGuard policy; nodes that rewrite or load text are never allowed.", "node_errors": {}}), "application/json")
         texts = imagegate.text_inputs(wf)
         ok, why = gate_text(user, texts)
         if not ok:
@@ -2517,8 +2447,19 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/hub/authz/comfy":       # forward_auth: send the frame to sign in and back to what it asked for
                 uri = self.headers.get("X-Forwarded-Uri") or "/"          # Caddy has already stripped /comfy when forward_auth runs
                 return self._redirect("/login?next=" + urllib.parse.quote(safe_next("/comfy" + uri if not uri.startswith("/comfy") else uri), safe="/?=&"))
+            if p == "/hub/authz/speech":
+                return self._redirect("/login?next=/tts/")
             return self._redirect("/login")
         REQ.user = user
+        # forward_auth answers FIRST and only ever grant (200) a fully signed-in session holding the grant. Caddy treats ANY
+        # 2xx as "allow", so these must never fall through to a page that renders with 200 (audit H3: the forced
+        # password-change page used to answer 200 for invite-code-only sessions).
+        if p in ("/hub/authz/comfy", "/hub/authz/speech"):
+            grant = "images" if p.endswith("comfy") else "speech"
+            rec = users().get(user, {})
+            if rec.get("must_change") or getattr(REQ, "limited", False) or not flags_of(rec).get(grant):
+                return self._send(403, f"{grant} is not granted to this session", "text/plain")
+            self.send_response(200); self.send_header("X-Aegis-User", user); self.send_header("Content-Length", "0"); self.end_headers(); return
         if users().get(user, {}).get("must_change") or getattr(REQ, "limited", False):
             return self._send(200, p_force_password())
         if p in ("", "/", "/portal"):
@@ -2527,11 +2468,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, p_portal_section(p.split("/", 2)[2]))
         if p == "/account":
             return self._send(200, p_account_plain())
-        if p == "/hub/authz/comfy":
-            f = flags_of(users().get(user, {}))
-            if not f.get("images"):
-                return self._send(403, "images are not granted to this account", "text/plain")
-            self.send_response(200); self.send_header("X-Aegis-User", user); self.send_header("Content-Length", "0"); self.end_headers(); return
         if p in ("/comfy/view", "/comfy/api/view") or p.startswith(("/comfy/object_info", "/comfy/api/object_info", "/comfy/history", "/comfy/api/history")):
             return self._comfy_get(user, p)
         if p == "/gallery" or p.startswith("/gallery/") or re.match(r"^/hub/gallery/[a-z0-9._-]+(/|$)", p):
@@ -2578,15 +2514,6 @@ class Handler(BaseHTTPRequestHandler):
             data = open(f, "rb").read(); os.unlink(f); audit("device_bundle_downloaded", fingerprint=fp)
             name = re.sub(r"[^A-Za-z0-9._-]", "_", devices().get("devices", {}).get(fp, {}).get("name", "device"))
             self.send_response(200); self.send_header("Content-Type", "application/x-pkcs12"); self.send_header("Content-Disposition", f'attachment; filename="{name}.p12"')
-            self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(data); return
-        if p.startswith("/hub/evidence/download/"):
-            rid = p.rsplit("/", 1)[-1]
-            f = os.path.join(HANDOFF_DIR, rid + ".aegis-evidence")
-            if not re.fullmatch(r"[0-9TZ]+-[0-9a-f]{8}", rid) or not os.path.exists(f):
-                return self._send(404, "not found", "text/plain")
-            audit("evidence_handoff_downloaded", id=rid)
-            data = open(f, "rb").read()
-            self.send_response(200); self.send_header("Content-Type", "application/octet-stream"); self.send_header("Content-Disposition", f'attachment; filename="{rid}.aegis-evidence"')
             self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(data); return
         parts = p.split("/")
         if len(parts) == 4 and (parts[2], parts[3]) in PAGES:
@@ -2776,6 +2703,5 @@ if __name__ == "__main__":
     if not os.path.exists(POLICY_FILE):
         save_json(POLICY_FILE, DEFAULT_POLICY)
     threading.Thread(target=_veto_watcher, name="veto-watcher", daemon=True).start()
-    threading.Thread(target=_retention_sweeper, name="retention-sweeper", daemon=True).start()
     threading.Thread(target=wide_watch, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", 9000), Handler).serve_forever()

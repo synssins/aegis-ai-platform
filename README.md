@@ -9,8 +9,8 @@ mandatory rather than optional.
   LAN reachability. Only the reverse proxy publishes ports. No container holds the Docker socket — a host
   watchdog performs restarts from a one-file request queue.
 - **VetoGuard.** Every request and every response (streamed output included) passes a lexical tripwire and a
-  Llama Guard 3 classifier, fail-closed. Vetoes are audited without content; the serious class produces sealed,
-  hash-chained, encrypted evidence with a law-enforcement handoff path.
+  Llama Guard 3 classifier, fail-closed. Vetoes are audited without content, and the gateway,
+  hub and LiteLLM store nothing about vetoed content (zero retention; Open WebUI keeps its own chat history (including refused messages) — a known open item; the portal chat does not.) Images, audio and files are refused: the classifier reads text only.
 - **Admin hub.** Own login (argon2id + mandatory TOTP), one place to choose the classifier, policy, retention,
   models, API keys, certificates (Let's Encrypt via DNS-01, no inbound ports), container control, metrics.
   The isolation layer is view-only there and console-only to change.
@@ -26,7 +26,7 @@ mandatory rather than optional.
 | [docs/CONFIG.md](docs/CONFIG.md) | `.env` reference; what is hub-managed vs console-only |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | networks, services, privilege boundaries |
 | [docs/SAFETY.md](docs/SAFETY.md) | how VetoGuard works, categories (Llama Guard S1–S14), policy, responses |
-| [docs/EVIDENCE.md](docs/EVIDENCE.md) | sealed evidence: what is captured, how it is protected, how law enforcement opens it |
+| [docs/EVIDENCE.md](docs/EVIDENCE.md) | zero retention: why no evidence is kept, and how to purge records from earlier versions |
 | [docs/HUB.md](docs/HUB.md) | the admin hub, page by page |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | daily operation, container control, GPUs, disk, backups, recovery |
 | [docs/TESTING.md](docs/TESTING.md) | acceptance suite and adversarial reviews |
@@ -42,11 +42,11 @@ The same pages are published to the repository wiki with `scripts/publish-wiki.s
 docker-compose.yml        the stack (edge / backend / mgmt / monitoring / apps networks, profiles)
 caddy/conf/Caddyfile      gateway — root-owned, read-only in containers, console-only to change
 caddy/hub/hub.py          admin hub (Python stdlib + argon2, cryptography, qrcode)
-proxy/veto_filter.py      VetoGuard (tripwire + classifier adapters + policy + audit + evidence)
+proxy/veto_filter.py      VetoGuard (tripwire + classifier adapters + policy + metadata-only audit)
 proxy/config.yaml         LiteLLM models + settings
 ops/aegis-watchdog.*      host-side container controller (systemd)
 monitoring/               Prometheus + Grafana provisioning
-scripts/                  install-hooks, sanitize-check, pull-model, mint-key, sentinel_test, evidence-*, hub-reset-admin, publish-wiki
+scripts/                  install-hooks, sanitize-check, pull-model, mint-key, sentinel_test, evidence-purge, hub-reset-admin, publish-wiki
 docs/                     documentation, test reports, adversarial review records, designs
 .env.example              every secret and site-specific value
 ```

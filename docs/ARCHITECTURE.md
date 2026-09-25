@@ -52,7 +52,7 @@ obeys file permissions, so container data directories are **root-owned, mode 700
 3. **Policy** — `proxy/policy/veto-policy.json`, written only by the hub, hot-reloaded per request.
    Category set and guard model are configurable; S4 is locked; the classifier and fail-closed are not
    configurable. Default: illegal (S1–S4, S9) and protected (S10, S11) blocked; adult/legal allowed.
-4. **Audit** — `proxy/audit/veto-audit.jsonl` and `proxy/audit/hub-audit.jsonl`; never content. Immutable entries expire by time only. Serious-class vetoes produce sealed evidence (`docs/EVIDENCE.md`). Admin actions and serious vetoes go to an optional webhook.
+4. **Audit** — `proxy/audit/veto-audit.jsonl` and `proxy/audit/hub-audit.jsonl`; never content. Immutable entries expire by time only. Zero retention: no vetoed content is stored anywhere (`docs/EVIDENCE.md`). Admin actions and serious vetoes go to an optional webhook.
 
 ## Privilege boundaries
 - **Isolation layer is console-only:** `caddy/conf/Caddyfile` (root 640, read-only in containers) and

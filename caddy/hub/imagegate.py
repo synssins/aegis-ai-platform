@@ -1,4 +1,4 @@
-"""Aegis hub — image generation gate (ComfyUI), gallery, per-file model attributes, sealed evidence for images.
+"""Aegis hub — image generation gate (ComfyUI), gallery, per-file model attributes.
 
 Mounted read-only into the hub next to hub.py. Design: docs/designs/portal-and-identity.md ("NSFW model files in
 ComfyUI", "Gallery and the image safety gate"). Rules enforced here, never in the UI:
@@ -8,17 +8,16 @@ ComfyUI", "Gallery and the image safety gate"). Rules enforced here, never in th
 * File gate — every string input that names a file in the model store is checked against the attribute
   registry: NSFW or unclassified files need the `images_nsfw` grant (unclassified: administrators only).
 * Output gate — every produced image is classified by a vision model before anyone can see it. Illegal / minor
-  sexual content: destroyed, immutable audit, sealed evidence (prompt, files, verdict, perceptual hash — never
-  the image). NSFW without the grant: destroyed, audited. Unreadable verdict: destroyed (fail closed).
+  sexual content: destroyed, immutable metadata-only audit entry, nothing else kept (zero retention — no evidence
+  store, no hashes, no prompt copies). NSFW without the grant: destroyed, audited. Unreadable verdict: destroyed
+  (fail closed).
 * Gallery — approved images live under gallery/<user>/; users purge their own; admins may review when policy says.
 """
 from __future__ import annotations
 
 import base64
-import fcntl
 import hashlib
 import json
-import math
 import os
 import re
 import threading
@@ -28,7 +27,6 @@ from datetime import datetime, timezone
 
 STORE = os.environ.get("COMFY_STORE", "/app/comfy-store")
 GALLERY = os.environ.get("GALLERY_DIR", "/app/gallery")
-EVIDENCE_DIR = "/app/evidence"
 ATTR_FILE = os.path.join(STORE, ".aegis-attributes.json")
 MODEL_DIRS = ("checkpoints", "loras", "vae", "controlnet", "upscale_models", "embeddings", "motion", "unet", "clip", "clip_vision", "diffusion_models", "text_encoders")
 MODEL_EXT = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft")
@@ -104,11 +102,69 @@ def file_refs(workflow: dict) -> list[str]:
     return seen
 
 
+def is_model_file_value(v: str, inv: dict[str, str] | None = None) -> bool:
+    """True only when the WHOLE value names a model file exactly as ComfyUI writes it ("x.safetensors" or
+    "subdir/x.safetensors" relative to its model folder). Audit H4: the old suffix test skipped any text that merely
+    ENDED in a model filename, so "<any prompt> /Model.safetensors" was never checked."""
+    inv = inventory() if inv is None else inv
+    norm = v.replace("\\", "/").strip()
+    b = os.path.basename(norm)
+    if b not in inv:
+        return False
+    rel_in_folder = inv[b].split("/", 1)[1] if "/" in inv[b] else inv[b]
+    return norm in (b, rel_in_folder)
+
+
+# Node allow-list (audit H4). A workflow is a program; only node classes known to be safe may run. The default set covers
+# core text-to-image, img2img, upscale, LoRA and ControlNet graphs (and every tracked Aegis workflow). Administrators can
+# add classes in Safety -> VetoGuard policy -> Image gate; text-rewriting classes are refused even if added there.
+DEFAULT_ALLOWED_NODES = frozenset({
+    "CheckpointLoaderSimple", "VAELoader", "LoraLoader", "LoraLoaderModelOnly", "CLIPSetLastLayer", "UpscaleModelLoader",
+    "ControlNetLoader", "ControlNetApply", "ControlNetApplyAdvanced",
+    "CLIPTextEncode", "CLIPTextEncodeSDXL", "CLIPTextEncodeSDXLRefiner",
+    "ConditioningCombine", "ConditioningConcat", "ConditioningSetArea", "ConditioningZeroOut",
+    "KSampler", "KSamplerAdvanced", "EmptyLatentImage", "LatentUpscale", "LatentUpscaleBy", "RepeatLatentBatch", "LatentFromBatch",
+    "SetLatentNoiseMask", "VAEDecode", "VAEEncode", "VAEEncodeForInpaint",
+    "LoadImage", "LoadImageMask", "SaveImage", "PreviewImage",
+    "ImageScale", "ImageScaleBy", "ImageScaleToTotalPixels", "ImageUpscaleWithModel", "ImageCrop", "ImageInvert", "ImagePadForOutpaint",
+    "PrimitiveInt", "PrimitiveFloat", "PrimitiveBoolean", "PrimitiveString", "PrimitiveStringMultiline",
+})
+# Classes that rewrite, join, load or generate text AFTER the prompt gate has read it — never allowed.
+TEXT_TRANSFORM_NODE_RE = re.compile(r"(?i)(^string|string(concat|replace|substring|trim|compare|contains|length|join|split|format|function)|strings?$|regex|caseconvert|"
+                                    r"text[ _]?(concat|replace|join|combine|transform|format|template|load|file)|concat|combine ?prompt|prompt ?(concat|styler|combine|from|load)|"
+                                    r"styler|wildcard|dynamicprompt|base64|translat|load ?(text|prompt)|from ?file|ollama|llm|caption|florence|gpt|gemini)")
+
+
+# Exact core classes whose names look textual but only carry a value (checked by the gate) or join conditioning.
+TRANSFORM_EXEMPT = frozenset({"ConditioningConcat", "PrimitiveString", "PrimitiveStringMultiline"})
+
+
+def text_transform_nodes(workflow: dict) -> list[str]:
+    """class_types that could rewrite or inject text after the gate (never allowed, whatever the allow-list says)."""
+    out = []
+    for node in (workflow or {}).values():
+        cls = str(node.get("class_type", "")) if isinstance(node, dict) else ""
+        if TEXT_TRANSFORM_NODE_RE.search(cls) and cls not in out and cls not in TRANSFORM_EXEMPT:
+            out.append(cls)
+    return out
+
+
+def disallowed_nodes(workflow: dict, extra_allowed: list[str] | tuple = ()) -> list[str]:
+    """Every class_type that is not on the allow-list, plus every text-rewriting class. Non-dict nodes count as disallowed."""
+    allowed = DEFAULT_ALLOWED_NODES | {str(x) for x in extra_allowed}
+    out = []
+    for nid, node in (workflow or {}).items():
+        cls = str(node.get("class_type", "")) if isinstance(node, dict) else f"<malformed node {nid}>"
+        if (cls not in allowed or cls in text_transform_nodes({nid: node})) and cls not in out:
+            out.append(cls)
+    return out
+
+
 def text_inputs(workflow: dict) -> list[str]:
-    """Every string input that is not a model file — prompts, but also anything a custom node might carry."""
+    """Every string input that is not exactly a model-file name — prompts, but also anything a custom node might carry."""
     inv = inventory(); out = []
     for _, cls, k, v in _walk_strings(workflow):
-        if os.path.basename(v.replace("\\", "/")) in inv or not v.strip():
+        if not v.strip() or is_model_file_value(v, inv):
             continue
         out.append(v)
     return out
@@ -169,60 +225,6 @@ def decide(res: dict, user_nsfw: bool) -> tuple[str, str, list[str]]:
     if (v["nsfw"] or v["sexual_content"] or v["violence_gore"]) and not user_nsfw:
         return "destroy_nsfw", "NSFW output without the NSFW grant", ["S12"]
     return "keep", "", []
-
-
-# ---------------------------------------------------------------- perceptual hash -------------
-def phash(path: str) -> str | None:
-    """64-bit DCT perceptual hash (pHash). Robust to resizing/re-encoding; lets law enforcement match a destroyed
-    image against holdings without the platform ever storing it."""
-    try:
-        from PIL import Image
-        im = Image.open(path).convert("L").resize((32, 32), Image.LANCZOS)
-        px = list(im.getdata()); N = 32
-        cos = [[math.cos((2 * x + 1) * u * math.pi / (2 * N)) for x in range(N)] for u in range(N)]
-        rows = [[sum(px[y * N + x] * cos[u][x] for x in range(N)) for u in range(8)] for y in range(N)]
-        dct = [[sum(rows[y][u] * cos[v][y] for y in range(N)) for u in range(8)] for v in range(8)]
-        vals = [dct[v][u] for v in range(8) for u in range(8)][1:]
-        med = sorted(vals)[len(vals) // 2]
-        bits = "".join("1" if val > med else "0" for val in [dct[v][u] for v in range(8) for u in range(8)])
-        return f"{int(bits, 2):016x}"
-    except Exception:  # noqa: BLE001
-        return None
-
-
-# ---------------------------------------------------------------- sealed evidence -------------
-def seal_evidence(evidence_key: str, user: str, prompt_texts: list[str], files: list[str], verdict: dict | None, codes: list[str], reason: str,
-                  ph: str | None, ip: str, device_fp: str, prompt_id: str, model: str) -> str | None:
-    """Same record shape and hash chain as VetoGuard's text evidence (proxy/veto_filter.py write_evidence), written
-    under a file lock so both writers share one chain. The image itself is never stored."""
-    if not evidence_key:
-        return None
-    from cryptography.fernet import Fernet
-    f = Fernet(base64.urlsafe_b64encode(hashlib.sha256(evidence_key.encode()).digest()))
-    os.makedirs(EVIDENCE_DIR, exist_ok=True)
-    rid = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + hashlib.sha256(os.urandom(16)).hexdigest()[:8]
-    cats = [{"code": c, "name": LLAMA_GUARD_NAMES.get(c, "")} for c in codes]
-    rec = {"id": rid, "ts": datetime.now(timezone.utc).isoformat(), "stage": "image_output", "reason": "classifier", "detail": " ".join(f"{c['code']} {c['name']}".strip() for c in cats) + f" — {reason}",
-           "categories": cats, "matches": [], "call_id": prompt_id, "model": model, "key_alias": f"portal-{user}", "client_ip": ip, "device_fingerprint": device_fp or "none",
-           "request": {"prompt_texts": prompt_texts, "workflow_files": files}, "output": None,
-           "image": {"stored": False, "destroyed": True, "phash_dct64": ph, "classifier_verdict": verdict}}
-    chain = os.path.join(EVIDENCE_DIR, "chain.txt"); lockp = os.path.join(EVIDENCE_DIR, ".chain.lock")
-    with open(lockp, "a+") as lk:
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        prev = open(chain).read().strip() if os.path.exists(chain) else "GENESIS"
-        body = json.dumps(rec, sort_keys=True, ensure_ascii=False)
-        h = hashlib.sha256((prev + body).encode()).hexdigest()
-        rec["prev_hash"], rec["hash"] = prev, h
-        path = os.path.join(EVIDENCE_DIR, rid + ".json.enc")
-        with open(path, "wb") as fh:
-            fh.write(f.encrypt(json.dumps(rec, sort_keys=True, ensure_ascii=False).encode()))
-        os.chmod(path, 0o600)
-        with open(chain, "w") as fh:
-            fh.write(h)
-        with open(os.path.join(EVIDENCE_DIR, "index.jsonl"), "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"id": rid, "ts": rec["ts"], "stage": "image_output", "reason": "classifier", "categories": codes, "key_alias": rec["key_alias"], "hash": h}) + "\n")
-        fcntl.flock(lk, fcntl.LOCK_UN)
-    return rid
 
 
 def destroy(path: str) -> None:

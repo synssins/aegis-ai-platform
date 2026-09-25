@@ -14,4 +14,8 @@ general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   database_url: os.environ/DATABASE_URL
   disable_spend_logs: true
+  # Zero retention: LiteLLM otherwise records failed requests (including vetoed ones) in its LiteLLM_ErrorLogs table,
+  # whose request_kwargs column can hold the prompt. Vetoes must leave no content anywhere.
+  disable_error_logs: true
+  store_prompts_in_spend_logs: false
   # Virtual keys per client: scripts/mint-key.sh (console only; /key/* is 404 at the edge).

@@ -1,8 +1,19 @@
 """
-VetoGuard rev 2.9 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
+VetoGuard rev 3.0 — LiteLLM pre/post-call safety gate: lexical tripwire + Llama Guard classifier,
 driven by an admin-editable policy file (hot-reloaded) that only the hub may write.
 
-rev 2.9: RETENTION + EVIDENCE. Every audit entry carries "immutable": true when its category/tripwire is in
+rev 3.0 (security audit 2026-09-24, stop-gap fixes):
+  * ZERO RETENTION. Vetoed content is never written anywhere: the sealed-evidence store and the optional
+    flagged-output snippets are removed. The audit log keeps metadata only (time, stage, reason/category,
+    call id, key alias, model, device fingerprint) — never content, never matched spans.
+  * NON-TEXT CONTENT IS REFUSED. Llama Guard 3 reads text only, so any image / audio / file part in a
+    request is refused before anything else runs (400 unsupported_content) instead of being passed to the
+    model unexamined.
+  * The child-safety tripwires (csam list + despaced pass) are always on; the policy's tripwire switch only
+    controls the sentinel, malware and admin-added lists.
+  * Default classifier is llama-guard3:8b (was 1b).
+
+rev 2.9 (superseded by 3.0 — evidence removed): RETENTION + EVIDENCE. Every audit entry carries "immutable": true when its category/tripwire is in
 the policy's immutable set (S4 always) — the hub's "clear log" keeps those until they expire by time.
 Vetoes in the evidence set (S4 + CSAM tripwires by default) additionally produce a sealed EVIDENCE
 RECORD in VETO_EVIDENCE_DIR: full request (and output), timestamp, key alias, client IP/agent, model,
@@ -20,7 +31,7 @@ never dropped; base64 fragments with stray non-printables are kept (cleaned) ins
 system-role messages always reach the classifier chunks; prefill windows are classified as-is (no
 synthetic user turn); regex scans run on a dedicated bounded executor (saturation => refusal, never
 bypass); streamed chunk COUNT is capped as well as bytes; indented base64 continuation lines accepted.
-Optional admin diagnostics: policy "audit": {"store_snippet": true} stores <=160 chars of FLAGGED OUTPUT
+Optional admin diagnostics (REMOVED in 3.0): policy "audit": {"store_snippet": true} stored <=160 chars of FLAGGED OUTPUT
 (never for S4 / CSAM-tripwire reasons) in VETO_SNIPPET_PATH — default off.
 
 rev 2.6 (Agy round 4, docs/tests/agy-vetoguard-review-r4-2026-09-24.md): the classifier's new segment
@@ -73,7 +84,6 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import binascii
 import fcntl
-import hashlib
 import copy
 import json
 import logging
@@ -95,11 +105,6 @@ log = logging.getLogger("vetoguard")
 GUARD_URL = os.environ.get("VETO_GUARD_URL", "http://ollama:11434").rstrip("/")
 POLICY_PATH = os.environ.get("VETO_POLICY_PATH", "/app/policy/veto-policy.json")
 AUDIT_PATH = os.environ.get("VETO_AUDIT_PATH", "/app/audit/veto-audit.jsonl")
-SNIPPET_PATH = os.environ.get("VETO_SNIPPET_PATH", "/app/audit/veto-snippets.jsonl")
-EVIDENCE_DIR = os.environ.get("VETO_EVIDENCE_DIR", "/app/evidence")
-EVIDENCE_KEY = os.environ.get("VETO_EVIDENCE_KEY", "")
-SNIPPET_CHARS = 160
-NEVER_SNIPPET = ("S4", "csam", "despaced")
 AUDIT_ROTATE_BYTES = 50 * 1024 * 1024
 WITHHELD_MSG = "[Response withheld by policy: veto_triggered]"
 SCAN_BUDGET_S = 5.0
@@ -119,14 +124,21 @@ LLAMA_GUARD_CATEGORIES = {
 LOCKED_CATEGORIES = {"S4"}
 DEFAULT_BLOCK = {"S1", "S2", "S3", "S4", "S9", "S10", "S11"}
 DEFAULT_POLICY = {
-    "guard": {"model": os.environ.get("VETO_GUARD_MODEL", "llama-guard3:1b"),
+    "guard": {"model": os.environ.get("VETO_GUARD_MODEL", "llama-guard3:8b"),
               "chunk_chars": 6000, "chunk_overlap": 600, "max_chunks": 100, "timeout": 60, "concurrency": 2},
     "categories": {c: {"block": c in DEFAULT_BLOCK} for c in LLAMA_GUARD_CATEGORIES},
     "tripwires": {"enabled": True, "extra_patterns": []},
-    "audit": {"store_snippet": False},
-    "retention": {"immutable_categories": ["S4", "S3", "S10", "S11"], "immutable_tripwires": ["csam", "despaced"], "immutable_days": 730,
-                  "evidence": {"enabled": True, "categories": ["S4"], "tripwires": ["csam", "despaced"], "days": 730}},
+    "retention": {"immutable_categories": ["S4", "S3", "S10", "S11"], "immutable_tripwires": ["csam", "despaced"], "immutable_days": 730},
 }
+# Child-safety tripwires are never switchable (the policy's "tripwires.enabled" governs only the others).
+LOCKED_TRIPWIRES = ("csam",)
+# Request content-part types that carry no text Llama Guard 3 can read. Any of these => refuse (zero-inference rule).
+NON_TEXT_PART_TYPES = {"image_url", "input_image", "image", "image_file", "input_audio", "audio", "file", "input_file", "video", "video_url", "document"}
+NON_TEXT_KEYS = ("image_url", "input_audio", "file", "image", "audio", "video_url", "file_data", "file_id", "inline_data", "inlineData", "file_uri", "fileData")
+# Top-level request keys that carry media in provider-native shapes (Ollama "images", Gemini "contents", ...).
+NON_TEXT_TOP_KEYS = ("images", "image", "audio", "file", "files", "inline_data", "inlineData")
+# Keys whose values are tool ARGUMENTS or citations, not content parts: {"file": "a.txt"} there is just a string argument.
+NON_CONTENT_SUBKEYS = ("input", "arguments", "annotations", "citations", "cache_control")
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +199,9 @@ class Policy:
                 try:
                     with open(POLICY_PATH, encoding="utf-8") as f:
                         loaded = json.load(f)
-                    for k in ("guard", "tripwires", "audit", "retention"):
+                    for k in ("guard", "tripwires", "retention"):
                         if isinstance(loaded.get(k), dict):
-                            if k == "retention" and isinstance(loaded[k].get("evidence"), dict):
-                                data[k]["evidence"].update(loaded[k]["evidence"])
-                            data[k].update({kk: vv for kk, vv in loaded[k].items() if kk != "evidence"})
+                            data[k].update({kk: vv for kk, vv in loaded[k].items() if kk != "evidence"})   # evidence: removed in 3.0
                     if isinstance(loaded.get("categories"), dict):
                         for c, v in loaded["categories"].items():
                             if c in data["categories"] and isinstance(v, dict):
@@ -202,11 +212,10 @@ class Policy:
             elif self._mtime is not None:
                 log.error("policy file vanished; keeping previous policy")
                 return
-            # S4 is always immutable and always captured as evidence
+            # S4 audit entries (metadata only) are always immutable
             r = data["retention"]
             r["immutable_categories"] = sorted(set(r.get("immutable_categories", [])) | {"S4"})
-            r["evidence"]["categories"] = sorted(set(r["evidence"].get("categories", [])) | {"S4"})
-            r["immutable_days"] = max(90, int(r.get("immutable_days", 730))); r["evidence"]["days"] = max(90, int(r["evidence"].get("days", 730)))
+            r["immutable_days"] = max(90, int(r.get("immutable_days", 730)))
             for c in LOCKED_CATEGORIES:
                 data["categories"][c]["block"] = True
             pats = []
@@ -355,6 +364,19 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
+def _has_non_text(content: Any, depth: int = 0) -> bool:
+    """True if a content value carries any image / audio / file / video part (Llama Guard 3 cannot read those)."""
+    if depth > 24:
+        return True                                   # absurd nesting: treat as unreadable (fail closed)
+    if isinstance(content, list):
+        return any(_has_non_text(p, depth + 1) for p in content)
+    if isinstance(content, dict):
+        if str(content.get("type", "")).strip().lower() in NON_TEXT_PART_TYPES or any(k in content for k in NON_TEXT_KEYS):
+            return True
+        return any(_has_non_text(v, depth + 1) for k, v in content.items() if isinstance(v, (list, dict)) and k not in NON_CONTENT_SUBKEYS)
+    return False
+
+
 def _tool_calls_text(tcs: Any) -> str:
     parts = []
     for tc in tcs or []:
@@ -375,6 +397,10 @@ class RequestView:
     def __init__(self, data: dict):
         msgs = [m for m in (data.get("messages") or []) if isinstance(m, dict)]
         self.has_payload = bool(msgs or data.get("prompt") or data.get("input") or data.get("system"))
+        # Messages with "images" (Ollama-native shape) or any non-text content part anywhere in the request body.
+        self.non_text = (any(_has_non_text(m.get("content")) or any(m.get(k) for k in ("images", "audio", "files")) for m in msgs)
+                         or any(_has_non_text(data.get(k)) for k in ("input", "prompt", "system", "contents"))
+                         or any(data.get(k) for k in NON_TEXT_TOP_KEYS))
         texts: list[str] = []
         self.turns: list[dict] = []
         for m in msgs:
@@ -421,18 +447,13 @@ class RequestView:
         self.new_texts = [t for t in self.new_segment + self.decoded if t and t.strip()]
 
 
-LAST_SPAN = threading.local()   # matched text of the last tripwire hit (evidence only; never audited)
-
-
 def scan(texts: Iterable[str], patterns: list[re.Pattern]) -> str | None:
     if not patterns:
         return None
     for t in texts:
         n = normalise(t)
         for p in patterns:
-            m = p.search(n)
-            if m:
-                LAST_SPAN.value = m.group(0)[:200]
+            if p.search(n):
                 return p.pattern
     return None
 
@@ -441,23 +462,20 @@ def scan_despaced(texts: Iterable[str]) -> str | None:
     for t in texts:
         d = NON_ALNUM_RE.sub("", normalise(t))
         for p in DESPACED_RE:
-            m = p.search(d)
-            if m:
-                LAST_SPAN.value = m.group(0)[:200]
+            if p.search(d):
                 return p.pattern
     return None
 
 
-def tripwire_check(texts: list[str], lists: tuple[str, ...]) -> tuple[str, str, str] | None:
-    """Returns (list_name, pattern, matched_span) on first hit."""
-    LAST_SPAN.value = ""
+def tripwire_check(texts: list[str], lists: tuple[str, ...]) -> tuple[str, str] | None:
+    """Returns (list_name, pattern) on first hit. The locked lists and the despaced pass always run."""
     table = {"sentinel": SENTINEL_RE, "csam": CSAM_RE, "malware": MALWARE_RE, "extra": POLICY.extra_re}
-    for name in lists:
+    for name in dict.fromkeys(LOCKED_TRIPWIRES + tuple(lists)):
         hit = scan(texts, table[name])
         if hit:
-            return name, hit, getattr(LAST_SPAN, "value", "")
+            return name, hit
     hit = scan_despaced(texts)
-    return ("despaced", hit, getattr(LAST_SPAN, "value", "")) if hit else None
+    return ("despaced", hit) if hit else None
 
 
 _SCAN_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="veto-scan")
@@ -512,16 +530,6 @@ def _is_immutable(reason: str, detail: str) -> bool:
     return any(reason == f"regex:{t}" for t in r.get("immutable_tripwires", []))
 
 
-def _wants_evidence(reason: str, detail: str) -> bool:
-    e = POLICY.data.get("retention", {}).get("evidence", {})
-    if not e.get("enabled", True):
-        return False
-    cats = set(re.findall(r"\bS\d{1,2}\b", detail or ""))
-    if cats & set(e.get("categories", [])):
-        return True
-    return any(reason == f"regex:{t}" for t in e.get("tripwires", []))
-
-
 def _client_meta(data: dict) -> dict:
     h = {}
     for src in (data.get("proxy_server_request", {}) or {}).get("headers", {}), (data.get("metadata", {}) or {}).get("headers", {}):
@@ -531,44 +539,6 @@ def _client_meta(data: dict) -> dict:
     return {"client_ip": (h.get("x-forwarded-for", "").split(",")[0].strip() or h.get("x-real-ip") or None), "user_agent": h.get("user-agent"),
             "device_fingerprint": fp if re.fullmatch(r"[0-9a-f]{64}", fp) and fp != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" else None,   # SHA-256("") = no certificate
             "device_subject": h.get("x-device-subject") or None}
-
-
-_EVIDENCE_LOCK = threading.Lock()
-
-
-def write_evidence(stage: str, reason: str, detail: str, data: dict, key_dict: Any, matches: list[dict], output: str | None) -> str | None:
-    """Sealed, hash-chained, encrypted record for the serious class. Returns the record id."""
-    if not EVIDENCE_KEY:
-        log.error("evidence capture requested but VETO_EVIDENCE_KEY is not set")
-        return None
-    try:
-        from cryptography.fernet import Fernet
-        f = Fernet(base64.urlsafe_b64encode(hashlib.sha256(EVIDENCE_KEY.encode()).digest()))
-        os.makedirs(EVIDENCE_DIR, exist_ok=True)
-        rid = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + hashlib.sha256(os.urandom(16)).hexdigest()[:8]
-        cats = [{"code": c, "name": LLAMA_GUARD_CATEGORIES.get(c, "")} for c in re.findall(r"\bS\d{1,2}\b", detail or "")]
-        rec = {"id": rid, "ts": datetime.now(timezone.utc).isoformat(), "stage": stage, "reason": reason, "detail": detail, "categories": cats,
-               "matches": matches, "call_id": data.get("litellm_call_id"), "model": data.get("model"), "key_alias": _key_alias(key_dict), **_client_meta(data),
-               "request": {k: data.get(k) for k in ("messages", "prompt", "input", "system", "tools", "functions") if data.get(k) is not None},
-               "output": output}
-        with _EVIDENCE_LOCK:
-            chain = os.path.join(EVIDENCE_DIR, "chain.txt")
-            prev = open(chain).read().strip() if os.path.exists(chain) else "GENESIS"
-            body = json.dumps(rec, sort_keys=True, ensure_ascii=False)
-            h = hashlib.sha256((prev + body).encode()).hexdigest()
-            rec["prev_hash"], rec["hash"] = prev, h
-            path = os.path.join(EVIDENCE_DIR, rid + ".json.enc")
-            with open(path, "wb") as fh:
-                fh.write(f.encrypt(json.dumps(rec, sort_keys=True, ensure_ascii=False).encode()))
-            os.chmod(path, 0o600)
-            with open(chain, "w") as fh:
-                fh.write(h)
-            with open(os.path.join(EVIDENCE_DIR, "index.jsonl"), "a", encoding="utf-8") as fh:   # metadata only, no content
-                fh.write(json.dumps({"id": rid, "ts": rec["ts"], "stage": stage, "reason": reason, "categories": [c["code"] for c in cats], "key_alias": rec["key_alias"], "hash": h}) + "\n")
-        return rid
-    except Exception as e:  # noqa: BLE001
-        log.error("evidence write failed: %s", _short_err(e))
-        return None
 
 
 def _key_alias(key_dict: Any) -> str | None:
@@ -581,39 +551,18 @@ def _short_err(e: Any) -> str:
     return f"{type(e).__name__}: {str(e).splitlines()[0][:80]}" if isinstance(e, BaseException) else str(e)[:120]
 
 
-def audit(stage: str, reason: str, detail: str, data: dict, key_dict: Any, matches: list[dict] | None = None, output: str | None = None) -> None:
+def audit(stage: str, reason: str, detail: str, data: dict, key_dict: Any) -> None:
+    """Metadata only. Zero retention: no request text, no output text, no matched spans — ever."""
     dcap = 240 if reason in ("guard_verdict_unparseable", "guard_no_adapter") else 120
     rec = {"ts": datetime.now(timezone.utc).isoformat(), "stage": stage, "reason": reason, "detail": (detail.replace("\n", "\\n")[:dcap] if detail else ""),
            "call_id": data.get("litellm_call_id"), "model": data.get("model"), "key_alias": _key_alias(key_dict),
            "device_fingerprint": _client_meta(data).get("device_fingerprint"),
            "immutable": _is_immutable(reason, detail)}
-    if _wants_evidence(reason, detail):
-        rid = write_evidence(stage, reason, detail, data, key_dict, matches or [], output)
-        if rid:
-            rec["evidence_id"] = rid
     log.warning("VETO %s", json.dumps(rec))
     try:
         _AUDIT_Q.put_nowait(rec)
     except queue.Full:
         log.error("audit queue full; event dropped from file (still in process log)")
-
-
-def snippet(stage: str, reason: str, detail: str, data: dict, key_dict: Any, text: str) -> None:
-    """Admin-enabled diagnostics for flagged OUTPUT only. Never for S4 / CSAM-tripwire reasons."""
-    if not POLICY.data.get("audit", {}).get("store_snippet"):
-        return
-    if any(x in detail for x in NEVER_SNIPPET) or any(x in reason for x in NEVER_SNIPPET):
-        return
-    rec = {"ts": datetime.now(timezone.utc).isoformat(), "stage": stage, "reason": reason, "detail": detail[:60],
-           "call_id": data.get("litellm_call_id"), "key_alias": _key_alias(key_dict), "snippet": text.strip()[:SNIPPET_CHARS]}
-    def _w():
-        try:
-            with open(SNIPPET_PATH, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec) + "\n")
-            os.chmod(SNIPPET_PATH, 0o600)
-        except OSError as e:
-            log.error("snippet write failed: %s", e)
-    threading.Thread(target=_w, daemon=True).start()
 
 
 def cats_str(cats: list[str]) -> str:
@@ -632,8 +581,23 @@ class GuardUnavailable(Exception):
     pass
 
 
+VERDICT_WORDS = {"safe", "unsafe", "yes", "no", "not", "harmful", "unharmful"}
+
+
+def _verdict_summary(got: str) -> str:
+    """What an unreadable classifier answer looked like, without retaining content: a short answer made only of
+    verdict words and S-codes is kept (e.g. "Safe.", "unsafe S99"); anything else is reduced to its length, because a
+    misbehaving model may echo the user's text back."""
+    g = (got or "").strip()
+    toks = re.findall(r"[a-z0-9]+", g.lower())
+    if g in ("(not called)", "") or (len(g) <= 32 and toks and all(t in VERDICT_WORDS or re.fullmatch(r"s\d{1,2}", t) for t in toks)):
+        return g
+    return f"<{len(g)} chars withheld>"
+
+
 class GuardVerdictUnparseable(Exception):
     def __init__(self, got: str, expected: str, reason: str = "guard_verdict_unparseable"):
+        got = _verdict_summary(got)
         super().__init__(f"got={got!r} expected={expected}")
         self.got, self.expected, self.reason = got, expected, reason
 
@@ -815,19 +779,22 @@ class VetoGuard(CustomLogger):
         except SchemaBudgetExceeded as e:
             audit("pre_call", "schema_budget_exceeded", str(e), data, user_api_key_dict)
             _refuse(413, "veto_triggered", "Request structure too large to evaluate; refused (fail-closed).")
+        if view.non_text:
+            audit("pre_call", "unsupported_content", "non-text content part (image/audio/file)", data, user_api_key_dict)
+            _refuse(400, "unsupported_content", "Images, audio and files cannot be safety-checked on this platform; send text only.")
         if not view.all_texts:
             if view.has_payload:
                 audit("pre_call", "no_scannable_text", call_type or "", data, user_api_key_dict)
                 _refuse(400, "veto_triggered", "Request carries content that cannot be evaluated; refused (fail-closed).")
             return data
-        if POLICY.data["tripwires"].get("enabled", True):
-            hit = await tripwires(view.all_texts, ("sentinel", "csam", "malware", "extra"))
-            if hit == "timeout":
-                audit("pre_call", "regex_budget_exhausted", "", data, user_api_key_dict)
-                _refuse(400, "veto_triggered", "Request refused by policy.")
-            if hit:
-                audit("pre_call", f"regex:{hit[0]}", hit[1], data, user_api_key_dict, matches=[{"list": hit[0], "pattern": hit[1], "span": hit[2]}])
-                _refuse(400, "veto_triggered", "Request refused by policy.")
+        lists = ("sentinel", "csam", "malware", "extra") if POLICY.data["tripwires"].get("enabled", True) else LOCKED_TRIPWIRES
+        hit = await tripwires(view.all_texts, lists)          # locked child-safety lists run even when tripwires are "off"
+        if hit == "timeout":
+            audit("pre_call", "regex_budget_exhausted", "", data, user_api_key_dict)
+            _refuse(400, "veto_triggered", "Request refused by policy.")
+        if hit:
+            audit("pre_call", f"regex:{hit[0]}", hit[1], data, user_api_key_dict)
+            _refuse(400, "veto_triggered", "Request refused by policy.")
         try:
             unsafe, cats = await classify_request(view)
         except GuardVerdictUnparseable as e:
@@ -846,12 +813,11 @@ class VetoGuard(CustomLogger):
         outputs += [d for o in outputs for d in _decoded_b64_fragments(o)]
         if not outputs:
             return None
-        if POLICY.data["tripwires"].get("enabled", True):
-            hit = await tripwires(outputs, OUTPUT_TRIPWIRES)
-            if hit == "timeout":
-                audit(stage, "regex_budget_exhausted", "", data, key); return ["REGEX_BUDGET"]
-            if hit:
-                audit(stage, f"regex:{hit[0]}", hit[1], data, key, matches=[{"list": hit[0], "pattern": hit[1], "span": hit[2]}], output="\n".join(outputs)); snippet(stage, f"regex:{hit[0]}", hit[1], data, key, "\n".join(outputs)); return [hit[0]]
+        hit = await tripwires(outputs, OUTPUT_TRIPWIRES if POLICY.data["tripwires"].get("enabled", True) else LOCKED_TRIPWIRES)
+        if hit == "timeout":
+            audit(stage, "regex_budget_exhausted", "", data, key); return ["REGEX_BUDGET"]
+        if hit:
+            audit(stage, f"regex:{hit[0]}", hit[1], data, key); return [hit[0]]
         try:
             try:
                 last_user = RequestView(data).last_user
@@ -863,7 +829,7 @@ class VetoGuard(CustomLogger):
         except GuardUnavailable as e:
             audit(stage, "guard_unavailable", _short_err(e), data, key); return ["GUARD_UNAVAILABLE"]
         if unsafe:
-            audit(stage, "classifier", cats_str(cats), data, key, output="\n".join(outputs)); snippet(stage, "classifier", cats_str(cats), data, key, "\n".join(outputs)); return cats
+            audit(stage, "classifier", cats_str(cats), data, key); return cats
         return None
 
     async def async_post_call_success_hook(self, data, user_api_key_dict, response):

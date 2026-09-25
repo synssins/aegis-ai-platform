@@ -56,7 +56,7 @@ automatically; status in Gateway → Certificates.
 ## Backups
 Back up: `.env` (secrets — offline copy), `proxy/db/` (LiteLLM keys and hub-exposed models), `openwebui/`
 (users, chats), `caddy/data/` (CA, certificates), `caddy/hub/state/` (admin account, hostname, webhook),
-`proxy/policy/`, `proxy/audit/`, `proxy/evidence/`. Models are re-downloadable. Restore = put the directories
+`proxy/policy/`, `proxy/audit/`. Models are re-downloadable. Restore = put the directories
 back with root ownership and `docker compose up -d`.
 
 ## Upgrades

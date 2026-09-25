@@ -13,8 +13,8 @@ the administrator changes after installation is changed in the hub, not in files
 | `OPENWEBUI_UPSTREAM_KEY` | a LiteLLM **virtual** key minted for Open WebUI (alias `openwebui`) |
 | `OPENWEBUI_DEFAULT_MODEL` | public model name Open WebUI preselects |
 | `HUB_SECRET_KEY` | hub session signing and encryption of TOTP secrets at rest (urlsafe base64, 32 bytes) |
-| `VETO_EVIDENCE_KEY` | encryption of sealed evidence records — keep an offline copy |
-| `VETO_GUARD_IGNORE_CATEGORIES` | legacy; category policy is now set in the hub |
+| `VETO_GUARD_MODEL` | classifier used until the hub writes a policy file (default `llama-guard3:8b`) |
+| ~~`VETO_EVIDENCE_KEY`~~ | removed (zero retention); delete it from `.env` |
 | `ACME_EMAIL` | Let's Encrypt contact for the public hostname |
 | `GRAFANA_ADMIN_PASSWORD`, `GRAFANA_ENABLED` | monitoring profile |
 | `TEST_API_KEY`, `TEST_MODEL` | acceptance suite key (alias `sentinel-tests`) and model |
